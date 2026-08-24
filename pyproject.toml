@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.46.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "floorball-content-bot"
+version = "0.1.0"
+description = "Approval-gated Telegram content workflow for floorball.kz"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram==3.30.0",
+  "assemblyai==1.0.0",
+  "asyncpg==0.31.0",
+  "httpx==0.28.1",
+  "phonenumbers==9.0.37",
+  "pillow==12.3.0",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.15.0",
+  "websockets==16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.13.0",
+]
+
+[project.scripts]
+floorball-bot = "floorball_bot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "postgres: requires a disposable PostgreSQL database",
+  "external: uses paid or remote providers",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
+ignore = ["S101"]
+
