@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -33,6 +34,67 @@ ROLE_COMMANDS: dict[str, tuple[Role, ...]] = {
     "/city": (Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN),
     "/players": (Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN),
     "/gallery": (Role.CITY_COACH, Role.MEDIA_EDITOR, Role.REVIEWER, Role.SUPERADMIN),
+}
+
+COACH_CRITICAL_STEPS = (
+    "full_name",
+    "city_region",
+    "club",
+    "experience",
+    "contact_preference",
+)
+COACH_OPTIONAL_STEPS = (
+    "qualification",
+    "age_groups",
+    "availability",
+    "public_contact_consent",
+)
+COACH_FIELD_LABELS = {
+    "full_name": "ФИО",
+    "city_region": "город и область",
+    "club": "клуб или организация",
+    "experience": "тренерский опыт",
+    "contact_preference": "предпочтительный способ связи",
+    "qualification": "квалификация",
+    "age_groups": "возрастные группы",
+    "availability": "доступность или расписание",
+    "public_contact_consent": "согласие на публичный контакт",
+}
+COACH_QUESTIONS = {
+    "full_name": "Как к вам обращаться? Укажите ФИО.",
+    "city_region": "В каком городе и области вы работаете?",
+    "club": "С каким клубом или организацией вы связаны? Если клуба нет, напишите «нет клуба».",
+    "experience": "Расскажите кратко о тренерском опыте или статусе.",
+    "contact_preference": "Какой способ связи для вас удобнее: Telegram, звонок или e-mail?",
+    "qualification": "Можно добавить квалификацию, сертификаты или образование.",
+    "age_groups": "Можно добавить возрастные группы, с которыми вы работаете.",
+    "availability": "Можно добавить доступность, расписание или площадку.",
+    "public_contact_consent": (
+        "Можно указать, разрешаете ли публиковать рабочий контакт. "
+        "По умолчанию он остаётся закрытым."
+    ),
+}
+COACH_ALIASES = {
+    "фио": "full_name",
+    "имя": "full_name",
+    "город": "city_region",
+    "область": "city_region",
+    "регион": "city_region",
+    "клуб": "club",
+    "организация": "club",
+    "стаж": "experience",
+    "опыт": "experience",
+    "статус": "experience",
+    "связь": "contact_preference",
+    "контакт": "contact_preference",
+    "квалификация": "qualification",
+    "сертификаты": "qualification",
+    "возрастные группы": "age_groups",
+    "группы": "age_groups",
+    "расписание": "availability",
+    "доступность": "availability",
+    "согласие": "public_contact_consent",
+    "публичный контакт": "public_contact_consent",
 }
 
 
@@ -320,7 +382,7 @@ class TelegramIngress:
         update_id: int,
         message,
     ) -> None:
-        """Persist a coach-only questionnaire without exposing content workflows."""
+        """Run the narrow, resumable coach questionnaire without content privileges."""
         if not message.text:
             await self._reply(
                 connection,
@@ -330,33 +392,37 @@ class TelegramIngress:
             )
             return
         command = message.text.split()[0].split("@")[0] if message.text.startswith("/") else ""
+        session = await connection.fetchrow(
+            """
+            SELECT id, status, current_step FROM conversation_sessions
+            WHERE user_id=$1 AND workflow='coach_form' AND status='active'
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE
+            """,
+            actor.user_id,
+        )
         if command == "/coach-form":
-            session_id = await connection.fetchval(
-                """
-                SELECT id FROM conversation_sessions
-                WHERE user_id=$1 AND workflow='coach_form' AND status='active'
-                ORDER BY created_at DESC
-                LIMIT 1
-                FOR UPDATE
-                """,
-                actor.user_id,
-            )
-            if session_id is None:
+            created = session is None
+            if created:
                 session_id = await connection.fetchval(
                     """
                     INSERT INTO conversation_sessions(user_id, workflow, current_step)
-                    VALUES ($1, 'coach_form', 'questionnaire')
+                    VALUES ($1, 'coach_form', 'full_name')
                     RETURNING id
                     """,
                     actor.user_id,
                 )
-            await self._reply(
-                connection,
-                update_id,
-                message.chat.id,
-                "Анкета тренера открыта. Одним сообщением укажите: ФИО, город, клуб, "
-                "стаж и предпочтительный способ связи. /cancel отменяет незавершённую анкету.",
-            )
+                await self._save_coach_memory(connection, session_id, {}, set())
+                session = {"id": session_id, "current_step": "full_name"}
+            fields, skipped = await self._coach_memory(connection, session["id"])
+            response = self._coach_progress_text(fields, skipped)
+            if created:
+                response = (
+                    "Начнём анкету тренера. Сначала нужны критически важные данные; "
+                    "дополнительные поля можно пропустить и заполнить позже.\n\n" + response
+                )
+            await self._reply(connection, update_id, message.chat.id, response)
             return
         if command == "/cancel":
             await connection.execute(
@@ -369,7 +435,47 @@ class TelegramIngress:
             )
             await self._reply(connection, update_id, message.chat.id, "Анкета отменена.")
             return
-        if command:
+        if command in {"/status", "/resume"}:
+            if session is None:
+                response = "Незавершённой анкеты нет. Используйте /coach-form."
+            else:
+                fields, skipped = await self._coach_memory(connection, session["id"])
+                response = self._coach_progress_text(fields, skipped)
+            await self._reply(connection, update_id, message.chat.id, response)
+            return
+        if command == "/submit":
+            if session is None:
+                await self._reply(
+                    connection, update_id, message.chat.id, "Нет анкеты для отправки."
+                )
+                return
+            fields, skipped = await self._coach_memory(connection, session["id"])
+            missing = [field for field in COACH_CRITICAL_STEPS if not fields.get(field)]
+            if missing:
+                await self._reply(
+                    connection,
+                    update_id,
+                    message.chat.id,
+                    self._coach_progress_text(fields, skipped),
+                )
+                return
+            await connection.execute(
+                """
+                UPDATE conversation_sessions
+                SET current_step='submitted', status='completed', updated_at=now(),
+                    last_activity_at=now()
+                WHERE id=$1
+                """,
+                session["id"],
+            )
+            await self._reply(
+                connection,
+                update_id,
+                message.chat.id,
+                "Анкета отправлена на рассмотрение. Она не публикуется автоматически.",
+            )
+            return
+        if command and command != "/skip":
             await self._reply(
                 connection,
                 update_id,
@@ -377,17 +483,7 @@ class TelegramIngress:
                 "Доступна только анкета тренера: /coach-form.",
             )
             return
-        session_id = await connection.fetchval(
-            """
-            SELECT id FROM conversation_sessions
-            WHERE user_id=$1 AND workflow='coach_form' AND status='active'
-            ORDER BY created_at DESC
-            LIMIT 1
-            FOR UPDATE
-            """,
-            actor.user_id,
-        )
-        if session_id is None:
+        if session is None:
             await self._reply(
                 connection,
                 update_id,
@@ -395,6 +491,26 @@ class TelegramIngress:
                 "Сначала откройте анкету командой /coach-form.",
             )
             return
+        fields, skipped = await self._coach_memory(connection, session["id"])
+        current_step = self._next_coach_step(fields, skipped)
+        if message.text.strip().casefold() in {"/skip", "пропустить", "өткізу"}:
+            if current_step not in COACH_OPTIONAL_STEPS:
+                await self._reply(
+                    connection,
+                    update_id,
+                    message.chat.id,
+                    "Сейчас пропустить нельзя: сначала нужны критически важные данные.\n\n"
+                    + self._coach_progress_text(fields, skipped),
+                )
+                return
+            skipped.add(current_step)
+        else:
+            provided = self._coach_labeled_fields(message.text)
+            if not provided and current_step:
+                provided = {current_step: message.text.strip()}
+            for field, value in provided.items():
+                if value and len(value) <= 500:
+                    fields[field] = value
         await connection.execute(
             """
             INSERT INTO messages(
@@ -402,28 +518,110 @@ class TelegramIngress:
                 direction, message_type, original_text
             ) VALUES ($1,$2,$3,$4,$5,'inbound','text',$6)
             """,
-            session_id,
+            session["id"],
             actor.user_id,
             message.chat.id,
             message.message_id,
             update_id,
             message.text,
         )
+        next_step = self._next_coach_step(fields, skipped)
+        await self._save_coach_memory(connection, session["id"], fields, skipped)
         await connection.execute(
             """
             UPDATE conversation_sessions
-            SET current_step='submitted', status='completed', updated_at=now(),
-                last_activity_at=now()
+            SET current_step=$2, updated_at=now(), last_activity_at=now()
             WHERE id=$1
             """,
-            session_id,
+            session["id"],
+            next_step or "ready_to_submit",
         )
         await self._reply(
             connection,
             update_id,
             message.chat.id,
-            "Анкета сохранена. Она не публикуется автоматически и будет рассмотрена ответственным.",
+            self._coach_progress_text(fields, skipped),
         )
+
+    @staticmethod
+    def _coach_labeled_fields(text: str) -> dict[str, str]:
+        provided: dict[str, str] = {}
+        for part in re.split(r"[\n;]+", text):
+            label, separator, value = part.partition(":")
+            if not separator:
+                continue
+            field = COACH_ALIASES.get(label.strip().casefold())
+            if field and value.strip():
+                provided[field] = value.strip()
+        return provided
+
+    @staticmethod
+    def _next_coach_step(fields: dict[str, str], skipped: set[str]) -> str | None:
+        for field in (*COACH_CRITICAL_STEPS, *COACH_OPTIONAL_STEPS):
+            if not fields.get(field) and field not in skipped:
+                return field
+        return None
+
+    async def _coach_memory(
+        self, connection: asyncpg.Connection, session_id
+    ) -> tuple[dict[str, str], set[str]]:
+        memory = await connection.fetchval(
+            "SELECT structured_memory FROM conversation_memory WHERE session_id=$1", session_id
+        ) or {}
+        fields = {
+            field: str(value)
+            for field, value in dict(memory.get("fields", {})).items()
+            if field in COACH_FIELD_LABELS and value
+        }
+        skipped = {field for field in memory.get("skipped", []) if field in COACH_OPTIONAL_STEPS}
+        return fields, skipped
+
+    async def _save_coach_memory(
+        self,
+        connection: asyncpg.Connection,
+        session_id,
+        fields: dict[str, str],
+        skipped: set[str],
+    ) -> None:
+        memory = {"fields": fields, "skipped": sorted(skipped)}
+        await connection.execute(
+            """
+            INSERT INTO conversation_memory(session_id, structured_memory)
+            VALUES ($1, $2::jsonb)
+            ON CONFLICT (session_id) DO UPDATE
+            SET structured_memory=EXCLUDED.structured_memory,
+                revision=conversation_memory.revision+1, updated_at=now()
+            """,
+            session_id,
+            memory,
+        )
+
+    @staticmethod
+    def _coach_progress_text(fields: dict[str, str], skipped: set[str]) -> str:
+        completed = [
+            COACH_FIELD_LABELS[field] for field in COACH_CRITICAL_STEPS if fields.get(field)
+        ]
+        missing = [
+            COACH_FIELD_LABELS[field] for field in COACH_CRITICAL_STEPS if not fields.get(field)
+        ]
+        optional = [
+            COACH_FIELD_LABELS[field]
+            for field in COACH_OPTIONAL_STEPS
+            if not fields.get(field) and field not in skipped
+        ]
+        lines = [
+            "Заполнено: " + (", ".join(completed) if completed else "пока нет"),
+            "Критично до отправки: " + (", ".join(missing) if missing else "всё заполнено"),
+            "Можно заполнить позже: " + (", ".join(optional) if optional else "нет"),
+        ]
+        next_step = TelegramIngress._next_coach_step(fields, skipped)
+        if next_step:
+            prefix = "Критично. " if next_step in COACH_CRITICAL_STEPS else "Необязательно. "
+            suffix = "" if next_step in COACH_CRITICAL_STEPS else " Можно написать /skip."
+            lines.append(prefix + COACH_QUESTIONS[next_step] + suffix)
+        else:
+            lines.append("Проверьте данные и подтвердите отправку командой /submit.")
+        return "\n\n".join(lines)
 
     async def _download_file(self, media, suffix: str) -> Path:
         self.download_root.mkdir(mode=0o700, parents=True, exist_ok=True)

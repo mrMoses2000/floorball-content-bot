@@ -150,7 +150,7 @@ async def test_kazakh_transcript_confirmation_queues_extraction(pg_pool):
 
 
 @pytest.mark.asyncio
-async def test_coach_form_role_cannot_enqueue_content_or_access_city_tools(pg_pool):
+async def test_coach_form_role_collects_critical_fields_and_requires_submit(pg_pool):
     sender_id = 555005
     user_id = await pg_pool.fetchval(
         """
@@ -166,15 +166,29 @@ async def test_coach_form_role_cannot_enqueue_content_or_access_city_tools(pg_po
 
     await ingress.accept(message_update(1006, sender_id, "/city"))
     await ingress.accept(message_update(1007, sender_id, "/coach-form"))
+    await ingress.accept(message_update(1008, sender_id, "Тестовый тренер"))
+    await ingress.accept(message_update(1009, sender_id, "/resume"))
     await ingress.accept(
-        message_update(1008, sender_id, "ФИО: Тест. Город: Алматы. Клуб: Тест. Стаж: 2 года.")
+        message_update(
+            1010,
+            sender_id,
+            "Город: Алматы; Клуб: Тест; Стаж: 2 года; Связь: Telegram",
+        )
     )
+    await ingress.accept(message_update(1011, sender_id, "/submit"))
 
     assert await pg_pool.fetchval("SELECT count(*) FROM jobs WHERE kind='extract'") == 0
     session = await pg_pool.fetchrow(
         "SELECT workflow, status FROM conversation_sessions WHERE user_id=$1", user_id
     )
     assert dict(session) == {"workflow": "coach_form", "status": "completed"}
+    memory = await pg_pool.fetchval(
+        "SELECT structured_memory FROM conversation_memory WHERE session_id=("
+        "SELECT id FROM conversation_sessions WHERE user_id=$1)",
+        user_id,
+    )
+    assert memory["fields"]["full_name"] == "Тестовый тренер"
+    assert memory["fields"]["city_region"] == "Алматы"
     answer = await pg_pool.fetchval(
         "SELECT payload FROM outbox_events ORDER BY created_at DESC LIMIT 1"
     )
