@@ -1,9 +1,12 @@
+import httpx
 import pytest
 
 from floorball_bot.domain import ExtractedCityPatch
 from floorball_bot.errors import PermanentProviderError
+from floorball_bot.providers import transcription
 from floorball_bot.providers.codex import CodexExtractor, FakeExtractor
 from floorball_bot.providers.transcription import (
+    AssemblyAIBatchTranscriber,
     FakeTranscriber,
     RoutedAssemblyAITranscriber,
 )
@@ -57,6 +60,47 @@ async def test_fake_transcriber_and_kazakh_routing(tmp_path):
     assert (await routed.transcribe(path, "ru")).text == "Русский текст"
     assert (await routed.transcribe(path, "kz")).text == "Қазақша мәтін"
     assert kz.paths == [path]
+
+
+@pytest.mark.asyncio
+async def test_batch_transcriber_uploads_async_compatible_bytes(tmp_path, monkeypatch):
+    path = tmp_path / "voice.wav"
+    path.write_bytes(b"test-audio")
+    uploads: list[bytes] = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, *, headers, content=None, json=None):
+            request = httpx.Request("POST", url)
+            if url.endswith("/upload"):
+                uploads.append(content)
+                return httpx.Response(200, request=request, json={"upload_url": "https://audio"})
+            return httpx.Response(200, request=request, json={"id": "transcript-1"})
+
+        async def get(self, url, *, headers):
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", url),
+                json={
+                    "status": "completed",
+                    "text": "Тестовый текст",
+                    "language_code": "ru",
+                    "audio_duration": 1.0,
+                    "speech_model": "universal-3-pro",
+                },
+            )
+
+    monkeypatch.setattr(transcription.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+    result = await AssemblyAIBatchTranscriber("test-key").transcribe(path, "ru")
+
+    assert uploads == [b"test-audio"]
+    assert result.provider_id == "transcript-1"
+    assert result.text == "Тестовый текст"
 
 
 @pytest.mark.asyncio

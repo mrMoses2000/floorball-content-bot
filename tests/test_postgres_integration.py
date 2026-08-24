@@ -38,7 +38,7 @@ async def pg_pool():
 async def test_migrations_are_repeatable(pg_pool):
     assert await run_migrations(pg_pool, Path(__file__).parents[1] / "migrations") == []
     count = await pg_pool.fetchval("SELECT count(*) FROM schema_migrations")
-    assert count == 4
+    assert count == 5
 
 
 @pytest.mark.asyncio

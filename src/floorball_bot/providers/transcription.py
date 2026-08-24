@@ -51,12 +51,12 @@ class AssemblyAIBatchTranscriber:
         timeout = httpx.Timeout(30, read=60)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                with path.open("rb") as source:
-                    upload = await client.post(
-                        "https://api.assemblyai.com/v2/upload",
-                        headers=headers,
-                        content=source,
-                    )
+                audio_bytes = await asyncio.to_thread(path.read_bytes)
+                upload = await client.post(
+                    "https://api.assemblyai.com/v2/upload",
+                    headers=headers,
+                    content=audio_bytes,
+                )
                 upload.raise_for_status()
                 request = {
                     "audio_url": upload.json()["upload_url"],

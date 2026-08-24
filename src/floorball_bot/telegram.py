@@ -165,6 +165,9 @@ class TelegramIngress:
                 "Доступ запрещён. Используйте /start для авторизации.",
             )
             return
+        if actor.roles == frozenset({Role.COACH_FORM}):
+            await self._handle_coach_form(connection, actor, update.update_id, message)
+            return
         await connection.execute(
             """
             INSERT INTO messages(user_id, telegram_chat_id, telegram_message_id, telegram_update_id,
@@ -309,6 +312,118 @@ class TelegramIngress:
                 message.chat.id,
                 "Этот тип сообщения пока нельзя добавить в черновик.",
             )
+
+    async def _handle_coach_form(
+        self,
+        connection: asyncpg.Connection,
+        actor: Actor,
+        update_id: int,
+        message,
+    ) -> None:
+        """Persist a coach-only questionnaire without exposing content workflows."""
+        if not message.text:
+            await self._reply(
+                connection,
+                update_id,
+                message.chat.id,
+                "Анкета тренера принимает только текст. Используйте /coach-form.",
+            )
+            return
+        command = message.text.split()[0].split("@")[0] if message.text.startswith("/") else ""
+        if command == "/coach-form":
+            session_id = await connection.fetchval(
+                """
+                SELECT id FROM conversation_sessions
+                WHERE user_id=$1 AND workflow='coach_form' AND status='active'
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                actor.user_id,
+            )
+            if session_id is None:
+                session_id = await connection.fetchval(
+                    """
+                    INSERT INTO conversation_sessions(user_id, workflow, current_step)
+                    VALUES ($1, 'coach_form', 'questionnaire')
+                    RETURNING id
+                    """,
+                    actor.user_id,
+                )
+            await self._reply(
+                connection,
+                update_id,
+                message.chat.id,
+                "Анкета тренера открыта. Одним сообщением укажите: ФИО, город, клуб, "
+                "стаж и предпочтительный способ связи. /cancel отменяет незавершённую анкету.",
+            )
+            return
+        if command == "/cancel":
+            await connection.execute(
+                """
+                UPDATE conversation_sessions
+                SET status='cancelled', updated_at=now(), last_activity_at=now()
+                WHERE user_id=$1 AND workflow='coach_form' AND status='active'
+                """,
+                actor.user_id,
+            )
+            await self._reply(connection, update_id, message.chat.id, "Анкета отменена.")
+            return
+        if command:
+            await self._reply(
+                connection,
+                update_id,
+                message.chat.id,
+                "Доступна только анкета тренера: /coach-form.",
+            )
+            return
+        session_id = await connection.fetchval(
+            """
+            SELECT id FROM conversation_sessions
+            WHERE user_id=$1 AND workflow='coach_form' AND status='active'
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE
+            """,
+            actor.user_id,
+        )
+        if session_id is None:
+            await self._reply(
+                connection,
+                update_id,
+                message.chat.id,
+                "Сначала откройте анкету командой /coach-form.",
+            )
+            return
+        await connection.execute(
+            """
+            INSERT INTO messages(
+                session_id, user_id, telegram_chat_id, telegram_message_id, telegram_update_id,
+                direction, message_type, original_text
+            ) VALUES ($1,$2,$3,$4,$5,'inbound','text',$6)
+            """,
+            session_id,
+            actor.user_id,
+            message.chat.id,
+            message.message_id,
+            update_id,
+            message.text,
+        )
+        await connection.execute(
+            """
+            UPDATE conversation_sessions
+            SET current_step='submitted', status='completed', updated_at=now(),
+                last_activity_at=now()
+            WHERE id=$1
+            """,
+            session_id,
+        )
+        await self._reply(
+            connection,
+            update_id,
+            message.chat.id,
+            "Анкета сохранена. Она не публикуется автоматически и будет рассмотрена ответственным.",
+        )
 
     async def _download_file(self, media, suffix: str) -> Path:
         self.download_root.mkdir(mode=0o700, parents=True, exist_ok=True)

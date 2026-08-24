@@ -4,15 +4,18 @@
 
 ## Состояние
 
-Реализован production-oriented MVP scaffold: схема БД, migrations, RBAC/city scopes, self-contact binding, durable update/job/outbox primitives, draft state machine, RU/KZ extraction contracts, fake и реальные provider adapters, image sanitization, deterministic city exporter/importer, publication preview/confirm core, systemd units и backup scripts.
+Реализован production-oriented MVP scaffold: схема БД, migrations, RBAC/city scopes,
+отдельная узкая роль `coach_form`, self-contact binding, durable update/job/outbox primitives,
+draft state machine, RU/KZ extraction contracts, fake и реальные provider adapters, image
+sanitization, deterministic city exporter/importer, publication preview/confirm core, systemd
+units и backup scripts.
 
 Production push, systemd installation и Plesk deployment намеренно не выполняются автоматически.
 
-Проверено локально: 26 unit/contract tests, 9 integration tests на PostgreSQL 18,
-Ruff, `compileall` и `pip check`. Read-only smoke прошёл для Telegram Bot API и
-реальный structured extraction smoke — для Codex CLI. AssemblyAI smoke ожидает
-разрешённые тестовые RU/KZ аудиофайлы, чтобы не расходовать API-кредиты без явного
-согласия.
+Проверено локально: 27 unit/contract tests и 10 integration tests на PostgreSQL 18,
+Ruff, `compileall`, `pip check`, Telegram Bot API, Codex CLI и реальные AssemblyAI RU/KZ
+маршруты на синтетическом аудио. Проверка качества распознавания всё ещё требует
+разрешённых речевых RU/KZ сэмплов.
 
 ## Быстрый старт
 

@@ -14,6 +14,7 @@ class Role(StrEnum):
     REVIEWER = "reviewer"
     FEDERATION_EDITOR = "federation_editor"
     CITY_COACH = "city_coach"
+    COACH_FORM = "coach_form"
     MEDIA_EDITOR = "media_editor"
 
 

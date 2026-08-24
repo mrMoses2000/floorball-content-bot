@@ -147,3 +147,35 @@ async def test_kazakh_transcript_confirmation_queues_extraction(pg_pool):
     assert transcript["normalized_text"] == "Қазақша мәтін"
     assert transcript["transcript_confirmed"] is True
     assert job["payload"]["text"] == "Қазақша мәтін"
+
+
+@pytest.mark.asyncio
+async def test_coach_form_role_cannot_enqueue_content_or_access_city_tools(pg_pool):
+    sender_id = 555005
+    user_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164, display_name, telegram_id)
+        VALUES ('+77011234570','Form Coach',$1) RETURNING id
+        """,
+        sender_id,
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id, role_name) VALUES ($1,'coach_form')", user_id
+    )
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    await ingress.accept(message_update(1006, sender_id, "/city"))
+    await ingress.accept(message_update(1007, sender_id, "/coach-form"))
+    await ingress.accept(
+        message_update(1008, sender_id, "ФИО: Тест. Город: Алматы. Клуб: Тест. Стаж: 2 года.")
+    )
+
+    assert await pg_pool.fetchval("SELECT count(*) FROM jobs WHERE kind='extract'") == 0
+    session = await pg_pool.fetchrow(
+        "SELECT workflow, status FROM conversation_sessions WHERE user_id=$1", user_id
+    )
+    assert dict(session) == {"workflow": "coach_form", "status": "completed"}
+    answer = await pg_pool.fetchval(
+        "SELECT payload FROM outbox_events ORDER BY created_at DESC LIMIT 1"
+    )
+    assert "не публикуется автоматически" in answer["text"]
