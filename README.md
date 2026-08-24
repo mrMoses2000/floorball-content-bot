@@ -8,6 +8,12 @@
 
 Production push, systemd installation и Plesk deployment намеренно не выполняются автоматически.
 
+Проверено локально: 26 unit/contract tests, 9 integration tests на PostgreSQL 18,
+Ruff, `compileall` и `pip check`. Read-only smoke прошёл для Telegram Bot API и
+реальный structured extraction smoke — для Codex CLI. AssemblyAI smoke ожидает
+разрешённые тестовые RU/KZ аудиофайлы, чтобы не расходовать API-кредиты без явного
+согласия.
+
 ## Быстрый старт
 
 ```bash
@@ -44,4 +50,3 @@ cp .env.example .env
 ```
 
 Подробности: [архитектура](docs/ARCHITECTURE.md), [операции](docs/OPERATIONS.md), [настройка интеграций](docs/INTEGRATIONS.md), [privacy/consent](docs/PRIVACY_CONSENT.md).
-

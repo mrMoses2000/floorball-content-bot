@@ -112,3 +112,38 @@ async def test_authorized_coach_profile_and_superadmin_command_denial(pg_pool):
     assert "city_coach" in events[0]["payload"]["text"]
     assert "Назначенных городов: 1" in events[0]["payload"]["text"]
     assert "Недостаточно прав" in events[1]["payload"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_kazakh_transcript_confirmation_queues_extraction(pg_pool):
+    sender_id = 555004
+    user_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164, display_name, telegram_id, preferred_language)
+        VALUES ('+77011234569','KZ Coach',$1,'kz') RETURNING id
+        """,
+        sender_id,
+    )
+    transcript_id = await pg_pool.fetchval(
+        """
+        INSERT INTO messages(
+            user_id, telegram_chat_id, direction, message_type,
+            original_text, normalized_text, source_language, transcript_confirmed
+        ) VALUES ($1,$2,'inbound','voice','','Қазақша мәтін','kz',FALSE)
+        RETURNING id
+        """,
+        user_id,
+        sender_id,
+    )
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    assert await ingress.accept(message_update(1005, sender_id, "Растаймын"))
+
+    transcript = await pg_pool.fetchrow(
+        "SELECT normalized_text, transcript_confirmed FROM messages WHERE id=$1",
+        transcript_id,
+    )
+    job = await pg_pool.fetchrow("SELECT kind, payload FROM jobs WHERE kind='extract'")
+    assert transcript["normalized_text"] == "Қазақша мәтін"
+    assert transcript["transcript_confirmed"] is True
+    assert job["payload"]["text"] == "Қазақша мәтін"

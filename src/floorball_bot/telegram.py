@@ -183,6 +183,9 @@ class TelegramIngress:
                 connection, actor, update.update_id, message.chat.id, message.text
             )
         elif message.voice or message.audio:
+            preferred_language = await connection.fetchval(
+                "SELECT preferred_language FROM users WHERE id=$1", actor.user_id
+            )
             media_path = await self._download_file(
                 message.voice or message.audio,
                 ".ogg" if message.voice else ".audio",
@@ -190,7 +193,11 @@ class TelegramIngress:
             await enqueue_job(
                 connection,
                 kind="transcribe",
-                payload={"path": str(media_path), "chat_id": message.chat.id, "language": "ru"},
+                payload={
+                    "path": str(media_path),
+                    "chat_id": message.chat.id,
+                    "language": preferred_language or "ru",
+                },
                 idempotency_key=stable_idempotency_key("transcribe", update.update_id),
             )
             await self._reply(
@@ -223,6 +230,65 @@ class TelegramIngress:
                 "Изображение принято в закрытое хранилище и отправлено на проверку.",
             )
         elif message.text:
+            pending_transcript = await connection.fetchrow(
+                """
+                SELECT id, normalized_text
+                FROM messages
+                WHERE user_id=$1 AND telegram_chat_id=$2
+                  AND message_type IN ('voice','audio')
+                  AND transcript_confirmed=FALSE
+                  AND normalized_text <> ''
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                actor.user_id,
+                message.chat.id,
+            )
+            if pending_transcript:
+                confirmations = {
+                    "подтверждаю",
+                    "подтвердить",
+                    "верно",
+                    "да",
+                    "растаймын",
+                    "дұрыс",
+                    "иә",
+                }
+                supplied_text = message.text.strip()
+                transcript_text = (
+                    pending_transcript["normalized_text"]
+                    if supplied_text.casefold() in confirmations
+                    else supplied_text
+                )
+                await connection.execute(
+                    """
+                    UPDATE messages
+                    SET normalized_text=$2, transcript_confirmed=TRUE
+                    WHERE id=$1
+                    """,
+                    pending_transcript["id"],
+                    transcript_text,
+                )
+                await enqueue_job(
+                    connection,
+                    kind="extract",
+                    payload={
+                        "text": transcript_text,
+                        "chat_id": message.chat.id,
+                        "user_id": str(actor.user_id),
+                    },
+                    idempotency_key=stable_idempotency_key(
+                        "confirmed-transcript", pending_transcript["id"]
+                    ),
+                )
+                await self._reply(
+                    connection,
+                    update.update_id,
+                    message.chat.id,
+                    "Расшифровка подтверждена и добавлена в черновик.",
+                )
+                return
             await enqueue_job(
                 connection,
                 kind="extract",
