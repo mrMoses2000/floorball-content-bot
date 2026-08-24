@@ -1,0 +1,18 @@
+[Unit]
+Description=Floorball Content Bot daily backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=floorballbot
+Group=floorballbot
+WorkingDirectory=/opt/floorball-content-bot
+EnvironmentFile=/etc/floorball-bot.env
+ExecStart=/opt/floorball-content-bot/scripts/backup.sh
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/backups/floorball-bot
+SyslogIdentifier=floorball-backup
+
