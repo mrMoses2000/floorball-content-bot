@@ -7,6 +7,7 @@ import pytest
 from aiogram.types import Chat, Contact, Message, Update, User
 
 from floorball_bot.db import create_pool, run_migrations
+from floorball_bot.dialogue.repository import DialogueSpecRepository
 from floorball_bot.telegram import TelegramIngress
 
 pytestmark = pytest.mark.postgres
@@ -107,11 +108,14 @@ async def test_authorized_coach_profile_and_superadmin_command_denial(pg_pool):
 
     await ingress.accept(message_update(1003, sender_id, "/profile"))
     await ingress.accept(message_update(1004, sender_id, "/publish"))
+    await ingress.accept(message_update(1012, sender_id, "Алматы"))
     events = await pg_pool.fetch("SELECT payload FROM outbox_events ORDER BY created_at")
 
     assert "city_coach" in events[0]["payload"]["text"]
     assert "Назначенных городов: 1" in events[0]["payload"]["text"]
     assert "Недостаточно прав" in events[1]["payload"]["text"]
+    assert "Сначала выберите" in events[2]["payload"]["text"]
+    assert await pg_pool.fetchval("SELECT count(*) FROM jobs WHERE kind='extract'") == 0
 
 
 @pytest.mark.asyncio
@@ -124,14 +128,30 @@ async def test_kazakh_transcript_confirmation_queues_extraction(pg_pool):
         """,
         sender_id,
     )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id, role_name) VALUES ($1,'coach_form')", user_id
+    )
+    loaded = DialogueSpecRepository().load("trainer")
+    session_id = await pg_pool.fetchval(
+        """
+        INSERT INTO conversation_sessions(
+            user_id, workflow, definition_version, definition_hash
+        ) VALUES ($1,'trainer',$2,$3) RETURNING id
+        """,
+        user_id,
+        loaded.spec.version,
+        loaded.sha256,
+    )
+    await pg_pool.execute("INSERT INTO conversation_memory(session_id) VALUES ($1)", session_id)
     transcript_id = await pg_pool.fetchval(
         """
         INSERT INTO messages(
-            user_id, telegram_chat_id, direction, message_type,
+            session_id, user_id, telegram_chat_id, direction, message_type,
             original_text, normalized_text, source_language, transcript_confirmed
-        ) VALUES ($1,$2,'inbound','voice','','Қазақша мәтін','kz',FALSE)
+        ) VALUES ($1,$2,$3,'inbound','voice','','Қазақша мәтін','kz',FALSE)
         RETURNING id
         """,
+        session_id,
         user_id,
         sender_id,
     )
@@ -147,10 +167,12 @@ async def test_kazakh_transcript_confirmation_queues_extraction(pg_pool):
     assert transcript["normalized_text"] == "Қазақша мәтін"
     assert transcript["transcript_confirmed"] is True
     assert job["payload"]["text"] == "Қазақша мәтін"
+    assert job["payload"]["mode"] == "trainer"
+    assert job["payload"]["session_id"] == str(session_id)
 
 
 @pytest.mark.asyncio
-async def test_coach_form_role_collects_critical_fields_and_requires_submit(pg_pool):
+async def test_coach_form_role_starts_only_pinned_trainer_dialogue(pg_pool):
     sender_id = 555005
     user_id = await pg_pool.fetchval(
         """
@@ -168,28 +190,22 @@ async def test_coach_form_role_collects_critical_fields_and_requires_submit(pg_p
     await ingress.accept(message_update(1007, sender_id, "/coach-form"))
     await ingress.accept(message_update(1008, sender_id, "Тестовый тренер"))
     await ingress.accept(message_update(1009, sender_id, "/resume"))
-    await ingress.accept(
-        message_update(
-            1010,
-            sender_id,
-            "Город: Алматы; Клуб: Тест; Стаж: 2 года; Связь: Telegram",
-        )
-    )
-    await ingress.accept(message_update(1011, sender_id, "/submit"))
 
-    assert await pg_pool.fetchval("SELECT count(*) FROM jobs WHERE kind='extract'") == 0
+    job = await pg_pool.fetchrow("SELECT payload FROM jobs WHERE kind='extract'")
+    assert job["payload"]["mode"] == "trainer"
+    assert job["payload"]["session_id"]
     session = await pg_pool.fetchrow(
-        "SELECT workflow, status FROM conversation_sessions WHERE user_id=$1", user_id
-    )
-    assert dict(session) == {"workflow": "coach_form", "status": "completed"}
-    memory = await pg_pool.fetchval(
-        "SELECT structured_memory FROM conversation_memory WHERE session_id=("
-        "SELECT id FROM conversation_sessions WHERE user_id=$1)",
+        """
+        SELECT workflow, status, definition_version, definition_hash
+        FROM conversation_sessions WHERE user_id=$1
+        """,
         user_id,
     )
-    assert memory["fields"]["full_name"] == "Тестовый тренер"
-    assert memory["fields"]["city_region"] == "Алматы"
-    answer = await pg_pool.fetchval(
-        "SELECT payload FROM outbox_events ORDER BY created_at DESC LIMIT 1"
+    assert session["workflow"] == "trainer"
+    assert session["status"] == "active"
+    assert session["definition_version"] == "2026-08-25"
+    assert len(session["definition_hash"]) == 64
+    denied = await pg_pool.fetchval(
+        "SELECT payload FROM outbox_events ORDER BY created_at LIMIT 1"
     )
-    assert "не публикуется автоматически" in answer["text"]
+    assert "анкета тренера" in denied["text"]

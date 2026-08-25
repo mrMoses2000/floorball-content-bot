@@ -22,6 +22,27 @@ journalctl -u floorball-bot -u floorball-worker --since today
 sudo -u floorballbot /opt/floorball-content-bot/.venv/bin/floorball-bot health
 ```
 
+## Текущий локальный запуск
+
+На машине разработки бот и worker установлены как user units и включены в `default.target`:
+
+```bash
+systemctl --user status floorball-content-bot.service floorball-content-worker.service
+systemctl --user restart floorball-content-bot.service floorball-content-worker.service
+journalctl --user -u floorball-content-bot.service -u floorball-content-worker.service --since today
+```
+
+Для пользователя `moses` включён linger, поэтому units запускаются после перезагрузки без
+интерактивного входа. Они используют `/home/moses/tg_bot_floorball_site/.env` с mode `0600`.
+После изменения Python-кода выполните restart обоих units; после изменения только значений
+`.env` также достаточно restart. Миграции перед запуском применяются явно:
+
+```bash
+cd /home/moses/tg_bot_floorball_site
+.venv/bin/floorball-bot migrate
+.venv/bin/floorball-bot health
+```
+
 ## Backup/restore
 
 `scripts/backup.sh` использует `pg_dump` custom format, архивирует media, хранит 7 дневных и 4 недельных набора. DB credentials передаются libpq через environment/`PGPASSFILE`, не в argv. `scripts/restore-test.sh` отказывается работать с БД, имя которой не заканчивается `_restore_test`.
@@ -42,4 +63,3 @@ sudo -u floorballbot /opt/floorball-content-bot/.venv/bin/floorball-bot health
 После успешного main push и проверки remote `plesk-static` бот сообщает commit IDs. Оператор открывает Plesk repository `floorball-build.git`, проверяет ветку `plesk-static` и нажимает «Получить сейчас»/«Развернуть сейчас». Автоматический click не выполняется.
 
 Проверить `https://floorball.kz`, прямой reload `/clubs/almaty`, RU/KZ/EN, hero, gallery и игрока без фото.
-

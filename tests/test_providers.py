@@ -1,6 +1,11 @@
+import json
+import re
+
 import httpx
 import pytest
 
+from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
+from floorball_bot.dialogue.patches import ExtractedDialoguePatch
 from floorball_bot.domain import ExtractedCityPatch
 from floorball_bot.errors import PermanentProviderError
 from floorball_bot.providers import transcription
@@ -108,3 +113,84 @@ async def test_codex_rejects_unbounded_input():
     extractor = CodexExtractor()
     with pytest.raises(PermanentProviderError):
         await extractor.extract("x" * 50_001, ExtractedCityPatch)
+
+
+@pytest.mark.asyncio
+async def test_every_dialogue_codex_call_embeds_pinned_spec_and_safe_context():
+    class CapturingExtractor(CodexExtractor):
+        def __init__(self):
+            super().__init__()
+            self.prompts: list[str] = []
+
+        async def _run(self, prompt: str, schema: dict) -> str:
+            self.prompts.append(prompt)
+            mode = re.search(r"mode=([a-z]+),", prompt).group(1)
+            spec_hash = re.search(r"SPEC_SHA256: ([0-9a-f]{64})", prompt).group(1)
+            context_hash = re.search(r"CONTEXT_SHA256: ([0-9a-f]{64})", prompt).group(1)
+            return json.dumps(
+                {
+                    "mode": mode,
+                    "spec_sha256": spec_hash,
+                    "context_sha256": context_hash,
+                    "fields": [],
+                    "next_questions": [],
+                    "warnings": [],
+                }
+            )
+
+    extractor = CapturingExtractor()
+    for mode in DialogueMode:
+        result = await extractor.extract(
+            "Тест",
+            ExtractedDialoguePatch,
+            mode=mode,
+            context={"safe_sentinel": mode.value},
+            known_fields={},
+        )
+        assert result.mode == mode
+    assert len(extractor.prompts) == 4
+    for mode, prompt in zip(DialogueMode, extractor.prompts, strict=True):
+        loaded = DialogueSpecRepository().load(mode)
+        assert f"SPEC_SHA256: {loaded.sha256}" in prompt
+        assert f'"safe_sentinel":"{mode.value}"' in prompt
+        assert "DETERMINISTIC_GAP_REPORT_JSON:" in prompt
+        assert "untrusted_user_text" in prompt
+
+
+@pytest.mark.asyncio
+async def test_codex_repair_call_keeps_the_same_trusted_policy():
+    class RepairingExtractor(CodexExtractor):
+        def __init__(self):
+            super().__init__()
+            self.prompts: list[str] = []
+
+        async def _run(self, prompt: str, schema: dict) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return "not-json"
+            mode = re.search(r"mode=([a-z]+),", prompt).group(1)
+            spec_hash = re.search(r"SPEC_SHA256: ([0-9a-f]{64})", prompt).group(1)
+            context_hash = re.search(r"CONTEXT_SHA256: ([0-9a-f]{64})", prompt).group(1)
+            return json.dumps(
+                {
+                    "mode": mode,
+                    "spec_sha256": spec_hash,
+                    "context_sha256": context_hash,
+                    "fields": [],
+                    "next_questions": [],
+                    "warnings": [],
+                }
+            )
+
+    extractor = RepairingExtractor()
+    await extractor.extract(
+        "Тест",
+        ExtractedDialoguePatch,
+        mode=DialogueMode.STRATEGY,
+        context={"mission": "missing"},
+    )
+    assert len(extractor.prompts) == 2
+    assert "DIALOGUE_SPEC_JSON:" in extractor.prompts[0]
+    assert "DIALOGUE_SPEC_JSON:" in extractor.prompts[1]
+    first_hash = re.search(r"SPEC_SHA256: ([0-9a-f]{64})", extractor.prompts[0]).group(1)
+    assert f"SPEC_SHA256: {first_hash}" in extractor.prompts[1]

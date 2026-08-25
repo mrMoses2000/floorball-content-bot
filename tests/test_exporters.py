@@ -81,3 +81,19 @@ def test_prompt_injection_text_is_data_and_schema_rejects_extra_actions():
                 "shell_command": "git push --force",
             }
         )
+
+
+def test_public_contract_rejects_urls_frontend_would_silently_strip():
+    with pytest.raises(ValidationBlocked, match="public contract"):
+        build_city_payload(
+            [city(hero="javascript:alert(1)")],
+            generated_at=datetime.now(UTC),
+        )
+
+
+def test_public_contract_rejects_invalid_coordinates():
+    with pytest.raises(ValidationBlocked, match="public contract"):
+        build_city_payload(
+            [city(geoCoords=[200, 95])],
+            generated_at=datetime.now(UTC),
+        )

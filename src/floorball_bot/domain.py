@@ -3,10 +3,22 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
+from urllib.parse import urlparse
 from uuid import UUID
 
 import phonenumbers
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _validate_public_url(value: str, *, allow_local: bool = False) -> str:
+    if not value:
+        return value
+    if allow_local and value.startswith("/") and not value.startswith("//"):
+        return value
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("public URL must use HTTPS")
+    return value
 
 
 class Role(StrEnum):
@@ -140,6 +152,11 @@ class PublicPlayer(BaseModel):
     bioKz: str = Field(default="", max_length=900)
     bioEn: str = Field(default="", max_length=900)
 
+    @field_validator("photo")
+    @classmethod
+    def validate_photo(cls, value: str) -> str:
+        return _validate_public_url(value, allow_local=True)
+
     @model_validator(mode="after")
     def require_name_and_bio(self) -> PublicPlayer:
         if not (self.nameRu or self.nameKz or self.nameEn):
@@ -164,6 +181,11 @@ class PublicGalleryItem(BaseModel):
     captionEn: str = Field(default="", max_length=600)
     author: str = Field(default="", max_length=180)
     takenAt: str = Field(default="", max_length=40)
+
+    @field_validator("src", "thumbnail")
+    @classmethod
+    def validate_image_url(cls, value: str) -> str:
+        return _validate_public_url(value, allow_local=True)
 
 
 class PublicCity(BaseModel):
@@ -194,6 +216,19 @@ class PublicCity(BaseModel):
     historyKz: str = Field(default="", max_length=2400)
     historyEn: str = Field(default="", max_length=2400)
 
+    @field_validator("hero")
+    @classmethod
+    def validate_hero(cls, value: str) -> str:
+        return _validate_public_url(value, allow_local=True)
+
+    @model_validator(mode="after")
+    def validate_coordinates(self) -> PublicCity:
+        if self.geoCoords is not None:
+            longitude, latitude = self.geoCoords
+            if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+                raise ValueError("geoCoords must contain valid longitude and latitude")
+        return self
+
 
 class CityPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -201,6 +236,137 @@ class CityPayload(BaseModel):
     version: Literal[1] = 1
     generatedAt: str
     cities: list[PublicCity]
+
+
+class FederationValue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(default="", max_length=80)
+    titleRu: str = Field(default="", max_length=160)
+    titleKz: str = Field(default="", max_length=160)
+    descriptionRu: str = Field(default="", max_length=800)
+    descriptionKz: str = Field(default="", max_length=800)
+
+    @model_validator(mode="after")
+    def require_title(self) -> FederationValue:
+        if not (self.titleRu or self.titleKz):
+            raise ValueError("federation value needs a localized title")
+        return self
+
+
+class FederationGoal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(default="", max_length=80)
+    titleRu: str = Field(default="", max_length=200)
+    titleKz: str = Field(default="", max_length=200)
+    descriptionRu: str = Field(default="", max_length=900)
+    descriptionKz: str = Field(default="", max_length=900)
+    kpiRu: str = Field(default="", max_length=300)
+    kpiKz: str = Field(default="", max_length=300)
+    ownerRu: str = Field(default="", max_length=180)
+    ownerKz: str = Field(default="", max_length=180)
+    deadlineRu: str = Field(default="", max_length=100)
+    deadlineKz: str = Field(default="", max_length=100)
+
+    @model_validator(mode="after")
+    def require_title(self) -> FederationGoal:
+        if not (self.titleRu or self.titleKz):
+            raise ValueError("federation goal needs a localized title")
+        return self
+
+
+class FederationMission(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    statementRu: str = Field(default="", max_length=2400)
+    statementKz: str = Field(default="", max_length=2400)
+    visionRu: str = Field(default="", max_length=2400)
+    visionKz: str = Field(default="", max_length=2400)
+    values: list[FederationValue] = Field(default_factory=list, max_length=8)
+    goals: list[FederationGoal] = Field(default_factory=list, max_length=12)
+
+
+class FederationTimelineItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(default="", max_length=80)
+    yearRu: str = Field(default="", max_length=32)
+    yearKz: str = Field(default="", max_length=32)
+    titleRu: str = Field(default="", max_length=220)
+    titleKz: str = Field(default="", max_length=220)
+    descriptionRu: str = Field(default="", max_length=2400)
+    descriptionKz: str = Field(default="", max_length=2400)
+    sourceUrl: str = Field(default="", max_length=1000)
+
+    @field_validator("sourceUrl")
+    @classmethod
+    def validate_source_url(cls, value: str) -> str:
+        return _validate_public_url(value)
+
+    @model_validator(mode="after")
+    def require_title(self) -> FederationTimelineItem:
+        if not (self.titleRu or self.titleKz):
+            raise ValueError("timeline item needs a localized title")
+        return self
+
+
+class FederationRoadmapItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(default="", max_length=80)
+    phaseRu: str = Field(default="", max_length=160)
+    phaseKz: str = Field(default="", max_length=160)
+    labelRu: str = Field(default="", max_length=120)
+    labelKz: str = Field(default="", max_length=120)
+    itemsRu: str = Field(default="", max_length=2400)
+    itemsKz: str = Field(default="", max_length=2400)
+    done: bool = False
+
+    @model_validator(mode="after")
+    def require_phase(self) -> FederationRoadmapItem:
+        if not (self.phaseRu or self.phaseKz):
+            raise ValueError("roadmap item needs a localized phase")
+        return self
+
+
+class FederationLeader(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(max_length=80)
+    nameRu: str = Field(default="", max_length=160)
+    nameKz: str = Field(default="", max_length=160)
+    roleRu: str = Field(default="", max_length=160)
+    roleKz: str = Field(default="", max_length=160)
+    bioRu: str = Field(default="", max_length=1200)
+    bioKz: str = Field(default="", max_length=1200)
+    focusRu: str = Field(default="", max_length=500)
+    focusKz: str = Field(default="", max_length=500)
+    photo: str = Field(default="", max_length=1000)
+    email: str = Field(default="", max_length=180)
+    phone: str = Field(default="", max_length=80)
+
+    @field_validator("photo")
+    @classmethod
+    def validate_photo(cls, value: str) -> str:
+        return _validate_public_url(value)
+
+    @model_validator(mode="after")
+    def require_name(self) -> FederationLeader:
+        if not (self.nameRu or self.nameKz):
+            raise ValueError("leader needs a localized name")
+        return self
+
+
+class PublicFederation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mission: FederationMission = Field(default_factory=FederationMission)
+    history: list[FederationTimelineItem] = Field(default_factory=list, max_length=15)
+    achievements: list[FederationTimelineItem] = Field(default_factory=list, max_length=15)
+    roadmap: list[FederationRoadmapItem] = Field(default_factory=list, max_length=12)
+    leadership: list[FederationLeader] = Field(default_factory=list, max_length=12)
+
+
+class FederationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ok: Literal[True] = True
+    version: Literal[1] = 1
+    generatedAt: str = Field(max_length=60)
+    federation: PublicFederation
 
 
 class Actor(BaseModel):

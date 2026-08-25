@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -5,6 +6,12 @@ from uuid import uuid4
 import pytest
 
 from floorball_bot.db import create_pool, run_migrations, transaction
+from floorball_bot.dialogue.patches import (
+    ExtractedDialoguePatch,
+    ExtractedFieldPatch,
+    canonical_context,
+)
+from floorball_bot.dialogue.repository import DialogueSpecRepository
 from floorball_bot.domain import Actor, DraftStatus, ExtractedCityPatch, Role
 from floorball_bot.providers.codex import FakeExtractor
 from floorball_bot.providers.transcription import FakeTranscriber
@@ -36,9 +43,10 @@ async def pg_pool():
 
 @pytest.mark.asyncio
 async def test_migrations_are_repeatable(pg_pool):
-    assert await run_migrations(pg_pool, Path(__file__).parents[1] / "migrations") == []
+    migrations_dir = Path(__file__).parents[1] / "migrations"
+    assert await run_migrations(pg_pool, migrations_dir) == []
     count = await pg_pool.fetchval("SELECT count(*) FROM schema_migrations")
-    assert count == 5
+    assert count == len(list(migrations_dir.glob("[0-9][0-9][0-9]_*.sql")))
 
 
 @pytest.mark.asyncio
@@ -183,3 +191,96 @@ async def test_voice_transcript_requires_confirmation_before_extraction(pg_pool,
     assert await pg_pool.fetchval("SELECT count(*) FROM jobs WHERE kind='extract'") == 0
     reply = await pg_pool.fetchval("SELECT payload FROM outbox_events")
     assert "Подтвердите текст" in reply["text"]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_worker_uses_pinned_spec_and_safe_db_snapshot(pg_pool):
+    loaded = DialogueSpecRepository().load("trainer")
+    user_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164, display_name, telegram_id)
+        VALUES ('+77011234888','Dialogue Coach',8877) RETURNING id
+        """
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id, role_name) VALUES ($1,'coach_form')", user_id
+    )
+    await pg_pool.execute(
+        """
+        INSERT INTO cities(slug, name_ru, name_kz, name_en)
+        VALUES ('almaty','Алматы','Алматы','Almaty')
+        """
+    )
+    session_id = await pg_pool.fetchval(
+        """
+        INSERT INTO conversation_sessions(
+            user_id, workflow, definition_version, definition_hash
+        ) VALUES ($1,'trainer',$2,$3) RETURNING id
+        """,
+        user_id,
+        loaded.spec.version,
+        loaded.sha256,
+    )
+    await pg_pool.execute(
+        "INSERT INTO conversation_memory(session_id) VALUES ($1)", session_id
+    )
+
+    class EchoExtractor:
+        async def extract(
+            self, text, output_model, *, mode=None, context=None, known_fields=None
+        ):
+            _, context_hash = canonical_context(context)
+            return ExtractedDialoguePatch(
+                mode=mode,
+                spec_sha256=loaded.sha256,
+                context_sha256=context_hash,
+                fields=[
+                    ExtractedFieldPatch(
+                        field_id="respondent",
+                        value_json=json.dumps(
+                            {"name": "Тестовый тренер", "role": "тренер"},
+                            ensure_ascii=False,
+                        ),
+                    )
+                ],
+            )
+
+    async with transaction(pg_pool) as connection:
+        await enqueue_job(
+            connection,
+            kind="extract",
+            payload={
+                "text": "Я тестовый тренер",
+                "chat_id": 8877,
+                "user_id": str(user_id),
+                "session_id": str(session_id),
+                "mode": "trainer",
+            },
+            idempotency_key=f"dialogue:{uuid4()}",
+        )
+    job = await claim_job(pg_pool, worker_id="dialogue-worker")
+    worker = Worker(
+        pg_pool,
+        extractor=EchoExtractor(),
+        transcriber=FakeTranscriber("", "ru"),
+    )
+
+    await worker.process(job)
+
+    memory = await pg_pool.fetchval(
+        "SELECT structured_memory FROM conversation_memory WHERE session_id=$1", session_id
+    )
+    assert memory["fields"]["respondent"]["name"] == "Тестовый тренер"
+    assert await pg_pool.fetchval(
+        "SELECT count(*) FROM agent_context_snapshots WHERE session_id=$1", session_id
+    ) == 1
+    stored = await pg_pool.fetchval(
+        "SELECT context FROM agent_context_snapshots WHERE session_id=$1", session_id
+    )
+    serialized = json.dumps(stored)
+    assert "+77011234888" not in serialized
+    assert "telegram_id" not in serialized
+    reply = await pg_pool.fetchval(
+        "SELECT payload FROM outbox_events WHERE idempotency_key LIKE 'dialogue-extract-result:%'"
+    )
+    assert "О каком городе" in reply["text"]

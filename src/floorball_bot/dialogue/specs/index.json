@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "modes": {
+    "trainer": {"file": "trainer.v1.json"},
+    "strategy": {"file": "strategy.v1.json"},
+    "history": {"file": "history.v1.json"},
+    "leadership": {"file": "leadership.v1.json"}
+  }
+}

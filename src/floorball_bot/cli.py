@@ -10,6 +10,12 @@ from uuid import UUID
 from aiogram import Bot
 
 from floorball_bot.config import get_settings
+from floorball_bot.context_gateway import (
+    AgentContextGateway,
+    AgentMode,
+    context_schema_catalog,
+    load_context_actor,
+)
 from floorball_bot.db import create_pool, run_migrations
 from floorball_bot.health import health_report
 from floorball_bot.importers import (
@@ -40,6 +46,11 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("bot")
     commands.add_parser("worker")
     commands.add_parser("health")
+    context = commands.add_parser("agent-context")
+    context.add_argument("--actor", required=True, type=UUID)
+    context.add_argument("--mode", required=True, choices=[mode.value for mode in AgentMode])
+    context.add_argument("--city")
+    commands.add_parser("context-schema")
     report = commands.add_parser("import-report")
     report.add_argument("path", type=Path)
     report.add_argument("--existing", type=Path)
@@ -69,6 +80,15 @@ def parser() -> argparse.ArgumentParser:
 
 
 async def async_main(args: argparse.Namespace) -> None:
+    if args.command == "context-schema":
+        print(
+            json.dumps(
+                context_schema_catalog().model_dump(mode="json"),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
     settings = get_settings()
     pool = await create_pool(settings.postgres_dsn.get_secret_value())
     try:
@@ -79,6 +99,21 @@ async def async_main(args: argparse.Namespace) -> None:
             print(
                 json.dumps(
                     await health_report(pool, settings.media_root), ensure_ascii=False, default=str
+                )
+            )
+        elif args.command == "agent-context":
+            async with pool.acquire() as connection:
+                actor = await load_context_actor(connection, args.actor)
+            if actor is None or not actor.active:
+                raise RuntimeError("agent-context requires an active actor")
+            snapshot = await AgentContextGateway(pool).snapshot(
+                actor=actor,
+                mode=AgentMode(args.mode),
+                city_slug=args.city,
+            )
+            print(
+                json.dumps(
+                    snapshot.model_dump(mode="json"), ensure_ascii=False, indent=2
                 )
             )
         elif args.command == "bot":

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 from pathlib import Path
@@ -19,11 +21,15 @@ from floorball_bot.auth import (
 )
 from floorball_bot.callbacks import consume_callback
 from floorball_bot.db import transaction
+from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
+from floorball_bot.dialogue.evaluator import evaluate_gaps
 from floorball_bot.domain import Actor, Role
 from floorball_bot.errors import AuthorizationError
 from floorball_bot.queue import accept_update, enqueue_job, enqueue_outbox, stable_idempotency_key
 
 logger = logging.getLogger(__name__)
+
+DIALOGUE_WORKFLOWS = tuple(mode.value for mode in DialogueMode)
 
 
 ROLE_COMMANDS: dict[str, tuple[Role, ...]] = {
@@ -113,6 +119,7 @@ class TelegramIngress:
         self.poll_timeout = poll_timeout
         self.download_root = download_root.resolve()
         self.max_download_bytes = max_download_bytes
+        self.dialogues = DialogueSpecRepository()
         self.offset: int | None = None
         self._stop = asyncio.Event()
 
@@ -194,11 +201,13 @@ class TelegramIngress:
             return
         if message.text and message.text.startswith("/start"):
             if actor and actor.active:
+                keyboard = self._dialogue_keyboard(actor)
                 await self._reply(
                     connection,
                     update.update_id,
                     message.chat.id,
-                    "Вы авторизованы. Используйте /profile или /help.",
+                    "Вы авторизованы. Выберите, о чём продолжить разговор.",
+                    reply_markup=keyboard,
                 )
             else:
                 keyboard = ReplyKeyboardMarkup(
@@ -227,15 +236,60 @@ class TelegramIngress:
                 "Доступ запрещён. Используйте /start для авторизации.",
             )
             return
-        if actor.roles == frozenset({Role.COACH_FORM}):
-            await self._handle_coach_form(connection, actor, update.update_id, message)
+
+        selected_mode = self._selected_dialogue_mode(message.text or "", actor)
+        if selected_mode is not None:
+            await self._start_dialogue(
+                connection,
+                actor,
+                selected_mode,
+                update.update_id,
+                message.chat.id,
+            )
+            return
+
+        dialogue_session = await connection.fetchrow(
+            """
+            SELECT id, workflow, status, definition_version, definition_hash, current_step
+            FROM conversation_sessions
+            WHERE user_id=$1 AND workflow=ANY($2::text[]) AND status='active'
+            ORDER BY last_activity_at DESC LIMIT 1
+            """,
+            actor.user_id,
+            list(DIALOGUE_WORKFLOWS),
+        )
+        if actor.roles == frozenset({Role.COACH_FORM}) and dialogue_session is None:
+            await self._reply(
+                connection,
+                update.update_id,
+                message.chat.id,
+                "Вам доступна анкета тренера. Нажмите «Продолжить как тренер» или отправьте "
+                "/coach-form.",
+                reply_markup=self._dialogue_keyboard(actor),
+            )
+            return
+        needs_dialogue = bool(message.voice or message.audio) or bool(
+            message.text and not message.text.startswith("/")
+        )
+        if dialogue_session is None and needs_dialogue:
+            await self._reply(
+                connection,
+                update.update_id,
+                message.chat.id,
+                "Сначала выберите, в каком качестве продолжить разговор. Это нужно, чтобы "
+                "вопросы и сохранение данных соответствовали выбранному разделу.",
+                reply_markup=self._dialogue_keyboard(actor),
+            )
             return
         await connection.execute(
             """
-            INSERT INTO messages(user_id, telegram_chat_id, telegram_message_id, telegram_update_id,
-                                 direction, message_type, original_text)
-            VALUES ($1,$2,$3,$4,'inbound',$5,$6)
+            INSERT INTO messages(
+                session_id, user_id, telegram_chat_id, telegram_message_id,
+                telegram_update_id, direction, message_type, original_text
+            )
+            VALUES ($1,$2,$3,$4,$5,'inbound',$6,$7)
             """,
+            dialogue_session["id"] if dialogue_session else None,
             actor.user_id,
             message.chat.id,
             message.message_id,
@@ -244,6 +298,15 @@ class TelegramIngress:
             message.text or message.caption or "",
         )
         if message.text and message.text.startswith("/"):
+            if dialogue_session and await self._handle_dialogue_command(
+                connection,
+                actor,
+                dialogue_session,
+                update.update_id,
+                message.chat.id,
+                message.text,
+            ):
+                return
             await self._handle_command(
                 connection, actor, update.update_id, message.chat.id, message.text
             )
@@ -262,6 +325,8 @@ class TelegramIngress:
                     "path": str(media_path),
                     "chat_id": message.chat.id,
                     "language": preferred_language or "ru",
+                    "session_id": str(dialogue_session["id"]) if dialogue_session else None,
+                    "mode": dialogue_session["workflow"] if dialogue_session else None,
                 },
                 idempotency_key=stable_idempotency_key("transcribe", update.update_id),
             )
@@ -297,15 +362,17 @@ class TelegramIngress:
         elif message.text:
             pending_transcript = await connection.fetchrow(
                 """
-                SELECT id, normalized_text
+                SELECT m.id, m.normalized_text, m.session_id, s.workflow
                 FROM messages
-                WHERE user_id=$1 AND telegram_chat_id=$2
-                  AND message_type IN ('voice','audio')
-                  AND transcript_confirmed=FALSE
-                  AND normalized_text <> ''
-                ORDER BY created_at DESC
+                AS m
+                LEFT JOIN conversation_sessions s ON s.id=m.session_id
+                WHERE m.user_id=$1 AND m.telegram_chat_id=$2
+                  AND m.message_type IN ('voice','audio')
+                  AND m.transcript_confirmed=FALSE
+                  AND m.normalized_text <> ''
+                ORDER BY m.created_at DESC
                 LIMIT 1
-                FOR UPDATE
+                FOR UPDATE OF m
                 """,
                 actor.user_id,
                 message.chat.id,
@@ -342,6 +409,10 @@ class TelegramIngress:
                         "text": transcript_text,
                         "chat_id": message.chat.id,
                         "user_id": str(actor.user_id),
+                        "session_id": str(pending_transcript["session_id"])
+                        if pending_transcript["session_id"]
+                        else None,
+                        "mode": pending_transcript["workflow"],
                     },
                     idempotency_key=stable_idempotency_key(
                         "confirmed-transcript", pending_transcript["id"]
@@ -361,6 +432,8 @@ class TelegramIngress:
                     "text": message.text,
                     "chat_id": message.chat.id,
                     "user_id": str(actor.user_id),
+                    "session_id": str(dialogue_session["id"]) if dialogue_session else None,
+                    "mode": dialogue_session["workflow"] if dialogue_session else None,
                 },
                 idempotency_key=stable_idempotency_key("extract", update.update_id),
             )
@@ -542,6 +615,255 @@ class TelegramIngress:
             message.chat.id,
             self._coach_progress_text(fields, skipped),
         )
+
+    def _available_dialogues(self, actor: Actor):
+        roles = {role.value for role in actor.roles}
+        return tuple(
+            loaded
+            for loaded in self.dialogues.load_all()
+            if roles.intersection(loaded.spec.allowed_roles)
+        )
+
+    def _dialogue_keyboard(self, actor: Actor) -> dict | None:
+        available = self._available_dialogues(actor)
+        if not available:
+            return None
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=loaded.spec.ui_label.ru)] for loaded in available
+            ],
+            resize_keyboard=True,
+        )
+        return keyboard.model_dump(exclude_none=True)
+
+    def _selected_dialogue_mode(self, text: str, actor: Actor) -> DialogueMode | None:
+        normalized = text.strip().casefold()
+        if normalized.split("@", 1)[0] == "/coach-form":
+            requested = DialogueMode.TRAINER
+            return requested if any(
+                loaded.spec.mode == requested for loaded in self._available_dialogues(actor)
+            ) else None
+        for loaded in self._available_dialogues(actor):
+            if normalized in {
+                loaded.spec.ui_label.ru.casefold(),
+                loaded.spec.ui_label.kz.casefold(),
+            }:
+                return loaded.spec.mode
+        return None
+
+    async def _start_dialogue(
+        self,
+        connection: asyncpg.Connection,
+        actor: Actor,
+        mode: DialogueMode,
+        update_id: int,
+        chat_id: int,
+    ) -> None:
+        loaded = self.dialogues.load(mode)
+        if not {role.value for role in actor.roles}.intersection(loaded.spec.allowed_roles):
+            await self._reply(connection, update_id, chat_id, "Этот вариант вам недоступен.")
+            return
+        session = await connection.fetchrow(
+            """
+            SELECT id FROM conversation_sessions
+            WHERE user_id=$1 AND workflow=$2 AND status='active'
+            ORDER BY last_activity_at DESC LIMIT 1 FOR UPDATE
+            """,
+            actor.user_id,
+            mode.value,
+        )
+        if session is None:
+            await connection.execute(
+                """
+                UPDATE conversation_sessions SET status='paused', updated_at=now()
+                WHERE user_id=$1 AND workflow=ANY($2::text[]) AND status='active'
+                """,
+                actor.user_id,
+                list(DIALOGUE_WORKFLOWS),
+            )
+            session_id = await connection.fetchval(
+                """
+                INSERT INTO conversation_sessions(
+                    user_id, workflow, definition_version, definition_hash, current_step
+                ) VALUES ($1,$2,$3,$4,$5) RETURNING id
+                """,
+                actor.user_id,
+                mode.value,
+                loaded.spec.version,
+                loaded.sha256,
+                evaluate_gaps(loaded.spec, {}).next_field_id or "ready_to_submit",
+            )
+            await connection.execute(
+                """
+                INSERT INTO conversation_memory(session_id, structured_memory)
+                VALUES ($1, '{"fields":{},"skipped":[]}'::jsonb)
+                """,
+                session_id,
+            )
+            fields: dict = {}
+            intro = f"Начинаем: {loaded.spec.ui_label.ru.lower()}.\n\n"
+        else:
+            memory = await connection.fetchval(
+                "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
+                session["id"],
+            ) or {}
+            fields = dict(memory.get("fields", {}))
+            intro = "Продолжаем с сохранённого места.\n\n"
+        language = await connection.fetchval(
+            "SELECT preferred_language FROM users WHERE id=$1", actor.user_id
+        )
+        await self._reply(
+            connection,
+            update_id,
+            chat_id,
+            intro + self._dialogue_progress(loaded.spec, fields, language or "ru"),
+            reply_markup=self._dialogue_keyboard(actor),
+        )
+
+    @staticmethod
+    def _dialogue_progress(spec, fields: dict, language: str) -> str:
+        gaps = evaluate_gaps(spec, fields)
+        critical = len(gaps.required_to_start) + len(gaps.required_for_submit)
+        later = len(gaps.required_for_publish) + len(gaps.recommended)
+        lines = [
+            f"Заполнено разделов: {len(fields)}.",
+            "Критично до отправки: " + (str(critical) if critical else "всё заполнено"),
+            "Можно дозаполнить позже: " + (str(later) if later else "нет"),
+        ]
+        ordered = (
+            *gaps.required_to_start,
+            *gaps.required_for_submit,
+            *gaps.required_for_publish,
+            *gaps.recommended,
+        )
+        if ordered:
+            question = ordered[0].question.kz if language == "kz" else ordered[0].question.ru
+            prefix = "Важно до отправки. " if critical else "Можно добавить сейчас. "
+            lines.append(prefix + question)
+        if gaps.can_submit:
+            lines.append("Черновик уже можно отправить командой /submit.")
+        return "\n\n".join(lines)
+
+    async def _handle_dialogue_command(
+        self,
+        connection: asyncpg.Connection,
+        actor: Actor,
+        session,
+        update_id: int,
+        chat_id: int,
+        text: str,
+    ) -> bool:
+        command = text.split()[0].split("@")[0]
+        if command not in {"/status", "/resume", "/cancel", "/submit", "/skip"}:
+            return False
+        if command == "/cancel":
+            await connection.execute(
+                """
+                UPDATE conversation_sessions
+                SET status='cancelled', updated_at=now(), last_activity_at=now()
+                WHERE id=$1
+                """,
+                session["id"],
+            )
+            await self._reply(connection, update_id, chat_id, "Разговор отменён.")
+            return True
+        loaded = self.dialogues.load(session["workflow"])
+        if loaded.sha256 != session["definition_hash"]:
+            await self._reply(
+                connection,
+                update_id,
+                chat_id,
+                "Определение вопросов обновилось. Сохранённые ответы не потеряны; "
+                "администратор должен перенести сессию на новую версию.",
+            )
+            return True
+        memory = await connection.fetchval(
+            "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
+            session["id"],
+        ) or {}
+        fields = dict(memory.get("fields", {}))
+        language = await connection.fetchval(
+            "SELECT preferred_language FROM users WHERE id=$1", actor.user_id
+        ) or "ru"
+        if command in {"/status", "/resume", "/skip"}:
+            await self._reply(
+                connection,
+                update_id,
+                chat_id,
+                self._dialogue_progress(loaded.spec, fields, language),
+            )
+            return True
+        gaps = evaluate_gaps(loaded.spec, fields)
+        if not gaps.can_submit:
+            await self._reply(
+                connection,
+                update_id,
+                chat_id,
+                "Пока не хватает критически важных ответов.\n\n"
+                + self._dialogue_progress(loaded.spec, fields, language),
+            )
+            return True
+        content = {
+            "dialogue_mode": session["workflow"],
+            "definition_version": session["definition_version"],
+            "definition_hash": session["definition_hash"],
+            "fields": fields,
+        }
+        canonical = json.dumps(
+            content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        entity_type = (
+            "city"
+            if session["workflow"] == DialogueMode.TRAINER
+            else "leadership"
+            if session["workflow"] == DialogueMode.LEADERSHIP
+            else "federation"
+        )
+        draft_id = await connection.fetchval(
+            """
+            INSERT INTO drafts(
+                session_id, entity_type, status, created_by, updated_by
+            ) VALUES ($1,$2,'submitted',$3,$3) RETURNING id
+            """,
+            session["id"],
+            entity_type,
+            actor.user_id,
+        )
+        await connection.execute(
+            """
+            INSERT INTO draft_revisions(
+                draft_id, revision, content, content_hash, created_by
+            ) VALUES ($1,1,$2::jsonb,$3,$4)
+            """,
+            draft_id,
+            content,
+            hashlib.sha256(canonical.encode()).hexdigest(),
+            actor.user_id,
+        )
+        await connection.execute(
+            """
+            INSERT INTO approval_events(draft_id, revision, actor_id, action)
+            VALUES ($1,1,$2,'submitted')
+            """,
+            draft_id,
+            actor.user_id,
+        )
+        await connection.execute(
+            """
+            UPDATE conversation_sessions
+            SET status='completed', current_step='submitted', updated_at=now(),
+                last_activity_at=now()
+            WHERE id=$1
+            """,
+            session["id"],
+        )
+        await self._reply(
+            connection,
+            update_id,
+            chat_id,
+            "Черновик отправлен на редакторскую проверку. Автоматической публикации нет.",
+        )
+        return True
 
     @staticmethod
     def _coach_labeled_fields(text: str) -> dict[str, str]:
