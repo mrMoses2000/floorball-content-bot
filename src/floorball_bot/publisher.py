@@ -244,9 +244,6 @@ class GitPublisher:
                 cwd=worktree,
             )
             main_commit = (await run_command("git", "rev-parse", "HEAD", cwd=worktree)).strip()
-            await run_command(
-                "git", "push", "origin", "HEAD:main", cwd=worktree, timeout_seconds=120
-            )
             static_commit = (
                 await run_command(
                     "git", "subtree", "split", "--prefix=app/dist", "HEAD", cwd=worktree
@@ -255,18 +252,25 @@ class GitPublisher:
             await run_command(
                 "git",
                 "push",
+                "--atomic",
                 "origin",
+                "HEAD:main",
                 f"{static_commit}:refs/heads/plesk-static",
                 cwd=worktree,
                 timeout_seconds=120,
             )
+            remote_main = (
+                await run_command(
+                    "git", "ls-remote", "origin", "refs/heads/main", cwd=worktree
+                )
+            ).split()[0]
             remote_static = (
                 await run_command(
                     "git", "ls-remote", "origin", "refs/heads/plesk-static", cwd=worktree
                 )
             ).split()[0]
-            if remote_static != static_commit:
-                raise ValidationBlocked("remote plesk-static verification failed")
+            if remote_main != main_commit or remote_static != static_commit:
+                raise ValidationBlocked("remote main/plesk-static verification failed")
             await connection.execute(
                 """
                 UPDATE publication_jobs SET status='published', confirmed_by=$2,

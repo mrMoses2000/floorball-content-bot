@@ -153,6 +153,9 @@ async def async_main(args: argparse.Namespace) -> None:
                     max_pixels=settings.max_image_pixels,
                     max_derivative_bytes=settings.max_derivative_bytes,
                 ),
+                publisher=GitPublisher(
+                    pool, settings.floorball_site_repo, settings.worktree_root
+                ),
                 lease_seconds=settings.job_lease_seconds,
             )
             loop = asyncio.get_running_loop()

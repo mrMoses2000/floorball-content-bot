@@ -37,6 +37,7 @@ ROLE_COMMANDS: dict[str, tuple[Role, ...]] = {
     "/publish": (Role.SUPERADMIN,),
     "/users": (Role.SUPERADMIN,),
     "/revert": (Role.SUPERADMIN,),
+    "/readiness": (Role.SUPERADMIN,),
     "/city": (Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN),
     "/players": (Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN),
     "/gallery": (Role.CITY_COACH, Role.MEDIA_EDITOR, Role.REVIEWER, Role.SUPERADMIN),
@@ -160,13 +161,86 @@ class TelegramIngress:
                 await get_actor_by_telegram_id(connection, update.callback_query.from_user.id)
             )
             try:
-                action, _target_id = await consume_callback(
+                action, target_id = await consume_callback(
                     connection,
                     actor=actor,
                     callback_data=update.callback_query.data or "",
                 )
-                callback_text = f"Действие {action} принято для повторной проверки прав."
-            except AuthorizationError:
+                if action == "approve_preview":
+                    require_roles(actor, Role.SUPERADMIN)
+                    draft = await connection.fetchrow(
+                        """
+                        SELECT status, current_revision FROM drafts
+                        WHERE id=$1 FOR UPDATE
+                        """,
+                        target_id,
+                    )
+                    if not draft or draft["status"] not in {"under_review", "approved"}:
+                        raise AuthorizationError("snapshot is no longer reviewable")
+                    if draft["status"] == "under_review":
+                        await connection.execute(
+                            """
+                            UPDATE drafts SET status='approved', approved_revision=current_revision,
+                                updated_by=$2, updated_at=now()
+                            WHERE id=$1
+                            """,
+                            target_id,
+                            actor.user_id,
+                        )
+                        await connection.execute(
+                            """
+                            INSERT INTO approval_events(
+                                draft_id, revision, actor_id, action, reason
+                            ) VALUES ($1,$2,$3,'approved','Approved from readiness notification')
+                            """,
+                            target_id,
+                            draft["current_revision"],
+                            actor.user_id,
+                        )
+                    await enqueue_job(
+                        connection,
+                        kind="publish_preview",
+                        payload={
+                            "draft_id": str(target_id),
+                            "actor_id": str(actor.user_id),
+                            "chat_id": update.callback_query.from_user.id,
+                        },
+                        idempotency_key=stable_idempotency_key(
+                            "publish-preview",
+                            target_id,
+                            draft["current_revision"],
+                            update.update_id,
+                        ),
+                    )
+                    callback_text = (
+                        "Одобрение принято. Собираю preview, запускаю тесты сайта и покажу diff. "
+                        "Commit/push пока не выполняются."
+                    )
+                elif action.startswith("confirm_publish|"):
+                    require_roles(actor, Role.SUPERADMIN)
+                    preview_nonce = action.partition("|")[2]
+                    if not preview_nonce:
+                        raise AuthorizationError("publication nonce is missing")
+                    await enqueue_job(
+                        connection,
+                        kind="publish_confirm",
+                        payload={
+                            "publication_id": str(target_id),
+                            "nonce": preview_nonce,
+                            "actor_id": str(actor.user_id),
+                            "chat_id": update.callback_query.from_user.id,
+                        },
+                        idempotency_key=stable_idempotency_key(
+                            "publish-confirm", target_id, actor.user_id, update.update_id
+                        ),
+                    )
+                    callback_text = (
+                        "Добро принято для конкретного preview. Выполняю commit, push и "
+                        "проверку удалённых веток."
+                    )
+                else:
+                    raise AuthorizationError("unsupported callback action")
+            except (AuthorizationError, ValueError):
                 callback_text = (
                     "Кнопка недействительна, устарела или принадлежит другому пользователю."
                 )
@@ -981,8 +1055,16 @@ class TelegramIngress:
             response = (
                 "Команды: /status /resume /cancel /profile /city /players /gallery "
                 "/submit /history. Проверяющим: /review. Администратору: "
-                "/publish /users /revert."
+                "/readiness /publish /users /revert."
             )
+        elif command == "/readiness":
+            await enqueue_job(
+                connection,
+                kind="readiness_scan",
+                payload={"actor_id": str(actor.user_id), "chat_id": chat_id},
+                idempotency_key=stable_idempotency_key("readiness-scan", update_id),
+            )
+            response = "Проверка готовности запущена. Новые готовые ревизии придут отдельно."
         elif command in {"/status", "/resume", "/cancel", "/submit", "/history"}:
             response = (
                 f"Команда {command} принята. Текущий workflow будет загружен из сохранённой сессии."

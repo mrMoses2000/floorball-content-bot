@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import asyncpg
 
+from floorball_bot.callbacks import create_callback
 from floorball_bot.context_gateway import AgentContextGateway, AgentMode, load_context_actor
 from floorball_bot.db import transaction
 from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
@@ -20,6 +22,7 @@ from floorball_bot.errors import PermanentProviderError, RetryableProviderError
 from floorball_bot.media import MediaPipeline
 from floorball_bot.providers.codex import StructuredExtractor
 from floorball_bot.providers.transcription import Transcriber
+from floorball_bot.publisher import GitPublisher
 from floorball_bot.queue import (
     ClaimedJob,
     claim_job,
@@ -28,6 +31,7 @@ from floorball_bot.queue import (
     fail_job,
     stable_idempotency_key,
 )
+from floorball_bot.readiness import scan_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +44,20 @@ class Worker:
         extractor: StructuredExtractor,
         transcriber: Transcriber,
         media_pipeline: MediaPipeline | None = None,
+        publisher: GitPublisher | None = None,
         lease_seconds: int = 300,
+        readiness_interval_seconds: int = 60,
     ) -> None:
         self.pool = pool
         self.extractor = extractor
         self.transcriber = transcriber
         self.media_pipeline = media_pipeline
+        self.publisher = publisher
         self.dialogues = DialogueSpecRepository()
         self.context_gateway = AgentContextGateway(pool)
         self.lease_seconds = lease_seconds
+        self.readiness_interval_seconds = readiness_interval_seconds
+        self._last_readiness_scan = 0.0
         self.worker_id = f"worker-{uuid4()}"
         self.stop_event = asyncio.Event()
 
@@ -61,6 +70,13 @@ class Worker:
                 self.pool, worker_id=self.worker_id, lease_seconds=self.lease_seconds
             )
             if job is None:
+                now = time.monotonic()
+                if now - self._last_readiness_scan >= self.readiness_interval_seconds:
+                    self._last_readiness_scan = now
+                    try:
+                        await scan_readiness(self.pool)
+                    except Exception:
+                        logger.exception("readiness_scan_failed")
                 try:
                     await asyncio.wait_for(self.stop_event.wait(), timeout=1)
                 except TimeoutError:
@@ -76,6 +92,12 @@ class Worker:
                 await self._extract(job)
             elif job.kind == "media":
                 await self._media(job)
+            elif job.kind == "readiness_scan":
+                await scan_readiness(self.pool)
+            elif job.kind == "publish_preview":
+                await self._publish_preview(job)
+            elif job.kind == "publish_confirm":
+                await self._publish_confirm(job)
             else:
                 raise PermanentProviderError(f"unsupported job kind: {job.kind}")
             await complete_job(self.pool, job.id)
@@ -85,6 +107,246 @@ class Worker:
         except Exception as exc:
             await fail_job(self.pool, job, type(exc).__name__, retryable=False)
             logger.exception("job_dead", extra={"job_id": str(job.id), "error": type(exc).__name__})
+
+    def _require_publisher(self) -> GitPublisher:
+        if self.publisher is None:
+            raise PermanentProviderError("publisher is not configured")
+        return self.publisher
+
+    async def _publication_recipients(self, fallback_chat_id: int) -> set[int]:
+        rows = await self.pool.fetch(
+            """
+            SELECT DISTINCT u.telegram_id
+            FROM notification_subscriptions s
+            JOIN users u ON u.id=s.user_id AND u.active=TRUE AND u.deleted_at IS NULL
+            JOIN user_roles ur ON ur.user_id=u.id AND ur.role_name='superadmin'
+                              AND ur.revoked_at IS NULL
+            WHERE s.event_type='publication_status' AND s.enabled=TRUE
+              AND u.telegram_id IS NOT NULL
+            """
+        )
+        return {fallback_chat_id, *(int(row["telegram_id"]) for row in rows)}
+
+    async def _publish_preview(self, job: ClaimedJob) -> None:
+        publisher = self._require_publisher()
+        draft_id = UUID(str(job.payload["draft_id"]))
+        actor_id = UUID(str(job.payload["actor_id"]))
+        chat_id = int(job.payload["chat_id"])
+        async with transaction(self.pool) as connection:
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('floorball-preview-create'))"
+            )
+            row = await connection.fetchrow(
+                """
+                SELECT d.approved_revision, r.content, r.content_hash
+                FROM drafts d
+                JOIN draft_revisions r
+                  ON r.draft_id=d.id AND r.revision=d.approved_revision
+                WHERE d.id=$1 AND d.status='approved'
+                FOR UPDATE OF d
+                """,
+                draft_id,
+            )
+            if not row:
+                raise PermanentProviderError("draft must have an approved revision")
+            active = await connection.fetchrow(
+                """
+                SELECT id, status FROM publication_jobs
+                WHERE draft_id=$1 AND revision=$2
+                  AND status NOT IN ('failed','cancelled')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                draft_id,
+                row["approved_revision"],
+            )
+            if active:
+                if active["status"] in {"preview_ready", "published"}:
+                    await enqueue_outbox(
+                        connection,
+                        event_type="telegram_message",
+                        payload={
+                            "chat_id": chat_id,
+                            "text": "Для этой ревизии preview уже создан или публикация завершена.",
+                        },
+                        idempotency_key=stable_idempotency_key(
+                            "preview-already-active", job.id, active["id"]
+                        ),
+                    )
+                    return
+                raise RetryableProviderError("publication preview is already building")
+            publication_id = await connection.fetchval(
+                """
+                INSERT INTO publication_jobs(
+                    draft_id, revision, revision_hash, requested_by
+                ) VALUES ($1,$2,$3,$4) RETURNING id
+                """,
+                draft_id,
+                row["approved_revision"],
+                row["content_hash"],
+                actor_id,
+            )
+            content = row["content"]
+        try:
+            preview = await publisher.build_preview(publication_id, content)
+        except Exception as exc:
+            await self.pool.execute(
+                """
+                UPDATE publication_jobs SET status='failed', updated_at=now(),
+                    check_output=$2 WHERE id=$1
+                """,
+                publication_id,
+                f"{type(exc).__name__}: {str(exc)[-3000:]}",
+            )
+            async with transaction(self.pool) as connection:
+                actor = await load_context_actor(connection, actor_id)
+                retry_markup = None
+                if actor is not None:
+                    retry = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="approve_preview",
+                        target_id=draft_id,
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    retry_markup = {
+                        "inline_keyboard": [[{
+                            "text": "Повторить сборку preview",
+                            "callback_data": retry.callback_data,
+                        }]]
+                    }
+                await enqueue_outbox(
+                    connection,
+                    event_type="telegram_message",
+                    payload={
+                        "chat_id": chat_id,
+                        "text": (
+                            "Preview не собран; commit/push не выполнялись. "
+                            f"Причина: {type(exc).__name__}. Проверьте журнал и повторите."
+                        ),
+                        "reply_markup": retry_markup,
+                    },
+                    idempotency_key=stable_idempotency_key(
+                        "preview-failed", publication_id, job.id
+                    ),
+                )
+            raise
+        async with transaction(self.pool) as connection:
+            actor = await load_context_actor(connection, actor_id)
+            if actor is None:
+                raise PermanentProviderError("publishing actor no longer exists")
+            callback = await create_callback(
+                connection,
+                actor=actor,
+                action=f"confirm_publish|{preview.nonce}",
+                target_id=publication_id,
+                ttl_seconds=30 * 60,
+            )
+            await enqueue_outbox(
+                connection,
+                event_type="telegram_message",
+                payload={
+                    "chat_id": chat_id,
+                    "text": (
+                        "Preview готов. Тесты и сборка сайта прошли.\n\n"
+                        f"Изменения:\n{preview.diff_summary or 'контентные файлы обновлены'}\n"
+                        f"Базовый commit: {preview.base_commit[:12]}\n"
+                        f"Ревизия: {preview.revision_hash[:12]}\n\n"
+                        "Проверьте данные. Только кнопка ниже выполнит commit и atomic push."
+                    ),
+                    "reply_markup": {
+                        "inline_keyboard": [[{
+                            "text": "Даю добро: commit и push",
+                            "callback_data": callback.callback_data,
+                        }]]
+                    },
+                },
+                idempotency_key=stable_idempotency_key(
+                    "preview-ready", publication_id, actor_id
+                ),
+            )
+
+    async def _publish_confirm(self, job: ClaimedJob) -> None:
+        publisher = self._require_publisher()
+        publication_id = UUID(str(job.payload["publication_id"]))
+        actor_id = UUID(str(job.payload["actor_id"]))
+        chat_id = int(job.payload["chat_id"])
+        draft_id = await self.pool.fetchval(
+            "SELECT draft_id FROM publication_jobs WHERE id=$1", publication_id
+        )
+        try:
+            main_commit, static_commit = await publisher.confirm_and_push(
+                publication_id, str(job.payload["nonce"]), actor_id
+            )
+        except Exception as exc:
+            await self.pool.execute(
+                "UPDATE publication_jobs SET status='failed', updated_at=now() WHERE id=$1",
+                publication_id,
+            )
+            try:
+                await publisher.cleanup(publisher.worktree_root / str(publication_id))
+            except Exception:
+                logger.exception(
+                    "publication_cleanup_failed", extra={"publication_id": str(publication_id)}
+                )
+            async with transaction(self.pool) as connection:
+                actor = await load_context_actor(connection, actor_id)
+                retry_markup = None
+                if actor is not None and draft_id is not None:
+                    retry = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="approve_preview",
+                        target_id=draft_id,
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    retry_markup = {
+                        "inline_keyboard": [[{
+                            "text": "Собрать новый preview",
+                            "callback_data": retry.callback_data,
+                        }]]
+                    }
+                await enqueue_outbox(
+                    connection,
+                    event_type="telegram_message",
+                    payload={
+                        "chat_id": chat_id,
+                        "text": (
+                            "Публикация не завершена. Автоматическое развёртывание не запускайте. "
+                            f"Причина: {type(exc).__name__}. Нужно собрать новый preview."
+                        ),
+                        "reply_markup": retry_markup,
+                    },
+                    idempotency_key=stable_idempotency_key(
+                        "publish-failed", publication_id, job.id
+                    ),
+                )
+            raise
+        await self.pool.execute(
+            """
+            UPDATE drafts SET status='published', updated_by=$2, updated_at=now()
+            WHERE id=$1 AND status='approved'
+            """,
+            draft_id,
+            actor_id,
+        )
+        recipients = await self._publication_recipients(chat_id)
+        async with transaction(self.pool) as connection:
+            for recipient in recipients:
+                await enqueue_outbox(
+                    connection,
+                    event_type="telegram_message",
+                    payload={
+                        "chat_id": recipient,
+                        "text": (
+                            "Commit и push завершены и проверены.\n\n"
+                            f"main: {main_commit}\nplesk-static: {static_commit}\n\n"
+                            "Заходите в панель сайта/Plesk и запускайте развёртывание репозитория."
+                        ),
+                    },
+                    idempotency_key=stable_idempotency_key(
+                        "publish-succeeded", publication_id, recipient
+                    ),
+                )
 
     async def _transcribe(self, job: ClaimedJob) -> None:
         path = Path(job.payload["path"])

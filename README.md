@@ -7,15 +7,16 @@
 Реализован production-oriented MVP scaffold: схема БД, migrations, RBAC/city scopes,
 отдельная узкая роль `coach_form`, self-contact binding, durable update/job/outbox primitives,
 draft state machine, RU/KZ extraction contracts, fake и реальные provider adapters, image
-sanitization, deterministic city exporter/importer, publication preview/confirm core, systemd
-units и backup scripts.
+sanitization, deterministic city exporter/importer, автоматическая проверка готовности,
+Telegram-уведомления, двухшаговый publication preview/confirm, atomic Git push, systemd units
+и backup scripts.
 
-Production push, systemd installation и Plesk deployment намеренно не выполняются автоматически.
+Commit/push выполняется только после двух явных Telegram-кнопок для конкретной ревизии;
+Plesk deployment остаётся ручным.
 
-Проверено локально: 27 unit/contract tests и 10 integration tests на PostgreSQL 18,
-Ruff, `compileall`, `pip check`, Telegram Bot API, Codex CLI и реальные AssemblyAI RU/KZ
-маршруты на синтетическом аудио. Проверка качества распознавания всё ещё требует
-разрешённых речевых RU/KZ сэмплов.
+Проверяется unit/contract и PostgreSQL integration suite, Ruff, `compileall`, `pip check`,
+Telegram Bot API, Codex CLI и AssemblyAI RU/KZ маршруты. Проверка качества распознавания
+всё ещё требует разрешённых речевых RU/KZ сэмплов.
 
 ## Быстрый старт
 
