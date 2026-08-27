@@ -8,9 +8,13 @@ if [[ ! "$TEST_RESTORE_DATABASE" =~ _restore_test$ ]]; then
 fi
 : "${1:?Usage: restore-test.sh /path/to/database.dump}"
 
-dropdb --if-exists "$TEST_RESTORE_DATABASE"
-createdb "$TEST_RESTORE_DATABASE"
+if [[ ${RESTORE_REUSE_DATABASE:-false} == true ]]; then
+    psql --dbname="$TEST_RESTORE_DATABASE" --set=ON_ERROR_STOP=1 \
+        --command='DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+else
+    dropdb --if-exists "$TEST_RESTORE_DATABASE"
+    createdb "$TEST_RESTORE_DATABASE"
+fi
 pg_restore --exit-on-error --no-owner --dbname="$TEST_RESTORE_DATABASE" "$1"
 psql --dbname="$TEST_RESTORE_DATABASE" --set=ON_ERROR_STOP=1 \
     --command='SELECT count(*) AS migrations FROM schema_migrations;'
-

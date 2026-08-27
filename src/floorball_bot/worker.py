@@ -19,6 +19,7 @@ from floorball_bot.dialogue.patches import (
     canonical_context,
 )
 from floorball_bot.errors import PermanentProviderError, RetryableProviderError
+from floorball_bot.health import record_heartbeat
 from floorball_bot.media import MediaPipeline
 from floorball_bot.providers.codex import StructuredExtractor
 from floorball_bot.providers.transcription import Transcriber
@@ -58,6 +59,7 @@ class Worker:
         self.lease_seconds = lease_seconds
         self.readiness_interval_seconds = readiness_interval_seconds
         self._last_readiness_scan = 0.0
+        self._last_heartbeat = 0.0
         self.worker_id = f"worker-{uuid4()}"
         self.stop_event = asyncio.Event()
 
@@ -66,6 +68,10 @@ class Worker:
 
     async def run(self) -> None:
         while not self.stop_event.is_set():
+            now = time.monotonic()
+            if now - self._last_heartbeat >= 30:
+                await record_heartbeat(self.pool, "worker", {"state": "running"})
+                self._last_heartbeat = now
             job = await claim_job(
                 self.pool, worker_id=self.worker_id, lease_seconds=self.lease_seconds
             )

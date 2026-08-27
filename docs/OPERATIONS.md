@@ -27,7 +27,8 @@ sudo -u floorballbot /opt/floorball-content-bot/.venv/bin/floorball-bot health
 На машине разработки бот и worker установлены как user units и включены в `default.target`:
 
 ```bash
-systemctl --user status floorball-content-bot.service floorball-content-worker.service
+systemctl --user status floorball-content-bot.service floorball-content-worker.service \
+  floorball-content-backup.timer floorball-content-health.timer
 systemctl --user restart floorball-content-bot.service floorball-content-worker.service
 journalctl --user -u floorball-content-bot.service -u floorball-content-worker.service --since today
 ```
@@ -43,15 +44,26 @@ cd /home/moses/tg_bot_floorball_site
 .venv/bin/floorball-bot health
 ```
 
+Polling и worker записывают heartbeat в PostgreSQL. Health считается успешным только при
+свежих heartbeat, свежем backup, отсутствии dead jobs/outbox и заполненном диске менее 90%.
+Health timer запускает эту проверку каждые пять минут.
+
 ## Backup/restore
 
 `scripts/backup.sh` использует `pg_dump` custom format, архивирует media, хранит 7 дневных и 4 недельных набора. DB credentials передаются libpq через environment/`PGPASSFILE`, не в argv. `scripts/restore-test.sh` отказывается работать с БД, имя которой не заканчивается `_restore_test`.
+
+В локальном запуске безопасные wrappers получают libpq environment из `POSTGRES_DSN`, не передавая пароль в argv:
+
+```bash
+.venv/bin/python scripts/backup.py
+.venv/bin/python scripts/restore_test.py var/backups/daily/database-YYYYMMDDTHHMMSSZ.dump
+```
 
 Копия на том же SSD не является полноценным backup. Настройте шифрованную копию на внешний диск/хранилище и периодически физически отключайте её. Restore drill выполняется минимум ежемесячно.
 
 ## Incident/recovery
 
-- Telegram/AssemblyAI/Codex outage: bot продолжает принимать updates; jobs переходят в bounded retry/dead. После устранения причины повторите только dead jobs после анализа error class.
+- Telegram outage: незабранные updates остаются на стороне Telegram; fail-fast supervision завершает процесс, а systemd перезапускает polling. AssemblyAI/Codex jobs переходят в bounded retry/dead. После устранения причины повторите только dead jobs после анализа error class.
 - Power loss: systemd рестартует процессы; leased `running` job снова доступен после истечения lease. Уникальные update/idempotency keys предотвращают повторные business mutations.
 - Disk 80%: warning, остановить новые media uploads и выгрузить backup. 90%: critical, остановить worker/publisher до освобождения места.
 - DB corruption: остановить bot/worker, сохранить повреждённый data dir read-only, восстановить последний проверенный dump в новую БД, сверить audit/publication IDs.

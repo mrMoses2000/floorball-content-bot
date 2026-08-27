@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import json
 import signal
+from collections.abc import Coroutine
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from aiogram import Bot
@@ -37,6 +39,40 @@ from floorball_bot.providers.transcription import (
 from floorball_bot.publisher import GitPublisher
 from floorball_bot.telegram import TelegramIngress, run_outbox
 from floorball_bot.worker import Worker
+
+
+async def supervise_bot_tasks(
+    *,
+    ingress: TelegramIngress,
+    outbox_coro: Coroutine[Any, Any, None],
+    stop: asyncio.Event,
+) -> None:
+    """Fail the process if a critical bot loop stops unexpectedly."""
+    ingress_task = asyncio.create_task(ingress.run(), name="telegram-ingress")
+    outbox_task = asyncio.create_task(outbox_coro, name="telegram-outbox")
+    stop_task = asyncio.create_task(stop.wait(), name="telegram-stop")
+    critical = {ingress_task, outbox_task}
+    tasks = critical | {stop_task}
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if stop_task in done:
+            await ingress.stop()
+            await asyncio.gather(*critical)
+            return
+        failed = next(task for task in done if task in critical)
+        if failed.cancelled():
+            raise RuntimeError(f"critical task {failed.get_name()} was cancelled")
+        error = failed.exception()
+        if error is not None:
+            raise RuntimeError(f"critical task {failed.get_name()} failed") from error
+        raise RuntimeError(f"critical task {failed.get_name()} stopped unexpectedly")
+    finally:
+        stop.set()
+        await ingress.stop()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -96,11 +132,12 @@ async def async_main(args: argparse.Namespace) -> None:
             applied = await run_migrations(pool, Path(__file__).resolve().parents[2] / "migrations")
             print(json.dumps({"applied": applied}, ensure_ascii=False))
         elif args.command == "health":
+            report = await health_report(pool, settings.media_root, settings.backup_root)
             print(
-                json.dumps(
-                    await health_report(pool, settings.media_root), ensure_ascii=False, default=str
-                )
+                json.dumps(report, ensure_ascii=False, default=str)
             )
+            if not report["ok"]:
+                raise SystemExit(1)
         elif args.command == "agent-context":
             async with pool.acquire() as connection:
                 actor = await load_context_actor(connection, args.actor)
@@ -130,13 +167,14 @@ async def async_main(args: argparse.Namespace) -> None:
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, stop.set)
-            outbox = asyncio.create_task(run_outbox(bot, pool, "bot-outbox", stop))
-            ingress_task = asyncio.create_task(ingress.run())
-            await stop.wait()
-            await ingress.stop()
-            await ingress_task
-            await outbox
-            await bot.session.close()
+            try:
+                await supervise_bot_tasks(
+                    ingress=ingress,
+                    outbox_coro=run_outbox(bot, pool, "bot-outbox", stop),
+                    stop=stop,
+                )
+            finally:
+                await bot.session.close()
         elif args.command == "worker":
             key = settings.require_assemblyai_key()
             transcriber = RoutedAssemblyAITranscriber(

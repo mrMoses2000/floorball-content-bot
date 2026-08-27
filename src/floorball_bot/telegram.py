@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import re
 from pathlib import Path
 from uuid import uuid4
 
 import asyncpg
 from aiogram import Bot
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.methods import DeleteWebhook, GetUpdates, GetWebhookInfo
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, Update
 
@@ -25,6 +27,7 @@ from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
 from floorball_bot.dialogue.evaluator import evaluate_gaps
 from floorball_bot.domain import Actor, Role
 from floorball_bot.errors import AuthorizationError
+from floorball_bot.health import record_heartbeat
 from floorball_bot.queue import accept_update, enqueue_job, enqueue_outbox, stable_idempotency_key
 
 logger = logging.getLogger(__name__)
@@ -135,23 +138,60 @@ class TelegramIngress:
 
     async def run(self) -> None:
         await self.prepare_long_polling()
+        await record_heartbeat(self.pool, "telegram_ingress", {"state": "started"})
+        retry_attempt = 0
         while not self._stop.is_set():
-            updates = await self.bot(
-                GetUpdates(
-                    offset=self.offset,
-                    timeout=self.poll_timeout,
-                    allowed_updates=["message", "edited_message", "callback_query"],
+            try:
+                updates = await self.bot(
+                    GetUpdates(
+                        offset=self.offset,
+                        timeout=self.poll_timeout,
+                        allowed_updates=["message", "edited_message", "callback_query"],
+                    )
                 )
+                retry_attempt = 0
+            except TelegramRetryAfter as exc:
+                retry_attempt += 1
+                await self._wait_polling_retry(float(exc.retry_after), type(exc).__name__)
+                continue
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                retry_attempt += 1
+                delay = min(30.0, 2 ** min(retry_attempt, 5))
+                delay += random.uniform(0, 1)  # noqa: S311 - retry jitter, not security
+                await self._wait_polling_retry(delay, type(exc).__name__)
+                continue
+            await record_heartbeat(
+                self.pool,
+                "telegram_ingress",
+                {"state": "polling", "updates_received": len(updates)},
             )
             for update in updates:
                 await self.accept(update)
                 self.offset = update.update_id + 1
+
+    async def _wait_polling_retry(self, delay: float, error_class: str) -> None:
+        logger.warning(
+            "telegram_poll_retry",
+            extra={"error": error_class, "delay_seconds": round(delay, 2)},
+        )
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=max(0.1, delay))
+        except TimeoutError:
+            pass
 
     async def accept(self, update: Update) -> bool:
         async with transaction(self.pool) as connection:
             if not await accept_update(connection, update.update_id):
                 return False
             await self._route(connection, update)
+            await connection.execute(
+                """
+                UPDATE processed_updates
+                SET status='completed', completed_at=now(), error_class=''
+                WHERE update_id=$1
+                """,
+                update.update_id,
+            )
         return True
 
     async def _route(self, connection: asyncpg.Connection, update: Update) -> None:

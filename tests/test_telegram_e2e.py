@@ -55,6 +55,12 @@ async def test_unknown_user_is_denied_and_duplicate_update_is_idempotent(pg_pool
 
     assert len(events) == 1
     assert "Доступ запрещён" in events[0]["payload"]["text"]
+    processed = await pg_pool.fetchrow(
+        "SELECT status, completed_at FROM processed_updates WHERE update_id=$1",
+        update.update_id,
+    )
+    assert processed["status"] == "completed"
+    assert processed["completed_at"] is not None
 
 
 @pytest.mark.asyncio
