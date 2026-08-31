@@ -55,6 +55,14 @@ def _is_required(field: FieldSpec, values: Mapping[str, Any]) -> bool:
     )
 
 
+def _requirement_satisfied(field: FieldSpec, value: Any) -> bool:
+    if not _present(value):
+        return False
+    if field.type == FieldType.BOOLEAN and field.privacy == "consent":
+        return value is True
+    return True
+
+
 def _field_gaps(
     field: FieldSpec,
     values: Mapping[str, Any],
@@ -66,7 +74,11 @@ def _field_gaps(
     value = local_values.get(field.id) if local_values is not None else _lookup(values, field_id)
     gaps: list[Gap] = []
     active = _is_required(field, local_values or values)
-    if active and field.requirement != RequirementLevel.OPTIONAL and not _present(value):
+    if (
+        active
+        and field.requirement != RequirementLevel.OPTIONAL
+        and not _requirement_satisfied(field, value)
+    ):
         gaps.append(
             Gap(field_id=field_id, requirement=field.requirement, question=field.question)
         )

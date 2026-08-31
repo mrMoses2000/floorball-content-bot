@@ -91,7 +91,18 @@ async def transition_draft(
     ):
         raise AuthorizationError("superadmin role is required")
     await connection.execute(
-        "UPDATE drafts SET status=$2, updated_by=$3, updated_at=now() WHERE id=$1",
+        """
+        UPDATE drafts SET
+            status=$2,
+            approved_revision=CASE
+                WHEN $2='approved' THEN current_revision
+                WHEN $2 IN ('changes_requested','rejected','revoked') THEN NULL
+                ELSE approved_revision
+            END,
+            updated_by=$3,
+            updated_at=now()
+        WHERE id=$1
+        """,
         draft_id,
         target.value,
         actor.user_id,

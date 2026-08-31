@@ -145,7 +145,27 @@ async def test_revision_idempotency_and_review_transition(pg_pool):
             actor=actor,
             target=DraftStatus.SUBMITTED,
         )
-    assert await pg_pool.fetchval("SELECT status FROM drafts WHERE id=$1", draft_id) == "submitted"
+        reviewer = actor.model_copy(update={"roles": frozenset({Role.REVIEWER})})
+        await transition_draft(
+            connection,
+            draft_id=draft_id,
+            actor=reviewer,
+            target=DraftStatus.UNDER_REVIEW,
+        )
+        await transition_draft(
+            connection,
+            draft_id=draft_id,
+            actor=reviewer,
+            target=DraftStatus.APPROVED,
+        )
+    draft = await pg_pool.fetchrow(
+        "SELECT status, current_revision, approved_revision FROM drafts WHERE id=$1", draft_id
+    )
+    assert dict(draft) == {
+        "status": "approved",
+        "current_revision": 2,
+        "approved_revision": 2,
+    }
 
 
 @pytest.mark.asyncio

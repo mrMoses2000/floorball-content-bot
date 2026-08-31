@@ -91,6 +91,34 @@ def test_trainer_gaps_prioritize_identity_then_submission_then_publication():
     assert complete.recommended[0].field_id == "clubs"
 
 
+def test_required_boolean_consents_must_be_affirmative_not_merely_answered():
+    spec = DialogueSpecRepository().load("trainer").spec
+
+    refused = evaluate_gaps(
+        spec,
+        {
+            "accuracy_confirmed": False,
+            "publication_permission": False,
+        },
+    )
+    refused_ids = {gap.field_id for gap in refused.required_for_submit}
+
+    assert "accuracy_confirmed" in refused_ids
+    assert "publication_permission" in refused_ids
+
+    accepted = evaluate_gaps(
+        spec,
+        {
+            "accuracy_confirmed": True,
+            "publication_permission": True,
+        },
+    )
+    accepted_ids = {gap.field_id for gap in accepted.required_for_submit}
+
+    assert "accuracy_confirmed" not in accepted_ids
+    assert "publication_permission" not in accepted_ids
+
+
 def test_conditional_and_repeated_record_gaps_are_deterministic():
     spec = DialogueSpecRepository().load("trainer").spec
     values = {

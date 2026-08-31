@@ -921,6 +921,7 @@ class TelegramIngress:
             "dialogue_mode": session["workflow"],
             "definition_version": session["definition_version"],
             "definition_hash": session["definition_hash"],
+            "context_hash": session["context_hash"],
             "fields": fields,
         }
         canonical = json.dumps(
