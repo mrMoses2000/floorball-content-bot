@@ -82,9 +82,9 @@ using raw SQL.
 - [x] Add reviewer list/show/approve/request-changes Telegram callbacks.
 - [x] Make a requested change create or resume a new immutable revision and invalidate old
       approval callbacks.
-- [ ] Add CLI dry-run/show commands for operational recovery.
+- [x] Add CLI dry-run/show commands for operational recovery.
 - [x] Add PostgreSQL concurrency, authorization, rollback and idempotency tests.
-- [ ] Add health/reporting for submitted or blocked drafts.
+- [x] Add health/reporting for submitted or blocked drafts.
 
 Gate: no news or new-city publication work proceeds to production until the canonical projector
 and reviewer path pass PostgreSQL E2E.
@@ -191,7 +191,7 @@ publication or an ambiguous success message.
 
 ## Cross-cutting release gates
 
-- [ ] `pytest -m 'not postgres'`, full disposable-PostgreSQL suite and Ruff are green.
+- [x] `pytest -m 'not postgres'`, full disposable-PostgreSQL suite and Ruff are green.
 - [ ] Site `npm ci`, Vitest, ESLint and production build are green from a clean checkout.
 - [ ] DB-to-JSON-to-frontend round trips do not expose private fields.
 - [ ] RBAC/IDOR and applicant isolation tests are green.
@@ -251,6 +251,20 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
   private contact, mapping, sequential idempotency and concurrent idempotency).
 - Full bot suite against `floorball_bot_test`: `93 passed`.
 - Ruff, compileall and dependency integrity: passed.
+
+### 2026-08-31 P0 iteration 4: operational inspection and health
+
+- RED: health exposed only process/queue failures and gave no indication of submitted,
+  under-review or returned editorial work.
+- GREEN: `health` now includes a non-fatal `editorial_backlog` with the three state counts and
+  oldest submitted timestamp; a content backlog no longer masquerades as a runtime outage.
+- RED: there was no operator contract for a read-only trainer projection.
+- GREEN: `project-trainer --draft ... --actor ...` returns a typed public-only plan without
+  mutating canonical tables or printing private contacts. `--apply` is explicit and reuses the
+  approved-revision projector and its authorization checks.
+- Full bot suite against `floorball_bot_test`: `100 passed`.
+- Ruff, compileall and dependency integrity: passed.
+- P0 gate passed; P1/P2/P3 work may now proceed without bypassing canonical review.
 
 ### 2026-08-31 P0 iteration 3: Telegram review and correction loop
 

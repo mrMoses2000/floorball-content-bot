@@ -9,7 +9,11 @@ from floorball_bot.db import create_pool, run_migrations
 from floorball_bot.dialogue.repository import DialogueSpecRepository
 from floorball_bot.domain import Actor, ExtractedCityPatch, Role
 from floorball_bot.errors import AuthorizationError
-from floorball_bot.projection.apply import ProjectionRejected, apply_approved_trainer_draft
+from floorball_bot.projection.apply import (
+    ProjectionRejected,
+    apply_approved_trainer_draft,
+    inspect_trainer_draft,
+)
 from floorball_bot.providers.codex import FakeExtractor
 from floorball_bot.providers.transcription import FakeTranscriber
 from floorball_bot.queue import claim_job, enqueue_job
@@ -169,6 +173,21 @@ async def test_only_approved_revision_can_change_canonical_city(pg_pool):
     )
     assert dict(city) == {"players_estimate": None, "revision": 1}
     assert await pg_pool.fetchval("SELECT count(*) FROM clubs") == 0
+
+
+@pytest.mark.asyncio
+async def test_dry_run_is_redacted_and_does_not_require_approval_or_write(pg_pool):
+    actor, draft_id, city_id = await _seed_case(pg_pool, status="submitted")
+
+    inspection = await inspect_trainer_draft(pg_pool, draft_id=draft_id, actor=actor)
+
+    assert inspection.status == "submitted"
+    assert inspection.ready
+    assert inspection.city_slug == "almaty"
+    assert inspection.public_preview["players"] == 40
+    assert "+77001112233" not in inspection.model_dump_json()
+    assert await pg_pool.fetchval("SELECT revision FROM cities WHERE id=$1", city_id) == 1
+    assert await pg_pool.fetchval("SELECT count(*) FROM canonical_projection_applications") == 0
 
 
 @pytest.mark.asyncio

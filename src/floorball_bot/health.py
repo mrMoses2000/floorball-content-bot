@@ -38,6 +38,16 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
     latest_publication = await pool.fetchval(
         "SELECT max(updated_at) FROM publication_jobs WHERE status='published'"
     )
+    backlog = await pool.fetchrow(
+        """
+        SELECT
+            count(*) FILTER (WHERE status='submitted')::integer AS submitted,
+            count(*) FILTER (WHERE status='under_review')::integer AS under_review,
+            count(*) FILTER (WHERE status='changes_requested')::integer AS changes_requested,
+            min(created_at) FILTER (WHERE status='submitted') AS oldest_submitted_at
+        FROM drafts
+        """
+    )
     heartbeat_rows = await pool.fetch(
         """
         SELECT component, observed_at,
@@ -83,4 +93,14 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
         "latest_backup": latest_backup.isoformat() if latest_backup else None,
         "backup_status": "ok" if backup_fresh else "missing_or_stale",
         "latest_publication": latest_publication.isoformat() if latest_publication else None,
+        "editorial_backlog": {
+            "submitted": backlog["submitted"],
+            "under_review": backlog["under_review"],
+            "changes_requested": backlog["changes_requested"],
+            "oldest_submitted_at": (
+                backlog["oldest_submitted_at"].isoformat()
+                if backlog["oldest_submitted_at"]
+                else None
+            ),
+        },
     }

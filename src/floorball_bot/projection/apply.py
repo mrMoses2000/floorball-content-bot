@@ -30,6 +30,21 @@ class TrainerApplicationResult(BaseModel):
     after_hash: str
 
 
+class TrainerInspectionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    draft_id: UUID
+    revision: int
+    status: str
+    content_hash: str
+    ready: bool
+    city_slug: str | None
+    blockers: tuple[str, ...]
+    publish_missing: tuple[str, ...]
+    warnings: tuple[str, ...]
+    public_preview: dict[str, Any]
+
+
 async def _canonical_snapshot(
     connection: asyncpg.Connection, city_id: UUID
 ) -> dict[str, Any]:
@@ -78,6 +93,77 @@ def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ProjectionRejected(f"{label} must be an object")
     return value
+
+
+async def inspect_trainer_draft(
+    pool: asyncpg.Pool,
+    *,
+    draft_id: UUID,
+    actor: Actor,
+) -> TrainerInspectionResult:
+    """Return a redacted, read-only projection plan for the current trainer revision."""
+    require_roles(actor, Role.REVIEWER, Role.SUPERADMIN)
+    async with pool.acquire() as connection, connection.transaction(readonly=True):
+        row = await connection.fetchrow(
+            """
+            SELECT d.status, d.current_revision, r.content, r.content_hash,
+                   s.workflow, s.definition_version, s.definition_hash, s.context_hash,
+                   u.preferred_language
+            FROM drafts d
+            JOIN draft_revisions r
+              ON r.draft_id=d.id AND r.revision=d.current_revision
+            JOIN conversation_sessions s ON s.id=d.session_id
+            JOIN users u ON u.id=s.user_id
+            WHERE d.id=$1
+            """,
+            draft_id,
+        )
+        if not row:
+            raise ProjectionRejected("draft or current revision not found")
+        if row["workflow"] != "trainer":
+            raise ProjectionRejected("draft is not a trainer dialogue")
+        loaded = DialogueSpecRepository().load("trainer")
+        if (
+            row["definition_hash"] != loaded.sha256
+            or row["definition_version"] != loaded.spec.version
+        ):
+            raise ProjectionRejected("dialogue definition changed")
+        content = _require_mapping(row["content"], "revision content")
+        if canonical_hash(dict(content)) != row["content_hash"]:
+            raise ProjectionRejected("revision content hash is invalid")
+        if (
+            content.get("dialogue_mode") != "trainer"
+            or content.get("definition_hash") != row["definition_hash"]
+            or content.get("definition_version") != row["definition_version"]
+        ):
+            raise ProjectionRejected("revision definition pin changed")
+        if content.get("context_hash", row["context_hash"]) != row["context_hash"]:
+            raise ProjectionRejected("revision context hash changed")
+        directory_rows = await connection.fetch(
+            """
+            SELECT slug, name_ru, name_kz, name_en
+            FROM cities WHERE active=TRUE AND deleted_at IS NULL ORDER BY slug
+            """
+        )
+        plan = plan_trainer_projection(
+            _require_mapping(content.get("fields"), "revision fields"),
+            preferred_language=row["preferred_language"],
+            city_directory=tuple(
+                CityDirectoryEntry(**dict(directory_row)) for directory_row in directory_rows
+            ),
+        )
+        return TrainerInspectionResult(
+            draft_id=draft_id,
+            revision=row["current_revision"],
+            status=row["status"],
+            content_hash=row["content_hash"],
+            ready=plan.ready,
+            city_slug=plan.city_slug,
+            blockers=plan.blockers,
+            publish_missing=plan.publish_missing,
+            warnings=plan.warnings,
+            public_preview=plan.public_preview(),
+        )
 
 
 async def _upsert_city_content(

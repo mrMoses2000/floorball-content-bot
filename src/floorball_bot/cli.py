@@ -30,6 +30,10 @@ from floorball_bot.importers import (
 )
 from floorball_bot.logging import configure_logging
 from floorball_bot.media import MediaPipeline
+from floorball_bot.projection.apply import (
+    apply_approved_trainer_draft,
+    inspect_trainer_draft,
+)
 from floorball_bot.providers.codex import CodexExtractor
 from floorball_bot.providers.transcription import (
     AssemblyAIBatchTranscriber,
@@ -105,6 +109,10 @@ def parser() -> argparse.ArgumentParser:
     scope = commands.add_parser("scope-city")
     scope.add_argument("--user", required=True, type=UUID)
     scope.add_argument("--city", required=True, type=UUID)
+    project_trainer = commands.add_parser("project-trainer")
+    project_trainer.add_argument("--draft", required=True, type=UUID)
+    project_trainer.add_argument("--actor", required=True, type=UUID)
+    project_trainer.add_argument("--apply", action="store_true")
     preview = commands.add_parser("publish-preview")
     preview.add_argument("--draft", required=True, type=UUID)
     preview.add_argument("--actor", required=True, type=UUID)
@@ -259,6 +267,25 @@ async def async_main(args: argparse.Namespace) -> None:
                 args.city,
             )
             print("ok")
+        elif args.command == "project-trainer":
+            async with pool.acquire() as connection:
+                actor = await load_context_actor(connection, args.actor)
+            if actor is None or not actor.active:
+                raise RuntimeError("project-trainer requires an active reviewer")
+            result = (
+                await apply_approved_trainer_draft(
+                    pool, draft_id=args.draft, actor=actor
+                )
+                if args.apply
+                else await inspect_trainer_draft(
+                    pool, draft_id=args.draft, actor=actor
+                )
+            )
+            print(
+                json.dumps(
+                    result.model_dump(mode="json"), ensure_ascii=False, indent=2
+                )
+            )
         elif args.command == "publish-preview":
             row = await pool.fetchrow(
                 """

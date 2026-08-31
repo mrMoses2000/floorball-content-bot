@@ -1,3 +1,4 @@
+from floorball_bot.cli import parser
 from floorball_bot.projection.trainer import CityDirectoryEntry, plan_trainer_projection
 
 
@@ -132,3 +133,27 @@ def test_projection_plan_excludes_schedule_without_public_permission():
     assert plan.schedules == ()
     assert "schedule[0].not_public" in plan.warnings
 
+
+def test_project_trainer_cli_is_dry_run_by_default_and_apply_is_explicit():
+    dry_run = parser().parse_args(
+        [
+            "project-trainer",
+            "--draft",
+            "00000000-0000-0000-0000-000000000001",
+            "--actor",
+            "00000000-0000-0000-0000-000000000002",
+        ]
+    )
+    apply = parser().parse_args(
+        [
+            "project-trainer",
+            "--draft",
+            "00000000-0000-0000-0000-000000000001",
+            "--actor",
+            "00000000-0000-0000-0000-000000000002",
+            "--apply",
+        ]
+    )
+
+    assert dry_run.apply is False
+    assert apply.apply is True
