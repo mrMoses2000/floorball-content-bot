@@ -79,11 +79,11 @@ using raw SQL.
       `training_schedules`, estimates and consent-aware contacts.
 - [x] Treat new-city selection as an application/provisional-city path, never implicit activation.
 - [x] Make application idempotent by `(draft_id, revision)` and record before/after hashes.
-- [ ] Add reviewer list/show/approve/request-changes Telegram callbacks.
-- [ ] Make a requested change create or resume a new immutable revision and invalidate old
+- [x] Add reviewer list/show/approve/request-changes Telegram callbacks.
+- [x] Make a requested change create or resume a new immutable revision and invalidate old
       approval callbacks.
 - [ ] Add CLI dry-run/show commands for operational recovery.
-- [ ] Add PostgreSQL concurrency, authorization, rollback and idempotency tests.
+- [x] Add PostgreSQL concurrency, authorization, rollback and idempotency tests.
 - [ ] Add health/reporting for submitted or blocked drafts.
 
 Gate: no news or new-city publication work proceeds to production until the canonical projector
@@ -250,4 +250,23 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
 - Focused PostgreSQL projector tests: `8 passed` (approval, stale pins, authorization, rollback,
   private contact, mapping, sequential idempotency and concurrent idempotency).
 - Full bot suite against `floorball_bot_test`: `93 passed`.
+- Ruff, compileall and dependency integrity: passed.
+
+### 2026-08-31 P0 iteration 3: Telegram review and correction loop
+
+- RED: `/review` returned a placeholder without a reviewable city or callback.
+- GREEN: reviewers and superadmins now receive a redacted trainer inbox, can open one exact
+  revision, inspect its public summary, approve it or request changes through actor-bound,
+  expiring, one-use callbacks.
+- RED: `apply_projection` was accepted by the queue schema but the worker marked it dead as an
+  unsupported job.
+- GREEN: the worker loads the approving actor, applies the pinned revision, reports whether it
+  was newly applied or already present, and enqueues a deterministic readiness scan.
+- RED: `/submit` after a change request first failed because the active-session query omitted its
+  context hash, then created a second draft rather than revision 2.
+- GREEN: a change request reopens the original session; corrected answers append an immutable
+  revision to the same draft, clear approval, invalidate all old draft callbacks and return the
+  draft to `submitted`.
+- Focused review/projection/workflow integration tests: `23 passed`.
+- Full bot suite against `floorball_bot_test`: `97 passed`.
 - Ruff, compileall and dependency integrity: passed.

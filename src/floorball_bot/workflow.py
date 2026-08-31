@@ -53,10 +53,20 @@ async def add_revision(
         actor.user_id,
     )
     await connection.execute(
-        "UPDATE drafts SET current_revision=$2, updated_by=$3, updated_at=now() WHERE id=$1",
+        """
+        UPDATE drafts SET current_revision=$2, approved_revision=NULL,
+            updated_by=$3, updated_at=now() WHERE id=$1
+        """,
         draft_id,
         revision,
         actor.user_id,
+    )
+    await connection.execute(
+        """
+        UPDATE callback_actions SET consumed_at=now()
+        WHERE target_id=$1 AND consumed_at IS NULL
+        """,
+        draft_id,
     )
     return revision
 

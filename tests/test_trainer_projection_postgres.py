@@ -7,9 +7,13 @@ import pytest
 
 from floorball_bot.db import create_pool, run_migrations
 from floorball_bot.dialogue.repository import DialogueSpecRepository
-from floorball_bot.domain import Actor, Role
+from floorball_bot.domain import Actor, ExtractedCityPatch, Role
 from floorball_bot.errors import AuthorizationError
 from floorball_bot.projection.apply import ProjectionRejected, apply_approved_trainer_draft
+from floorball_bot.providers.codex import FakeExtractor
+from floorball_bot.providers.transcription import FakeTranscriber
+from floorball_bot.queue import claim_job, enqueue_job
+from floorball_bot.worker import Worker
 from floorball_bot.workflow import canonical_hash
 
 pytestmark = pytest.mark.postgres
@@ -290,3 +294,43 @@ async def test_projection_rejects_wrong_role_and_new_city_without_partial_writes
     assert await pg_pool.fetchval("SELECT revision FROM cities WHERE id=$1", city_id) == 1
     assert await pg_pool.fetchval("SELECT count(*) FROM city_content") == 0
     assert await pg_pool.fetchval("SELECT count(*) FROM clubs") == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_applies_approved_projection_and_schedules_readiness_scan(pg_pool):
+    actor, draft_id, city_id = await _seed_case(pg_pool)
+    async with pg_pool.acquire() as connection, connection.transaction():
+        job_id = await enqueue_job(
+            connection,
+            kind="apply_projection",
+            payload={
+                "draft_id": str(draft_id),
+                "actor_id": str(actor.user_id),
+                "chat_id": actor.telegram_id,
+            },
+            idempotency_key=f"test-apply:{draft_id}",
+        )
+    job = await claim_job(pg_pool, worker_id="projection-test")
+    assert job is not None and job.id == job_id
+    worker = Worker(
+        pg_pool,
+        extractor=FakeExtractor(ExtractedCityPatch(source_language="ru")),
+        transcriber=FakeTranscriber(),
+    )
+
+    await worker.process(job)
+
+    assert await pg_pool.fetchval("SELECT status FROM jobs WHERE id=$1", job_id) == "succeeded"
+    assert await pg_pool.fetchval(
+        "SELECT count(*) FROM canonical_projection_applications WHERE draft_id=$1", draft_id
+    ) == 1
+    assert await pg_pool.fetchval("SELECT players_estimate FROM cities WHERE id=$1", city_id) == 40
+    assert await pg_pool.fetchval(
+        "SELECT count(*) FROM jobs WHERE kind='readiness_scan' AND status='pending'"
+    ) == 1
+    notice = await pg_pool.fetchval(
+        "SELECT payload FROM outbox_events WHERE payload->>'chat_id'=$1",
+        str(actor.telegram_id),
+    )
+    assert "основную БД" in notice["text"]
+    assert "preview" in notice["text"]

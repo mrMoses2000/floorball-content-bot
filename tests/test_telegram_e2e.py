@@ -4,11 +4,12 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from aiogram.types import Chat, Contact, Message, Update, User
+from aiogram.types import CallbackQuery, Chat, Contact, Message, Update, User
 
 from floorball_bot.db import create_pool, run_migrations
 from floorball_bot.dialogue.repository import DialogueSpecRepository
 from floorball_bot.telegram import TelegramIngress
+from floorball_bot.workflow import canonical_hash
 
 pytestmark = pytest.mark.postgres
 
@@ -42,6 +43,109 @@ def message_update(update_id: int, sender_id: int, text: str) -> Update:
             text=text,
         ),
     )
+
+
+def callback_update(update_id: int, sender_id: int, data: str) -> Update:
+    return Update(
+        update_id=update_id,
+        callback_query=CallbackQuery(
+            id=f"callback-{update_id}",
+            from_user=User(id=sender_id, is_bot=False, first_name="Reviewer"),
+            chat_instance="test-review",
+            data=data,
+        ),
+    )
+
+
+async def _seed_submitted_trainer_draft(pg_pool, *, reviewer_telegram_id: int):
+    coach_telegram_id = uuid4().int % 1_000_000_000
+    coach_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164, display_name, telegram_id)
+        VALUES ($1,'Тренер',$2) RETURNING id
+        """,
+        f"+77{uuid4().int % 10**9:09d}",
+        coach_telegram_id,
+    )
+    reviewer_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164, display_name, telegram_id)
+        VALUES ($1,'Редактор',$2) RETURNING id
+        """,
+        f"+77{uuid4().int % 10**9:09d}",
+        reviewer_telegram_id,
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id, role_name) VALUES ($1,'reviewer')", reviewer_id
+    )
+    loaded = DialogueSpecRepository().load("trainer")
+    session_id = await pg_pool.fetchval(
+        """
+        INSERT INTO conversation_sessions(
+            user_id, workflow, status, definition_version, definition_hash
+        ) VALUES ($1,'trainer','completed',$2,$3) RETURNING id
+        """,
+        coach_id,
+        loaded.spec.version,
+        loaded.sha256,
+    )
+    content = {
+        "dialogue_mode": "trainer",
+        "definition_version": loaded.spec.version,
+        "definition_hash": loaded.sha256,
+        "context_hash": "",
+        "fields": {
+            "respondent": {
+                "name": "Тренер",
+                "role": "тренер",
+                "phone": "+77000000000",
+                "email": "coach@example.kz",
+            },
+            "city": {
+                "name": "Алматы",
+                "status": "есть регулярные тренировки",
+                "summary": "Описание",
+                "history": "История",
+            },
+            "metrics": {
+                "players_total": 12,
+                "coaches_total": 2,
+                "clubs_total": 1,
+                "data_confidence": 4,
+            },
+            "media": {"permission": "нет", "minors_permission": "нет"},
+            "accuracy_confirmed": True,
+            "publication_permission": True,
+        },
+    }
+    draft_id = await pg_pool.fetchval(
+        """
+        INSERT INTO drafts(
+            session_id, entity_type, status, current_revision, created_by, updated_by
+        ) VALUES ($1,'city','submitted',1,$2,$2) RETURNING id
+        """,
+        session_id,
+        coach_id,
+    )
+    await pg_pool.execute(
+        """
+        INSERT INTO draft_revisions(draft_id, revision, content, content_hash, created_by)
+        VALUES ($1,1,$2::jsonb,$3,$4)
+        """,
+        draft_id,
+        content,
+        canonical_hash(content),
+        coach_id,
+    )
+    await pg_pool.execute(
+        """
+        INSERT INTO conversation_memory(session_id, structured_memory)
+        VALUES ($1,$2::jsonb)
+        """,
+        session_id,
+        {"fields": content["fields"]},
+    )
+    return draft_id, coach_telegram_id
 
 
 @pytest.mark.asyncio
@@ -215,3 +319,179 @@ async def test_coach_form_role_starts_only_pinned_trainer_dialogue(pg_pool):
         "SELECT payload FROM outbox_events ORDER BY created_at LIMIT 1"
     )
     assert "анкета тренера" in denied["text"]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_can_open_inbox_review_and_approve_exact_revision(pg_pool):
+    reviewer_telegram_id = 555099
+    draft_id, _coach_telegram_id = await _seed_submitted_trainer_draft(
+        pg_pool, reviewer_telegram_id=reviewer_telegram_id
+    )
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    assert await ingress.accept(message_update(1090, reviewer_telegram_id, "/review"))
+    inbox = await pg_pool.fetchval(
+        """
+        SELECT payload FROM outbox_events
+        WHERE payload->>'chat_id'=$1 ORDER BY created_at DESC LIMIT 1
+        """,
+        str(reviewer_telegram_id),
+    )
+    assert "Алматы" in inbox["text"]
+    start_callback = inbox["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+
+    assert await ingress.accept(callback_update(1091, reviewer_telegram_id, start_callback))
+    assert (
+        await pg_pool.fetchval("SELECT status FROM drafts WHERE id=$1", draft_id)
+        == "under_review"
+    )
+    review = await pg_pool.fetchval(
+        """
+        SELECT payload FROM outbox_events
+        WHERE payload->>'chat_id'=$1 ORDER BY created_at DESC LIMIT 1
+        """,
+        str(reviewer_telegram_id),
+    )
+    assert "Игроков: 12" in review["text"]
+    assert "context_hash" not in review["text"]
+    buttons = review["reply_markup"]["inline_keyboard"][0]
+    approve_callback = next(
+        button["callback_data"] for button in buttons if "Одобрить" in button["text"]
+    )
+
+    assert await ingress.accept(callback_update(1092, reviewer_telegram_id, approve_callback))
+    draft = await pg_pool.fetchrow(
+        "SELECT status, approved_revision FROM drafts WHERE id=$1", draft_id
+    )
+    assert dict(draft) == {"status": "approved", "approved_revision": 1}
+    job = await pg_pool.fetchrow("SELECT kind, payload FROM jobs WHERE kind='apply_projection'")
+    assert job["kind"] == "apply_projection"
+    assert job["payload"]["draft_id"] == str(draft_id)
+    assert job["payload"]["actor_id"]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_requests_changes_and_resumes_author_session(pg_pool):
+    reviewer_telegram_id = 555100
+    draft_id, coach_telegram_id = await _seed_submitted_trainer_draft(
+        pg_pool, reviewer_telegram_id=reviewer_telegram_id
+    )
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    await ingress.accept(message_update(1100, reviewer_telegram_id, "/review"))
+    inbox = await pg_pool.fetchval(
+        """
+        SELECT payload FROM outbox_events WHERE payload->>'chat_id'=$1
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        str(reviewer_telegram_id),
+    )
+    await ingress.accept(
+        callback_update(
+            1101,
+            reviewer_telegram_id,
+            inbox["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+        )
+    )
+    review = await pg_pool.fetchval(
+        """
+        SELECT payload FROM outbox_events WHERE payload->>'chat_id'=$1
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        str(reviewer_telegram_id),
+    )
+    changes_callback = next(
+        button["callback_data"]
+        for button in review["reply_markup"]["inline_keyboard"][0]
+        if "изменения" in button["text"]
+    )
+
+    await ingress.accept(callback_update(1102, reviewer_telegram_id, changes_callback))
+
+    draft = await pg_pool.fetchrow(
+        """
+        SELECT d.status, d.approved_revision, s.status AS session_status, s.current_step
+        FROM drafts d JOIN conversation_sessions s ON s.id=d.session_id WHERE d.id=$1
+        """,
+        draft_id,
+    )
+    assert dict(draft) == {
+        "status": "changes_requested",
+        "approved_revision": None,
+        "session_status": "active",
+        "current_step": "changes_requested",
+    }
+    author_notice = await pg_pool.fetchval(
+        """
+        SELECT payload FROM outbox_events WHERE payload->>'chat_id'=$1
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        str(coach_telegram_id),
+    )
+    assert "/resume" in author_notice["text"]
+    assert await pg_pool.fetchval("SELECT count(*) FROM jobs WHERE kind='apply_projection'") == 0
+
+
+@pytest.mark.asyncio
+async def test_resubmission_appends_revision_to_same_draft(pg_pool):
+    reviewer_telegram_id = 555101
+    draft_id, coach_telegram_id = await _seed_submitted_trainer_draft(
+        pg_pool, reviewer_telegram_id=reviewer_telegram_id
+    )
+    await pg_pool.execute(
+        "UPDATE drafts SET status='changes_requested' WHERE id=$1", draft_id
+    )
+    await pg_pool.execute(
+        """
+        UPDATE conversation_sessions SET status='active', current_step='changes_requested'
+        WHERE id=(SELECT session_id FROM drafts WHERE id=$1)
+        """,
+        draft_id,
+    )
+    await pg_pool.execute(
+        """
+        UPDATE conversation_memory
+        SET structured_memory=jsonb_set(
+            structured_memory,
+            '{fields,city,summary}',
+            to_jsonb('Исправленное описание'::text)
+        )
+        WHERE session_id=(SELECT session_id FROM drafts WHERE id=$1)
+        """,
+        draft_id,
+    )
+    stale_callback_id = await pg_pool.fetchval(
+        """
+        INSERT INTO callback_actions(
+            actor_id, action, target_id, nonce_hash, expires_at
+        )
+        SELECT created_by, 'review_approve', id, repeat('a',64), now()+interval '1 hour'
+        FROM drafts WHERE id=$1 RETURNING id
+        """,
+        draft_id,
+    )
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    assert await ingress.accept(message_update(1110, coach_telegram_id, "/submit"))
+
+    draft = await pg_pool.fetchrow(
+        "SELECT status, current_revision, approved_revision FROM drafts WHERE id=$1", draft_id
+    )
+    assert dict(draft) == {
+        "status": "submitted",
+        "current_revision": 2,
+        "approved_revision": None,
+    }
+    assert await pg_pool.fetchval(
+        "SELECT count(*) FROM drafts WHERE session_id=(SELECT session_id FROM drafts WHERE id=$1)",
+        draft_id,
+    ) == 1
+    revisions = await pg_pool.fetch(
+        "SELECT revision, content FROM draft_revisions WHERE draft_id=$1 ORDER BY revision",
+        draft_id,
+    )
+    assert [row["revision"] for row in revisions] == [1, 2]
+    assert revisions[1]["content"]["fields"]["city"]["summary"] == "Исправленное описание"
+    assert await pg_pool.fetchval(
+        "SELECT consumed_at IS NOT NULL FROM callback_actions WHERE id=$1", stale_callback_id
+    )

@@ -21,6 +21,7 @@ from floorball_bot.dialogue.patches import (
 from floorball_bot.errors import PermanentProviderError, RetryableProviderError
 from floorball_bot.health import record_heartbeat
 from floorball_bot.media import MediaPipeline
+from floorball_bot.projection.apply import apply_approved_trainer_draft
 from floorball_bot.providers.codex import StructuredExtractor
 from floorball_bot.providers.transcription import Transcriber
 from floorball_bot.publisher import GitPublisher
@@ -28,6 +29,7 @@ from floorball_bot.queue import (
     ClaimedJob,
     claim_job,
     complete_job,
+    enqueue_job,
     enqueue_outbox,
     fail_job,
     stable_idempotency_key,
@@ -100,6 +102,8 @@ class Worker:
                 await self._media(job)
             elif job.kind == "readiness_scan":
                 await scan_readiness(self.pool)
+            elif job.kind == "apply_projection":
+                await self._apply_projection(job)
             elif job.kind == "publish_preview":
                 await self._publish_preview(job)
             elif job.kind == "publish_confirm":
@@ -118,6 +122,49 @@ class Worker:
         if self.publisher is None:
             raise PermanentProviderError("publisher is not configured")
         return self.publisher
+
+    async def _apply_projection(self, job: ClaimedJob) -> None:
+        draft_id = UUID(str(job.payload["draft_id"]))
+        actor_id = UUID(str(job.payload["actor_id"]))
+        chat_id = int(job.payload["chat_id"])
+        async with self.pool.acquire() as connection:
+            actor = await load_context_actor(connection, actor_id)
+        if actor is None or not actor.active:
+            raise PermanentProviderError("projection actor no longer exists")
+        result = await apply_approved_trainer_draft(
+            self.pool,
+            draft_id=draft_id,
+            actor=actor,
+        )
+        async with transaction(self.pool) as connection:
+            await enqueue_job(
+                connection,
+                kind="readiness_scan",
+                payload={
+                    "actor_id": str(actor_id),
+                    "chat_id": chat_id,
+                    "application_id": str(result.application_id),
+                },
+                idempotency_key=stable_idempotency_key(
+                    "readiness-after-projection", result.application_id
+                ),
+            )
+            state = "перенесены" if result.applied else "уже были перенесены"
+            await enqueue_outbox(
+                connection,
+                event_type="telegram_message",
+                payload={
+                    "chat_id": chat_id,
+                    "text": (
+                        f"Разрешённые данные ревизии {result.revision} {state} в основную БД. "
+                        "Запущена проверка готовности; если публичный набор полон, бот "
+                        "отдельно предложит собрать preview."
+                    ),
+                },
+                idempotency_key=stable_idempotency_key(
+                    "projection-applied", result.application_id, chat_id
+                ),
+            )
 
     async def _publication_recipients(self, fallback_chat_id: int) -> set[int]:
         rows = await self.pool.fetch(

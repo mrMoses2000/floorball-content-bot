@@ -21,14 +21,15 @@ from floorball_bot.auth import (
     require_active,
     require_roles,
 )
-from floorball_bot.callbacks import consume_callback
+from floorball_bot.callbacks import consume_callback, create_callback
 from floorball_bot.db import transaction
 from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
 from floorball_bot.dialogue.evaluator import evaluate_gaps
-from floorball_bot.domain import Actor, Role
+from floorball_bot.domain import Actor, DraftStatus, Role
 from floorball_bot.errors import AuthorizationError
 from floorball_bot.health import record_heartbeat
 from floorball_bot.queue import accept_update, enqueue_job, enqueue_outbox, stable_idempotency_key
+from floorball_bot.workflow import add_revision, transition_draft
 
 logger = logging.getLogger(__name__)
 
@@ -200,13 +201,131 @@ class TelegramIngress:
             actor = require_active(
                 await get_actor_by_telegram_id(connection, update.callback_query.from_user.id)
             )
+            callback_markup = None
             try:
                 action, target_id = await consume_callback(
                     connection,
                     actor=actor,
                     callback_data=update.callback_query.data or "",
                 )
-                if action == "approve_preview":
+                if action == "review_start":
+                    require_roles(actor, Role.REVIEWER, Role.SUPERADMIN)
+                    draft = await connection.fetchrow(
+                        """
+                        SELECT d.status, d.current_revision, r.content, r.content_hash
+                        FROM drafts d
+                        JOIN draft_revisions r
+                          ON r.draft_id=d.id AND r.revision=d.current_revision
+                        WHERE d.id=$1 FOR UPDATE OF d
+                        """,
+                        target_id,
+                    )
+                    if not draft or draft["status"] not in {"submitted", "under_review"}:
+                        raise AuthorizationError("draft is no longer reviewable")
+                    if draft["status"] == "submitted":
+                        await transition_draft(
+                            connection,
+                            draft_id=target_id,
+                            actor=actor,
+                            target=DraftStatus.UNDER_REVIEW,
+                        )
+                    approve = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="review_approve",
+                        target_id=target_id,
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    changes = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="review_changes",
+                        target_id=target_id,
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    callback_text = self._trainer_review_summary(
+                        draft["content"], draft["current_revision"], draft["content_hash"]
+                    )
+                    callback_markup = {
+                        "inline_keyboard": [[
+                            {
+                                "text": "Одобрить данные",
+                                "callback_data": approve.callback_data,
+                            },
+                            {
+                                "text": "Нужны изменения",
+                                "callback_data": changes.callback_data,
+                            },
+                        ]]
+                    }
+                elif action == "review_approve":
+                    require_roles(actor, Role.REVIEWER, Role.SUPERADMIN)
+                    await transition_draft(
+                        connection,
+                        draft_id=target_id,
+                        actor=actor,
+                        target=DraftStatus.APPROVED,
+                        reason="Approved from Telegram review",
+                    )
+                    revision = await connection.fetchval(
+                        "SELECT approved_revision FROM drafts WHERE id=$1", target_id
+                    )
+                    await enqueue_job(
+                        connection,
+                        kind="apply_projection",
+                        payload={
+                            "draft_id": str(target_id),
+                            "actor_id": str(actor.user_id),
+                            "chat_id": update.callback_query.from_user.id,
+                        },
+                        idempotency_key=stable_idempotency_key(
+                            "apply-projection", target_id, revision
+                        ),
+                    )
+                    callback_text = (
+                        "Ревизия одобрена. Переношу разрешённые данные в основную БД. "
+                        "После проверки готовности бот отдельно предложит собрать preview."
+                    )
+                elif action == "review_changes":
+                    require_roles(actor, Role.REVIEWER, Role.SUPERADMIN)
+                    await transition_draft(
+                        connection,
+                        draft_id=target_id,
+                        actor=actor,
+                        target=DraftStatus.CHANGES_REQUESTED,
+                        reason="Changes requested from Telegram review",
+                    )
+                    revision = await connection.fetchval(
+                        "SELECT current_revision FROM drafts WHERE id=$1", target_id
+                    )
+                    author = await connection.fetchrow(
+                        """
+                        UPDATE conversation_sessions s
+                        SET status='active', current_step='changes_requested',
+                            updated_at=now(), last_activity_at=now()
+                        FROM drafts d, users u
+                        WHERE d.id=$1 AND s.id=d.session_id AND u.id=s.user_id
+                        RETURNING u.telegram_id
+                        """,
+                        target_id,
+                    )
+                    if author and author["telegram_id"] is not None:
+                        await enqueue_outbox(
+                            connection,
+                            event_type="telegram_message",
+                            payload={
+                                "chat_id": author["telegram_id"],
+                                "text": (
+                                    "Редактор запросил изменения в анкете. Ответы сохранены; "
+                                    "используйте /resume, дополните их и снова отправьте /submit."
+                                ),
+                            },
+                            idempotency_key=stable_idempotency_key(
+                                "review-changes-author", target_id, revision
+                            ),
+                        )
+                    callback_text = "Запрос изменений отправлен автору; прежнее одобрение снято."
+                elif action == "approve_preview":
                     require_roles(actor, Role.SUPERADMIN)
                     draft = await connection.fetchrow(
                         """
@@ -290,6 +409,7 @@ class TelegramIngress:
                 payload={
                     "chat_id": update.callback_query.from_user.id,
                     "text": callback_text,
+                    "reply_markup": callback_markup,
                 },
                 idempotency_key=stable_idempotency_key(
                     "callback-ack", update.update_id, actor.user_id
@@ -364,7 +484,8 @@ class TelegramIngress:
 
         dialogue_session = await connection.fetchrow(
             """
-            SELECT id, workflow, status, definition_version, definition_hash, current_step
+            SELECT id, workflow, status, definition_version, definition_hash,
+                   context_hash, current_step
             FROM conversation_sessions
             WHERE user_id=$1 AND workflow=ANY($2::text[]) AND status='active'
             ORDER BY last_activity_at DESC LIMIT 1
@@ -934,35 +1055,66 @@ class TelegramIngress:
             if session["workflow"] == DialogueMode.LEADERSHIP
             else "federation"
         )
-        draft_id = await connection.fetchval(
+        existing = await connection.fetchrow(
             """
-            INSERT INTO drafts(
-                session_id, entity_type, status, created_by, updated_by
-            ) VALUES ($1,$2,'submitted',$3,$3) RETURNING id
+            SELECT id, status FROM drafts
+            WHERE session_id=$1 AND status='changes_requested'
+            ORDER BY updated_at DESC LIMIT 1 FOR UPDATE
             """,
             session["id"],
-            entity_type,
-            actor.user_id,
         )
-        await connection.execute(
-            """
-            INSERT INTO draft_revisions(
-                draft_id, revision, content, content_hash, created_by
-            ) VALUES ($1,1,$2::jsonb,$3,$4)
-            """,
-            draft_id,
-            content,
-            hashlib.sha256(canonical.encode()).hexdigest(),
-            actor.user_id,
-        )
-        await connection.execute(
-            """
-            INSERT INTO approval_events(draft_id, revision, actor_id, action)
-            VALUES ($1,1,$2,'submitted')
-            """,
-            draft_id,
-            actor.user_id,
-        )
+        if existing:
+            draft_id = existing["id"]
+            await add_revision(
+                connection,
+                draft_id=draft_id,
+                actor=actor,
+                content=content,
+            )
+            await connection.execute(
+                """
+                UPDATE callback_actions SET consumed_at=now()
+                WHERE target_id=$1 AND consumed_at IS NULL
+                """,
+                draft_id,
+            )
+            await transition_draft(
+                connection,
+                draft_id=draft_id,
+                actor=actor,
+                target=DraftStatus.SUBMITTED,
+                reason="Corrected dialogue revision submitted",
+            )
+        else:
+            draft_id = await connection.fetchval(
+                """
+                INSERT INTO drafts(
+                    session_id, entity_type, status, created_by, updated_by
+                ) VALUES ($1,$2,'submitted',$3,$3) RETURNING id
+                """,
+                session["id"],
+                entity_type,
+                actor.user_id,
+            )
+            await connection.execute(
+                """
+                INSERT INTO draft_revisions(
+                    draft_id, revision, content, content_hash, created_by
+                ) VALUES ($1,1,$2::jsonb,$3,$4)
+                """,
+                draft_id,
+                content,
+                hashlib.sha256(canonical.encode()).hexdigest(),
+                actor.user_id,
+            )
+            await connection.execute(
+                """
+                INSERT INTO approval_events(draft_id, revision, actor_id, action)
+                VALUES ($1,1,$2,'submitted')
+                """,
+                draft_id,
+                actor.user_id,
+            )
         await connection.execute(
             """
             UPDATE conversation_sessions
@@ -1110,11 +1262,73 @@ class TelegramIngress:
             response = (
                 f"Команда {command} принята. Текущий workflow будет загружен из сохранённой сессии."
             )
+        elif command == "/review":
+            rows = await connection.fetch(
+                """
+                SELECT d.id, d.current_revision, r.content, r.content_hash, d.created_at
+                FROM drafts d
+                JOIN conversation_sessions s ON s.id=d.session_id AND s.workflow='trainer'
+                JOIN draft_revisions r
+                  ON r.draft_id=d.id AND r.revision=d.current_revision
+                WHERE d.status IN ('submitted','under_review')
+                ORDER BY d.created_at LIMIT 10
+                """
+            )
+            if not rows:
+                response = "Новых анкет на проверку нет."
+            else:
+                lines = ["Анкеты на проверку:"]
+                keyboard = []
+                for row in rows:
+                    fields = row["content"].get("fields", {})
+                    city = fields.get("city", {}) if isinstance(fields, dict) else {}
+                    city_name = city.get("other_name") or city.get("name") or "город не указан"
+                    lines.append(
+                        f"• {city_name} · ревизия {row['current_revision']} · "
+                        f"{row['content_hash'][:12]}"
+                    )
+                    callback = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="review_start",
+                        target_id=row["id"],
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    keyboard.append([{
+                        "text": f"Проверить: {city_name}",
+                        "callback_data": callback.callback_data,
+                    }])
+                await self._reply(
+                    connection,
+                    update_id,
+                    chat_id,
+                    "\n".join(lines),
+                    reply_markup={"inline_keyboard": keyboard},
+                )
+                return
         elif command in ROLE_COMMANDS:
             response = f"Раздел {command} доступен. Выберите запись в следующем меню."
         else:
             response = "Неизвестная команда. Используйте /help."
         await self._reply(connection, update_id, chat_id, response)
+
+    @staticmethod
+    def _trainer_review_summary(content: dict, revision: int, content_hash: str) -> str:
+        fields = content.get("fields", {}) if isinstance(content, dict) else {}
+        city = fields.get("city", {}) if isinstance(fields, dict) else {}
+        metrics = fields.get("metrics", {}) if isinstance(fields, dict) else {}
+        city_name = city.get("other_name") or city.get("name") or "не указан"
+        return (
+            "Анкета тренера готова к решению.\n\n"
+            f"Город: {city_name}\n"
+            f"Статус: {city.get('status') or 'не указан'}\n"
+            f"Описание: {city.get('summary') or 'не заполнено'}\n"
+            f"История: {city.get('history') or 'не заполнена'}\n"
+            f"Игроков: {metrics.get('players_total', 'не указано')}\n"
+            f"Тренеров: {metrics.get('coaches_total', 'не указано')}\n"
+            f"Клубов: {metrics.get('clubs_total', 'не указано')}\n\n"
+            f"Ревизия: {revision} · {content_hash[:12]}"
+        )
 
     async def _reply(
         self,

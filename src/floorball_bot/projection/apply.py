@@ -218,7 +218,7 @@ async def apply_approved_trainer_draft(
     Authorization, pinned definition checks, completeness evaluation and every canonical write
     happen in one serializable transaction. A rejected plan therefore leaves no partial rows.
     """
-    require_roles(actor, Role.SUPERADMIN)
+    require_roles(actor, Role.REVIEWER, Role.SUPERADMIN)
     # The draft row is the per-draft mutex. READ COMMITTED is intentional: a waiter must see
     # the application row committed by the lock holder instead of retaining a stale snapshot.
     async with pool.acquire() as connection, connection.transaction():

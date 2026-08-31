@@ -68,7 +68,7 @@ ALLOWED_TRANSITIONS: dict[DraftStatus, frozenset[DraftStatus]] = {
     DraftStatus.UNDER_REVIEW: frozenset(
         {DraftStatus.CHANGES_REQUESTED, DraftStatus.APPROVED, DraftStatus.REJECTED}
     ),
-    DraftStatus.CHANGES_REQUESTED: frozenset({DraftStatus.UNDER_REVIEW, DraftStatus.CANCELLED}),
+    DraftStatus.CHANGES_REQUESTED: frozenset({DraftStatus.SUBMITTED, DraftStatus.CANCELLED}),
     DraftStatus.APPROVED: frozenset({DraftStatus.PUBLISHING, DraftStatus.REVOKED}),
     DraftStatus.PUBLISHING: frozenset({DraftStatus.PUBLISHED, DraftStatus.PUBLISH_FAILED}),
     DraftStatus.PUBLISH_FAILED: frozenset({DraftStatus.PUBLISHING, DraftStatus.REVOKED}),
