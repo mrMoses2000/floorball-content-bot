@@ -22,6 +22,8 @@
 | Stolen secrets from logs/Git | Secret types, masked logs, env files mode 600, `.env` ignored, secret scan before release. |
 | Queue loss/crash | PostgreSQL transaction, leased claim, attempts/dead-letter, stale-job recovery and outbox. |
 | Double publish/race | DB advisory lock, approved revision hash, preview nonce, base-commit recheck, non-force push. |
+| Screenshot substitution/stale approval | Persisted per-file SHA-256 and dimensions, revision + manifest binding, one-use actor callback, revalidation immediately before push. |
+| Preview browser data exfiltration | Allocated loopback server, non-loopback request abort, service workers blocked, pinned Playwright Chromium and secret-free subprocess environment. |
 | Compromised content editor | Least-privilege roles/city scopes, immutable revisions and audit log; reviewer + superadmin gates. |
 | Home-host exposure | Long polling only; no port forwarding; optional health/admin binds localhost and future Access layer. |
 | Disk exhaustion | File/publication limits, 80/90% alerts, temp cleanup and backup retention. |
@@ -38,4 +40,3 @@ Phones, Telegram identifiers, raw messages/transcripts, voice, original media pa
 - Real RU/KZ AssemblyAI accuracy and billing require explicit external smoke samples.
 - GitHub deploy key and actual push require a separate approved production action.
 - Existing site dependency advisories and lock-file drift require a separate frontend maintenance change.
-

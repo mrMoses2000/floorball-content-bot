@@ -64,7 +64,27 @@ async def add_revision(
     await connection.execute(
         """
         UPDATE callback_actions SET consumed_at=now()
-        WHERE target_id=$1 AND consumed_at IS NULL
+        WHERE consumed_at IS NULL AND (
+            target_id=$1 OR target_id IN (
+                SELECT id FROM publication_jobs WHERE draft_id=$1
+            )
+        )
+        """,
+        draft_id,
+    )
+    await connection.execute(
+        """
+        UPDATE publication_artifacts SET valid=FALSE
+        WHERE publication_id IN (SELECT id FROM publication_jobs WHERE draft_id=$1)
+        """,
+        draft_id,
+    )
+    await connection.execute(
+        """
+        UPDATE publication_jobs
+        SET status=CASE WHEN status='published' THEN status ELSE 'cancelled' END,
+            screenshot_manifest_hash='', artifacts_invalidated_at=now(), updated_at=now()
+        WHERE draft_id=$1 AND status<>'published'
         """,
         draft_id,
     )

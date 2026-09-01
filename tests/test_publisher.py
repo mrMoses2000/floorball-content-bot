@@ -6,9 +6,11 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from PIL import Image, ImageDraw
 
 from floorball_bot import publisher as publisher_module
-from floorball_bot.publisher import CommandFailed, GitPublisher
+from floorball_bot.errors import ValidationBlocked
+from floorball_bot.publisher import CommandFailed, GitPublisher, derive_affected_routes
 
 
 class FakePool:
@@ -25,6 +27,44 @@ class FakePool:
 
     async def execute(self, *args):
         self.executions.append(args)
+
+    async def fetch(self, *_args):
+        return []
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
+
+
+async def fake_screenshot_capture(_worktree, routes, output_dir):
+    output_dir.mkdir(parents=True)
+    artifacts = []
+    dimensions = {
+        "desktop-1280x720": (1280, 720),
+        "mobile-390x844": (390, 844),
+    }
+    for route in routes:
+        for language in ("ru", "kz", "en"):
+            for viewport, size in dimensions.items():
+                target = output_dir / f"{len(artifacts)}.png"
+                image = Image.new("RGB", size, "white")
+                ImageDraw.Draw(image).rectangle((10, 10, 100, 100), fill="blue")
+                image.save(target)
+                artifacts.append(
+                    {
+                        "route": route,
+                        "language": language,
+                        "viewport": viewport,
+                        "width": size[0],
+                        "height": size[1],
+                        "path": str(target),
+                    }
+                )
+    return artifacts
 
 
 def command(*args: str, cwd: Path) -> str:
@@ -140,7 +180,9 @@ async def test_publication_preview_uses_isolated_worktree_and_does_not_push(tmp_
     worktrees.mkdir()
     expected_payload = payload()
     pool = FakePool(expected_payload)
-    publisher = GitPublisher(pool, site, worktrees)
+    publisher = GitPublisher(
+        pool, site, worktrees, screenshot_capture=fake_screenshot_capture
+    )
     preview = await publisher.build_preview(uuid4(), expected_payload)
 
     assert preview.base_commit == base
@@ -149,6 +191,8 @@ async def test_publication_preview_uses_isolated_worktree_and_does_not_push(tmp_
     assert "city-content.json" in preview.diff_summary
     assert command("git", "rev-parse", "main", cwd=bare) == base
     assert any("preview_ready" in execution[0] for execution in pool.executions)
+    assert preview.screenshot_manifest_hash
+    assert len(preview.artifacts) == 18
     await publisher.cleanup(preview.worktree)
     assert not preview.worktree.exists()
 
@@ -159,7 +203,12 @@ async def test_news_preview_changes_only_news_bundle_and_build_output(tmp_path):
     worktrees = tmp_path / "worktrees"
     worktrees.mkdir()
     expected_payload = news_payload()
-    publisher = GitPublisher(FakePool(expected_payload), site, worktrees)
+    publisher = GitPublisher(
+        FakePool(expected_payload),
+        site,
+        worktrees,
+        screenshot_capture=fake_screenshot_capture,
+    )
 
     preview = await publisher.build_preview(uuid4(), expected_payload)
 
@@ -174,7 +223,12 @@ async def test_build_failure_does_not_push_and_cleans_worktree(tmp_path):
     worktrees = tmp_path / "worktrees"
     worktrees.mkdir()
     expected_payload = payload()
-    publisher = GitPublisher(FakePool(expected_payload), site, worktrees)
+    publisher = GitPublisher(
+        FakePool(expected_payload),
+        site,
+        worktrees,
+        screenshot_capture=fake_screenshot_capture,
+    )
     publication_id = uuid4()
 
     with pytest.raises(CommandFailed):
@@ -250,7 +304,14 @@ async def test_confirm_pushes_main_and_static_atomically_and_verifies_refs(
     monkeypatch.setattr(publisher_module, "run_command", fake_run_command)
     publisher = GitPublisher(pool, repository, worktrees)
 
-    result = await publisher.confirm_and_push(publication_id, nonce, actor_id)
+    async def fake_verify_manifest(*_args):
+        return None
+
+    monkeypatch.setattr(publisher, "_verify_persisted_manifest", fake_verify_manifest)
+
+    result = await publisher.confirm_and_push(
+        publication_id, nonce, actor_id, "e" * 64
+    )
 
     assert result == (main_commit, static_commit)
     assert (
@@ -262,3 +323,146 @@ async def test_confirm_pushes_main_and_static_atomically_and_verifies_refs(
         f"{static_commit}:refs/heads/plesk-static",
     ) in calls
     assert any("status='published'" in execution[0] for execution in pool.connection.executions)
+
+
+def test_affected_routes_are_derived_from_changed_news_entity():
+    old = {
+        "items": [{"slug": "old", "scope": "national", "titleRu": "Old"}]
+    }
+    current = {
+        "items": [
+            {"slug": "old", "scope": "national", "titleRu": "Old"},
+            {"slug": "city-news", "scope": "city", "citySlug": "almaty"},
+        ]
+    }
+
+    assert derive_affected_routes(current, old) == (
+        "/",
+        "/clubs/almaty",
+        "/news",
+        "/news/city-news",
+    )
+
+
+def test_affected_routes_include_old_and_new_city_when_news_moves():
+    old = {
+        "items": [{
+            "slug": "city-news",
+            "scope": "city",
+            "citySlug": "almaty",
+        }]
+    }
+    current = {
+        "items": [{
+            "slug": "city-news",
+            "scope": "city",
+            "citySlug": "astana",
+        }]
+    }
+
+    assert derive_affected_routes(current, old) == (
+        "/",
+        "/clubs/almaty",
+        "/clubs/astana",
+        "/news",
+        "/news/city-news",
+    )
+
+
+def test_screenshot_validator_rejects_blank_or_missing_matrix(tmp_path):
+    output = tmp_path / "artifacts"
+    output.mkdir()
+    target = output / "blank.png"
+    Image.new("RGB", (1280, 720), "white").save(target)
+    raw = [{
+        "route": "/",
+        "language": "ru",
+        "viewport": "desktop-1280x720",
+        "path": str(target),
+    }]
+
+    with pytest.raises(ValidationBlocked, match="blank"):
+        GitPublisher._validate_artifacts(raw, output_dir=output, routes=("/",))
+
+
+class FakeArtifactConnection:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def fetch(self, *_args):
+        return self.rows
+
+
+@pytest.mark.asyncio
+async def test_persisted_manifest_rejects_a_modified_screenshot(tmp_path):
+    artifact = tmp_path / "preview.png"
+    image = Image.new("RGB", (1280, 720), "white")
+    ImageDraw.Draw(image).rectangle((10, 10, 100, 100), fill="blue")
+    image.save(artifact)
+    original_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    manifest_hash = "e" * 64
+    connection = FakeArtifactConnection([{
+        "route": "/",
+        "language": "ru",
+        "viewport": "desktop-1280x720",
+        "path": str(artifact),
+        "sha256": original_hash,
+        "width": 1280,
+        "height": 720,
+        "manifest_hash": manifest_hash,
+    }])
+    artifact.write_bytes(artifact.read_bytes() + b"tampered")
+
+    with pytest.raises(ValidationBlocked, match="hash changed"):
+        await GitPublisher._verify_persisted_manifest(
+            connection, uuid4(), manifest_hash
+        )
+
+
+class FakeRetentionPool:
+    def __init__(self, rows):
+        self.rows = rows
+        self.executions = []
+
+    async def fetch(self, *_args):
+        return self.rows
+
+    async def execute(self, *args):
+        self.executions.append(args)
+
+
+@pytest.mark.asyncio
+async def test_expired_artifact_cleanup_only_removes_files_under_artifact_root(tmp_path):
+    repository = tmp_path / "site"
+    worktrees = tmp_path / "worktrees"
+    publication_id = uuid4()
+    artifact_dir = worktrees / "_artifacts" / str(publication_id)
+    repository.mkdir()
+    artifact_dir.mkdir(parents=True)
+    artifact = artifact_dir / "preview.png"
+    artifact.write_bytes(b"expired")
+    (artifact_dir / "capture-manifest.json").write_text("{}\n")
+    row_id = uuid4()
+    pool = FakeRetentionPool([{"id": row_id, "path": str(artifact)}])
+    publisher = GitPublisher(pool, repository, worktrees)
+
+    assert await publisher.cleanup_expired_artifacts() == 1
+    assert not artifact.exists()
+    assert not artifact_dir.exists()
+    assert pool.executions[0][1] == row_id
+
+
+@pytest.mark.asyncio
+async def test_expired_artifact_cleanup_refuses_external_paths(tmp_path):
+    repository = tmp_path / "site"
+    worktrees = tmp_path / "worktrees"
+    repository.mkdir()
+    worktrees.mkdir()
+    external = tmp_path / "external.png"
+    external.write_bytes(b"keep")
+    pool = FakeRetentionPool([{"id": uuid4(), "path": str(external)}])
+    publisher = GitPublisher(pool, repository, worktrees)
+
+    with pytest.raises(RuntimeError, match="outside artifact root"):
+        await publisher.cleanup_expired_artifacts()
+    assert external.exists()

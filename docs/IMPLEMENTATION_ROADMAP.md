@@ -151,17 +151,17 @@ application; a superadmin can verify it and initialize a provisional city.
 Release objective: every visual publication produces reproducible images of the exact approved
 revision and supports an invalidate-and-rebuild change loop.
 
-- [ ] Add `publication_artifacts` with route, language, viewport, path, SHA-256, dimensions,
+- [x] Add `publication_artifacts` with route, language, viewport, path, SHA-256, dimensions,
       revision hash, manifest hash and retention timestamp.
-- [ ] Add Telegram media-group outbox support with idempotent retry.
-- [ ] Run a local preview on an allocated loopback port; block non-local network requests.
-- [ ] Pin desktop `1280x720` and mobile `390x844`, timezone, locale and reduced motion.
-- [ ] Derive affected routes from the changed entity.
-- [ ] Fail preview if an expected screenshot is missing, corrupt, blank or has a mismatched hash.
-- [ ] Bind approval to actor + publication + revision hash + screenshot manifest hash + expiry.
-- [ ] Add Approve / Needs changes / Cancel callbacks.
-- [ ] Invalidate every old callback and artifact manifest when revision N+1 is created.
-- [ ] Add screenshot, stale-button, media-group retry and cleanup tests.
+- [x] Add Telegram media-group outbox support with idempotent retry.
+- [x] Run a local preview on an allocated loopback port; block non-local network requests.
+- [x] Pin desktop `1280x720` and mobile `390x844`, timezone, locale and reduced motion.
+- [x] Derive affected routes from the changed entity.
+- [x] Fail preview if an expected screenshot is missing, corrupt, blank or has a mismatched hash.
+- [x] Bind approval to actor + publication + revision hash + screenshot manifest hash + expiry.
+- [x] Add Approve / Needs changes / Cancel callbacks.
+- [x] Invalidate every old callback and artifact manifest when revision N+1 is created.
+- [x] Add screenshot, stale-button, media-group retry and cleanup tests.
 
 ## Phase P5: crash-safe publisher
 
@@ -197,8 +197,8 @@ publication or an ambiguous success message.
 - [ ] RBAC/IDOR and applicant isolation tests are green.
 - [ ] Media consent withdrawal removes the public derivative on the next projection.
 - [ ] Contact live delivery is verified.
-- [ ] Both desktop/mobile screenshot sets exist for visual changes.
-- [ ] Old callbacks fail after revision or base commit changes.
+- [x] Both desktop/mobile screenshot sets exist for visual changes.
+- [x] Old callbacks fail after revision or base commit changes.
 - [ ] Remote main/static commit IDs are verified before Telegram reports success.
 - [ ] Backup/restore drill succeeds.
 
@@ -331,3 +331,23 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
   directory. The public CTA opens `https://t.me/floorball_site_agent_bot?start=new_city`.
 - Full bot suite against `floorball_bot_test`: `122 passed`; Ruff, compileall and dependency
   integrity passed. Full site suite: `37 passed`; ESLint and production Vite build passed.
+
+### 2026-09-01 P4: deterministic visual preview and revision feedback
+
+- Added migration `015_publication_artifacts.sql`: every screenshot persists its route, language,
+  fixed viewport, path, dimensions, SHA-256, exact revision hash, manifest hash and retention time.
+- The publisher derives affected city/news/federation routes, starts Vite on an allocated
+  `127.0.0.1` port and captures RU/KZ/EN at `1280x720` and `390x844` with fixed timezone,
+  locale, reduced motion and wall-clock behavior. Browser routing rejects non-loopback network.
+- Preview validation rejects an incomplete matrix, unsafe/missing/corrupt/blank images, wrong
+  dimensions and changed image or manifest hashes. Expired cleanup refuses paths outside the
+  dedicated artifact root.
+- Telegram delivers screenshot batches through a durable retrying media-group outbox. Approve,
+  Needs changes and Cancel are actor-bound, one-use and tied to publication, revision, manifest
+  and expiry; revision N+1 invalidates the old publication, artifacts and callbacks.
+- Real browser smoke: Playwright Chromium `145.0.7632.6` (revision `1208`) produced six homepage
+  screenshots; all passed the production validator.
+- Focused P4 suite against `floorball_bot_test`: `21 passed`. Full bot suite: `131 passed`; Ruff,
+  compileall and dependency integrity passed. Clean `npm ci` site suite: `37 passed`; ESLint and
+  production Vite build passed. The existing npm audit still reports 14 dependency advisories
+  and remains separate frontend-maintenance work.

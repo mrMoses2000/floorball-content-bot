@@ -13,7 +13,13 @@ import asyncpg
 from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.methods import DeleteWebhook, GetUpdates, GetWebhookInfo
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, Update
+from aiogram.types import (
+    FSInputFile,
+    InputMediaPhoto,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 
 from floorball_bot.auth import (
     bind_self_contact,
@@ -548,6 +554,16 @@ class TelegramIngress:
                     preview_nonce = action.partition("|")[2]
                     if not preview_nonce:
                         raise AuthorizationError("publication nonce is missing")
+                    manifest_hash = await connection.fetchval(
+                        """
+                        SELECT screenshot_manifest_hash FROM publication_jobs
+                        WHERE id=$1 AND status='preview_ready'
+                          AND artifacts_invalidated_at IS NULL
+                        """,
+                        target_id,
+                    )
+                    if not manifest_hash:
+                        raise AuthorizationError("screenshot manifest is missing")
                     await enqueue_job(
                         connection,
                         kind="publish_confirm",
@@ -556,6 +572,7 @@ class TelegramIngress:
                             "nonce": preview_nonce,
                             "actor_id": str(actor.user_id),
                             "chat_id": update.callback_query.from_user.id,
+                            "manifest_hash": manifest_hash,
                         },
                         idempotency_key=stable_idempotency_key(
                             "publish-confirm", target_id, actor.user_id, update.update_id
@@ -565,6 +582,97 @@ class TelegramIngress:
                         "Добро принято для конкретного preview. Выполняю commit, push и "
                         "проверку удалённых веток."
                     )
+                elif action in {"preview_needs_changes", "preview_cancel"}:
+                    require_roles(actor, Role.SUPERADMIN)
+                    publication = await connection.fetchrow(
+                        """
+                        SELECT p.draft_id, p.revision, d.session_id, d.status AS draft_status,
+                               u.telegram_id AS author_chat_id
+                        FROM publication_jobs p
+                        JOIN drafts d ON d.id=p.draft_id
+                        JOIN conversation_sessions s ON s.id=d.session_id
+                        JOIN users u ON u.id=s.user_id
+                        WHERE p.id=$1 AND p.status='preview_ready'
+                          AND p.artifacts_invalidated_at IS NULL
+                        FOR UPDATE OF p, d
+                        """,
+                        target_id,
+                    )
+                    if not publication:
+                        raise AuthorizationError("preview is no longer active")
+                    await connection.execute(
+                        "UPDATE publication_artifacts SET valid=FALSE WHERE publication_id=$1",
+                        target_id,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE publication_jobs SET status='cancelled',
+                            screenshot_manifest_hash='', artifacts_invalidated_at=now(),
+                            updated_at=now() WHERE id=$1
+                        """,
+                        target_id,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE callback_actions SET consumed_at=now()
+                        WHERE target_id=$1 AND consumed_at IS NULL
+                        """,
+                        target_id,
+                    )
+                    if action == "preview_needs_changes":
+                        if publication["draft_status"] != "approved":
+                            raise AuthorizationError("approved draft changed")
+                        await connection.execute(
+                            """
+                            UPDATE drafts SET status='changes_requested', approved_revision=NULL,
+                                updated_by=$2, updated_at=now() WHERE id=$1
+                            """,
+                            publication["draft_id"],
+                            actor.user_id,
+                        )
+                        await connection.execute(
+                            """
+                            INSERT INTO approval_events(
+                                draft_id, revision, actor_id, action, reason
+                            ) VALUES ($1,$2,$3,'changes_requested',
+                                      'Visual preview needs changes')
+                            """,
+                            publication["draft_id"],
+                            publication["revision"],
+                            actor.user_id,
+                        )
+                        await connection.execute(
+                            """
+                            UPDATE conversation_sessions SET status='active',
+                                current_step='changes_requested', updated_at=now(),
+                                last_activity_at=now() WHERE id=$1
+                            """,
+                            publication["session_id"],
+                        )
+                        if publication["author_chat_id"] is not None:
+                            await enqueue_outbox(
+                                connection,
+                                event_type="telegram_message",
+                                payload={
+                                    "chat_id": publication["author_chat_id"],
+                                    "text": (
+                                        "Проверяющий запросил изменения после визуального preview. "
+                                        "Используйте /resume, исправьте данные и снова /submit."
+                                    ),
+                                },
+                                idempotency_key=stable_idempotency_key(
+                                    "visual-changes-author", target_id
+                                ),
+                            )
+                        callback_text = (
+                            "Preview и все его кнопки инвалидированы. Автору отправлен запрос "
+                            "изменений; новая ревизия потребует новых скриншотов."
+                        )
+                    else:
+                        callback_text = (
+                            "Preview отменён; его manifest и кнопки инвалидированы. "
+                            "Одобренная ревизия не опубликована."
+                        )
                 else:
                     raise AuthorizationError("unsupported callback action")
             except (AuthorizationError, ValueError):
@@ -1984,7 +2092,8 @@ async def run_outbox(bot: Bot, pool: asyncpg.Pool, worker_id: str, stop: asyncio
                 """
                 WITH candidate AS (
                     SELECT id FROM outbox_events
-                    WHERE status IN ('pending','retry') AND available_at <= now()
+                    WHERE (status IN ('pending','retry') AND available_at <= now())
+                       OR (status='sending' AND locked_at < now()-interval '5 minutes')
                     ORDER BY available_at, created_at
                     FOR UPDATE SKIP LOCKED LIMIT 1
                 )
@@ -2002,18 +2111,35 @@ async def run_outbox(bot: Bot, pool: asyncpg.Pool, worker_id: str, stop: asyncio
             continue
         try:
             payload = event["payload"]
-            sent = await bot.send_message(
-                chat_id=payload["chat_id"],
-                text=payload["text"],
-                reply_markup=payload.get("reply_markup"),
-            )
+            if event["event_type"] == "telegram_media_group":
+                paths = [Path(item) for item in payload.get("paths", [])]
+                if not 1 <= len(paths) <= 10 or any(not item.is_file() for item in paths):
+                    raise ValueError("media group requires 1-10 existing artifact files")
+                media = [
+                    InputMediaPhoto(
+                        media=FSInputFile(path),
+                        caption=payload.get("caption") if index == 0 else None,
+                    )
+                    for index, path in enumerate(paths)
+                ]
+                sent_group = await bot.send_media_group(
+                    chat_id=payload["chat_id"], media=media
+                )
+                external_id = ",".join(str(item.message_id) for item in sent_group)
+            else:
+                sent = await bot.send_message(
+                    chat_id=payload["chat_id"],
+                    text=payload["text"],
+                    reply_markup=payload.get("reply_markup"),
+                )
+                external_id = str(sent.message_id)
             await pool.execute(
                 """
                 UPDATE outbox_events SET status='sent', sent_at=now(), external_id=$2,
                     locked_at=NULL, locked_by=NULL WHERE id=$1
                 """,
                 event["id"],
-                str(sent.message_id),
+                external_id,
             )
         except Exception as exc:
             terminal = event["attempts"] >= 5

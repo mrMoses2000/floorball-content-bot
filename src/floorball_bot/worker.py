@@ -403,7 +403,44 @@ class Worker:
                 action=f"confirm_publish|{preview.nonce}",
                 target_id=publication_id,
                 ttl_seconds=30 * 60,
+                revision_hash=preview.revision_hash,
+                manifest_hash=preview.screenshot_manifest_hash,
             )
+            needs_changes = await create_callback(
+                connection,
+                actor=actor,
+                action="preview_needs_changes",
+                target_id=publication_id,
+                ttl_seconds=30 * 60,
+                revision_hash=preview.revision_hash,
+                manifest_hash=preview.screenshot_manifest_hash,
+            )
+            cancel = await create_callback(
+                connection,
+                actor=actor,
+                action="preview_cancel",
+                target_id=publication_id,
+                ttl_seconds=30 * 60,
+                revision_hash=preview.revision_hash,
+                manifest_hash=preview.screenshot_manifest_hash,
+            )
+            for batch_index in range(0, len(preview.artifacts), 10):
+                batch = preview.artifacts[batch_index : batch_index + 10]
+                await enqueue_outbox(
+                    connection,
+                    event_type="telegram_media_group",
+                    payload={
+                        "chat_id": chat_id,
+                        "paths": [str(path) for path in batch],
+                        "caption": (
+                            f"Preview {preview.screenshot_manifest_hash[:12]} · "
+                            f"кадры {batch_index + 1}–{batch_index + len(batch)}"
+                        ),
+                    },
+                    idempotency_key=stable_idempotency_key(
+                        "preview-media-group", publication_id, batch_index // 10
+                    ),
+                )
             await enqueue_outbox(
                 connection,
                 event_type="telegram_message",
@@ -414,13 +451,26 @@ class Worker:
                         f"Изменения:\n{preview.diff_summary or 'контентные файлы обновлены'}\n"
                         f"Базовый commit: {preview.base_commit[:12]}\n"
                         f"Ревизия: {preview.revision_hash[:12]}\n\n"
+                        f"Screenshot manifest: {preview.screenshot_manifest_hash[:12]}\n\n"
                         "Проверьте данные. Только кнопка ниже выполнит commit и atomic push."
                     ),
                     "reply_markup": {
-                        "inline_keyboard": [[{
-                            "text": "Даю добро: commit и push",
-                            "callback_data": callback.callback_data,
-                        }]]
+                        "inline_keyboard": [
+                            [{
+                                "text": "Даю добро: commit и push",
+                                "callback_data": callback.callback_data,
+                            }],
+                            [
+                                {
+                                    "text": "Нужны изменения",
+                                    "callback_data": needs_changes.callback_data,
+                                },
+                                {
+                                    "text": "Отменить",
+                                    "callback_data": cancel.callback_data,
+                                },
+                            ],
+                        ]
                     },
                 },
                 idempotency_key=stable_idempotency_key(
@@ -438,7 +488,10 @@ class Worker:
         )
         try:
             main_commit, static_commit = await publisher.confirm_and_push(
-                publication_id, str(job.payload["nonce"]), actor_id
+                publication_id,
+                str(job.payload["nonce"]),
+                actor_id,
+                str(job.payload["manifest_hash"]),
             )
         except Exception as exc:
             await self.pool.execute(

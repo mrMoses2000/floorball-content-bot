@@ -25,20 +25,26 @@ async def create_callback(
     action: str,
     target_id: UUID,
     ttl_seconds: int = 900,
+    revision_hash: str = "",
+    manifest_hash: str = "",
 ) -> CallbackToken:
     nonce = secrets.token_urlsafe(12)
     nonce_hash = hashlib.sha256(nonce.encode()).hexdigest()
     expires_at = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
     action_id = await connection.fetchval(
         """
-        INSERT INTO callback_actions(actor_id, action, target_id, nonce_hash, expires_at)
-        VALUES ($1,$2,$3,$4,$5) RETURNING id
+        INSERT INTO callback_actions(
+            actor_id, action, target_id, nonce_hash, expires_at,
+            revision_hash, manifest_hash
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
         """,
         actor.user_id,
         action,
         target_id,
         nonce_hash,
         expires_at,
+        revision_hash,
+        manifest_hash,
     )
     return CallbackToken(f"a:{action_id}:{nonce}", expires_at)
 
@@ -59,9 +65,19 @@ async def consume_callback(
     nonce_hash = hashlib.sha256(parts[2].encode()).hexdigest()
     row = await connection.fetchrow(
         """
-        SELECT * FROM callback_actions
-        WHERE id=$1 AND actor_id=$2 AND nonce_hash=$3
+        SELECT callback.* FROM callback_actions callback
+        WHERE callback.id=$1 AND callback.actor_id=$2 AND callback.nonce_hash=$3
           AND consumed_at IS NULL AND expires_at > now()
+          AND (
+            callback.manifest_hash='' OR EXISTS (
+                SELECT 1 FROM publication_jobs publication
+                WHERE publication.id=callback.target_id
+                  AND publication.status='preview_ready'
+                  AND publication.revision_hash=callback.revision_hash
+                  AND publication.screenshot_manifest_hash=callback.manifest_hash
+                  AND publication.artifacts_invalidated_at IS NULL
+            )
+          )
         FOR UPDATE
         """,
         action_id,

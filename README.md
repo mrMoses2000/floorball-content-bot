@@ -8,7 +8,8 @@
 отдельная узкая роль `coach_form`, self-contact binding, durable update/job/outbox primitives,
 draft state machine, RU/KZ extraction contracts, fake и реальные provider adapters, image
 sanitization, deterministic city exporter/importer, автоматическая проверка готовности,
-Telegram-уведомления, двухшаговый publication preview/confirm, atomic Git push, durable contact
+Telegram-уведомления, RU/KZ/EN desktop/mobile screenshot preview с manifest-bound confirm,
+atomic Git push, durable contact
 requests с асинхронной SMTP-доставкой, approval-gated национальные и городские новости,
 systemd units и backup scripts.
 

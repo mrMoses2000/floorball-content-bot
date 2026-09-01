@@ -24,7 +24,9 @@ flowchart LR
   PG --> PUB[floorball-publisher]
   PUB --> WT[Isolated git worktree]
   WT --> TESTS[Parser tests + Vitest + Vite build]
-  TESTS -->|explicit confirmation| GH[GitHub main + plesk-static]
+  TESTS --> SHOTS[Loopback Playwright screenshots]
+  SHOTS -->|manifest + media group| TG
+  SHOTS -->|explicit bound confirmation| GH[GitHub main + plesk-static]
   GH -->|manual| PLESK[Plesk deploy]
 ```
 
@@ -33,7 +35,9 @@ flowchart LR
 - `floorball-contact-api`: loopback-only HTTP service; validates the versioned contact contract,
   allowed Origin, body size, honeypot and HMAC pseudonymized IP rate limit, then atomically stores
   the request and delivery job before returning `202 accepted`.
-- `floorball-publisher`: advisory lock, approved hash check, isolated worktree, deterministic export, tests/build, preview; commit/push is a second explicit action.
+- `floorball-publisher`: advisory lock, approved hash check, isolated worktree, deterministic
+  export, tests/build and loopback-only Playwright screenshots; commit/push is a second explicit
+  action bound to the persisted screenshot manifest.
 - `floorball-backup`: `pg_dump`, media/config manifest and retention; secrets are not copied into reports.
 
 ## Persistence and queue
@@ -54,9 +58,16 @@ Telegram acceptance inserts `processed_updates`, normalized message and any requ
 8. Worker periodically projects each city, the federation and approved national/city news into
    public site contracts. A deterministic evaluator records missing blocking fields and notifies
    subscribed, Telegram-bound superadmins only when a new content hash becomes complete.
-9. The notification button approves the immutable snapshot and builds an isolated preview. Tests and the Vite build run without commit or push.
-10. A second, actor-bound 30-minute button matching the preview nonce, approved revision hash and base commit permits one atomic push of `main` and `plesk-static`.
-11. After both remote refs are verified, the bot reports both commit IDs and asks the operator to deploy in Plesk.
+9. The notification button approves the immutable snapshot and builds an isolated preview. Tests
+   and the Vite build run without commit or push. The publisher derives affected routes, starts
+   Vite on an allocated `127.0.0.1` port and captures RU/KZ/EN desktop/mobile images with pinned
+   locale, timezone, reduced motion and browser revision. Non-loopback browser traffic is blocked.
+10. Screenshot rows and one manifest hash bind paths, dimensions, SHA-256 and revision. Telegram
+    sends them in durable media groups followed by Approve / Needs changes / Cancel controls.
+11. The actor-bound 30-minute approval matching the preview nonce, publication, approved revision
+    and screenshot manifest permits one atomic push of `main` and `plesk-static`. Any new revision,
+    change request or cancellation invalidates every prior preview artifact and callback.
+12. After both remote refs are verified, the bot reports both commit IDs and asks the operator to deploy in Plesk.
 
 Contact requests use a separate flow: the site submits one stable UUID, the loopback API stores
 the bounded public fields and a delivery job in one transaction, and the worker sends plain text
@@ -74,7 +85,8 @@ the newly created user only `city_coach` and one city scope.
 
 - Configuration: environment only; `.env` is accepted for local development. Canonical secret names are `TG_API_KEY` and the user-provided `ASSEMBLI_AI`; alias `ASSEMBLYAI_API_KEY` is supported.
 - Telegram callbacks contain opaque server-side action ID plus nonce, never role/city authority.
-- Free-form messages such as «добро» cannot publish. Only the one-use confirmation button tied to the exact preview can authorize commit/push.
+- Free-form messages such as «добро» cannot publish. Only the one-use confirmation button tied to
+  the exact actor, publication, revision and screenshot manifest can authorize commit/push.
 - Extractor input is untrusted text inside a delimited JSON envelope. Output must satisfy a Pydantic-generated JSON Schema; one validation repair is permitted.
 - Public export uses explicit Pydantic allowlist models, never DB-row serialization.
 - News bodies use typed paragraph/heading/quote blocks. The client renders block text through

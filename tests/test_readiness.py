@@ -162,11 +162,13 @@ class FakePublisher:
             """
             UPDATE publication_jobs SET status='preview_ready',
                 base_commit=$2, preview_nonce_hash=repeat('0',64),
-                preview_expires_at=now()+interval '30 minutes'
+                preview_expires_at=now()+interval '30 minutes',
+                screenshot_manifest_hash=$3, artifacts_invalidated_at=NULL
             WHERE id=$1
             """,
             publication_id,
             "a" * 40,
+            "e" * 64,
         )
         return PublicationPreview(
             publication_id=publication_id,
@@ -175,10 +177,13 @@ class FakePublisher:
             nonce="preview-nonce",
             diff_summary="city-content.json | 2 +",
             worktree=self.worktree_root / str(publication_id),
+            screenshot_manifest_hash="e" * 64,
+            artifacts=(),
         )
 
-    async def confirm_and_push(self, publication_id, nonce, actor_id):
+    async def confirm_and_push(self, publication_id, nonce, actor_id, manifest_hash):
         assert nonce == "preview-nonce"
+        assert manifest_hash == "e" * 64
         await self.pool.execute(
             """
             UPDATE publication_jobs SET status='published', confirmed_by=$2,

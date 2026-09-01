@@ -1,6 +1,8 @@
+import asyncio
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -8,7 +10,8 @@ from aiogram.types import CallbackQuery, Chat, Contact, Message, Update, User
 
 from floorball_bot.db import create_pool, run_migrations
 from floorball_bot.dialogue.repository import DialogueSpecRepository
-from floorball_bot.telegram import TelegramIngress
+from floorball_bot.queue import enqueue_outbox
+from floorball_bot.telegram import TelegramIngress, run_outbox
 from floorball_bot.workflow import canonical_hash
 
 pytestmark = pytest.mark.postgres
@@ -16,6 +19,63 @@ pytestmark = pytest.mark.postgres
 
 class FakeBot:
     pass
+
+
+class MediaGroupBot:
+    def __init__(self, stop, *, fail=False):
+        self.stop = stop
+        self.fail = fail
+        self.calls = 0
+
+    async def send_media_group(self, *, chat_id, media):
+        self.calls += 1
+        self.stop.set()
+        assert chat_id == 777
+        assert len(media) == 2
+        if self.fail:
+            raise RuntimeError("temporary Telegram failure")
+        return [SimpleNamespace(message_id=11), SimpleNamespace(message_id=12)]
+
+
+@pytest.mark.asyncio
+async def test_media_group_outbox_retries_idempotent_event(pg_pool, tmp_path):
+    first = tmp_path / "one.png"
+    second = tmp_path / "two.png"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    async with pg_pool.acquire() as connection, connection.transaction():
+        created = await enqueue_outbox(
+            connection,
+            event_type="telegram_media_group",
+            payload={"chat_id": 777, "paths": [str(first), str(second)], "caption": "Preview"},
+            idempotency_key="media-group:test",
+        )
+        duplicate = await enqueue_outbox(
+            connection,
+            event_type="telegram_media_group",
+            payload={"chat_id": 777, "paths": [str(first), str(second)]},
+            idempotency_key="media-group:test",
+        )
+    assert created is not None and duplicate is None
+
+    stop = asyncio.Event()
+    failing = MediaGroupBot(stop, fail=True)
+    await run_outbox(failing, pg_pool, "media-test-1", stop)
+    assert await pg_pool.fetchval(
+        "SELECT status FROM outbox_events WHERE id=$1", created
+    ) == "retry"
+    await pg_pool.execute(
+        "UPDATE outbox_events SET available_at=now() WHERE id=$1", created
+    )
+
+    stop = asyncio.Event()
+    succeeding = MediaGroupBot(stop)
+    await run_outbox(succeeding, pg_pool, "media-test-2", stop)
+    row = await pg_pool.fetchrow(
+        "SELECT status, external_id FROM outbox_events WHERE id=$1", created
+    )
+    assert row["status"] == "sent"
+    assert row["external_id"] == "11,12"
 
 
 @pytest.fixture
@@ -26,7 +86,12 @@ async def pg_pool():
     pool = await create_pool(dsn)
     await run_migrations(pool, Path(__file__).parents[1] / "migrations")
     await pool.execute(
-        "TRUNCATE users, cities, jobs, outbox_events, processed_updates RESTART IDENTITY CASCADE"
+        """
+        TRUNCATE users, cities, jobs, outbox_events, processed_updates,
+            telegram_start_intents, city_applicant_contact_attempts,
+            city_applications, city_applicants
+        RESTART IDENTITY CASCADE
+        """
     )
     yield pool
     await pool.close()
