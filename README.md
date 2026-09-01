@@ -9,7 +9,8 @@
 draft state machine, RU/KZ extraction contracts, fake и реальные provider adapters, image
 sanitization, deterministic city exporter/importer, автоматическая проверка готовности,
 Telegram-уведомления, двухшаговый publication preview/confirm, atomic Git push, durable contact
-requests с асинхронной SMTP-доставкой, systemd units и backup scripts.
+requests с асинхронной SMTP-доставкой, approval-gated национальные и городские новости,
+systemd units и backup scripts.
 
 Commit/push выполняется только после двух явных Telegram-кнопок для конкретной ревизии;
 Plesk deployment остаётся ручным.

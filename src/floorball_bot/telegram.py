@@ -243,7 +243,7 @@ class TelegramIngress:
                         target_id=target_id,
                         ttl_seconds=7 * 24 * 60 * 60,
                     )
-                    callback_text = self._trainer_review_summary(
+                    callback_text = self._review_summary(
                         draft["content"], draft["current_revision"], draft["content_hash"]
                     )
                     callback_markup = {
@@ -873,8 +873,11 @@ class TelegramIngress:
 
     def _selected_dialogue_mode(self, text: str, actor: Actor) -> DialogueMode | None:
         normalized = text.strip().casefold()
-        if normalized.split("@", 1)[0] == "/coach-form":
-            requested = DialogueMode.TRAINER
+        command = normalized.split("@", 1)[0]
+        if command in {"/coach-form", "/news"}:
+            requested = (
+                DialogueMode.TRAINER if command == "/coach-form" else DialogueMode.NEWS
+            )
             return requested if any(
                 loaded.spec.mode == requested for loaded in self._available_dialogues(actor)
             ) else None
@@ -1051,6 +1054,8 @@ class TelegramIngress:
         entity_type = (
             "city"
             if session["workflow"] == DialogueMode.TRAINER
+            else "news"
+            if session["workflow"] == DialogueMode.NEWS
             else "leadership"
             if session["workflow"] == DialogueMode.LEADERSHIP
             else "federation"
@@ -1267,7 +1272,7 @@ class TelegramIngress:
                 """
                 SELECT d.id, d.current_revision, r.content, r.content_hash, d.created_at
                 FROM drafts d
-                JOIN conversation_sessions s ON s.id=d.session_id AND s.workflow='trainer'
+                JOIN conversation_sessions s ON s.id=d.session_id
                 JOIN draft_revisions r
                   ON r.draft_id=d.id AND r.revision=d.current_revision
                 WHERE d.status IN ('submitted','under_review')
@@ -1277,14 +1282,19 @@ class TelegramIngress:
             if not rows:
                 response = "Новых анкет на проверку нет."
             else:
-                lines = ["Анкеты на проверку:"]
+                lines = ["Черновики на проверку:"]
                 keyboard = []
                 for row in rows:
                     fields = row["content"].get("fields", {})
+                    mode = row["content"].get("dialogue_mode", "")
                     city = fields.get("city", {}) if isinstance(fields, dict) else {}
-                    city_name = city.get("other_name") or city.get("name") or "город не указан"
+                    label = (
+                        fields.get("title_ru") or fields.get("title_kz") or "новость без заголовка"
+                        if mode == "news"
+                        else city.get("other_name") or city.get("name") or mode or "черновик"
+                    )
                     lines.append(
-                        f"• {city_name} · ревизия {row['current_revision']} · "
+                        f"• {label} · ревизия {row['current_revision']} · "
                         f"{row['content_hash'][:12]}"
                     )
                     callback = await create_callback(
@@ -1295,7 +1305,7 @@ class TelegramIngress:
                         ttl_seconds=7 * 24 * 60 * 60,
                     )
                     keyboard.append([{
-                        "text": f"Проверить: {city_name}",
+                        "text": f"Проверить: {label[:48]}",
                         "callback_data": callback.callback_data,
                     }])
                 await self._reply(
@@ -1311,6 +1321,23 @@ class TelegramIngress:
         else:
             response = "Неизвестная команда. Используйте /help."
         await self._reply(connection, update_id, chat_id, response)
+
+    @staticmethod
+    def _review_summary(content: dict, revision: int, content_hash: str) -> str:
+        if content.get("dialogue_mode") == "news":
+            fields = content.get("fields", {}) if isinstance(content, dict) else {}
+            scope = fields.get("scope") or "не указана"
+            city = fields.get("city_slug") or "—"
+            return (
+                "Новость готова к редакторскому решению.\n\n"
+                f"Заголовок RU: {fields.get('title_ru') or 'не заполнен'}\n"
+                f"Заголовок KZ: {fields.get('title_kz') or 'не заполнен'}\n"
+                f"Область: {scope}; город: {city}\n"
+                f"Slug: {fields.get('slug') or 'не заполнен'}\n"
+                f"Дата: {fields.get('published_at') or 'не заполнена'}\n"
+                f"Ревизия: {revision}; hash: {content_hash[:12]}"
+            )
+        return TelegramIngress._trainer_review_summary(content, revision, content_hash)
 
     @staticmethod
     def _trainer_review_summary(content: dict, revision: int, content_hash: str) -> str:

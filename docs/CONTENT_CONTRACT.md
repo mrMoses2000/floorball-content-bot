@@ -39,9 +39,27 @@ Top level: `ok`, `version`, `generatedAt`, `federation`.
 
 Current frontend has RU/KZ federation fields only; English site falls back through existing static translations. This is preserved until a separate backward-compatible federation EN migration.
 
+## News payload
+
+Top level: `ok`, `version`, `generatedAt`, `items`. Items are sorted by publication time and
+slug. Only canonical rows created from an approved, pinned draft revision are exported.
+
+| DB source | Public field | Rule |
+|---|---|---|
+| `news_items.slug` | `slug` | lowercase slug, max 120, unique |
+| scope fields | `scope`, `citySlug` | `national` has no city; `city` must reference exactly one active city |
+| publication time | `publishedAt` | reviewer-approved UTC timestamp; never generated from export wall-clock time |
+| localized fields | `titleRu/Kz/En`, `excerptRu/Kz/En` | RU/KZ required; EN optional and falls back in the client |
+| typed body blocks | `bodyRu/Kz/En` | ordered `paragraph`, `heading` or `quote` blocks; rendered as text, never executable HTML |
+| sources | `sources[]` | HTTPS URL and bounded public label |
+| approved media | `image`, localized image alt, `videoUrl` | optional; image requires recorded rights and RU/KZ alt text |
+
+City coaches may create news only for an assigned city. Federation editors and superadmins may
+create national news. Review approval pins the exact immutable revision; publication rechecks its
+hash and completeness before applying it idempotently.
+
 ## Explicitly forbidden public fields
 
 `telegram_id`, private/full phone, raw Telegram update, raw/original message, raw transcript, voice/audio paths, internal notes, consent document/path/evidence, DB creator/updater IDs, job/audit details, private email, original media path and provider metadata.
 
 Importers store current bundles with `source=google_forms_import` and stable content hash. Dry-run/reconciliation compares canonicalized records and is repeatable without duplicates.
-

@@ -58,8 +58,12 @@ fs.writeFileSync('app/src/data/generated/city-content.json', output)
     (site / "scripts/sync-federation-content.mjs").write_text(
         sync.replace("city-content", "federation-content"), encoding="utf-8"
     )
+    (site / "scripts/sync-news-content.mjs").write_text(
+        sync.replace("city-content", "news-content"), encoding="utf-8"
+    )
     (site / "scripts/test-coach-data-api.mjs").write_text("console.log('coach ok')\n")
     (site / "scripts/test-federation-content.mjs").write_text("console.log('fed ok')\n")
+    (site / "scripts/test-news-content.mjs").write_text("console.log('news ok')\n")
     (site / "app/build.mjs").write_text(
         """
 import fs from 'node:fs'
@@ -79,6 +83,9 @@ fs.writeFileSync('dist/.htaccess', 'RewriteEngine On\\n')
     (site / "app/src/data/generated/city-content.json").write_text(json.dumps(initial) + "\n")
     (site / "app/src/data/generated/federation-content.json").write_text(
         json.dumps({"ok": True, "version": 1, "federation": {}}) + "\n"
+    )
+    (site / "app/src/data/generated/news-content.json").write_text(
+        json.dumps({"ok": True, "version": 1, "items": []}) + "\n"
     )
     (site / "app/dist/index.html").write_text("<html>ok</html>\n")
     (site / "app/dist/.htaccess").write_text("RewriteEngine On\n")
@@ -117,6 +124,15 @@ def payload() -> dict:
     }
 
 
+def news_payload() -> dict:
+    return {
+        "ok": True,
+        "version": 1,
+        "generatedAt": "2026-09-01T00:00:00Z",
+        "items": [{"slug": "safe-news"}],
+    }
+
+
 @pytest.mark.asyncio
 async def test_publication_preview_uses_isolated_worktree_and_does_not_push(tmp_path):
     site, bare, base = make_site(tmp_path)
@@ -135,6 +151,21 @@ async def test_publication_preview_uses_isolated_worktree_and_does_not_push(tmp_
     assert any("preview_ready" in execution[0] for execution in pool.executions)
     await publisher.cleanup(preview.worktree)
     assert not preview.worktree.exists()
+
+
+@pytest.mark.asyncio
+async def test_news_preview_changes_only_news_bundle_and_build_output(tmp_path):
+    site, bare, base = make_site(tmp_path)
+    worktrees = tmp_path / "worktrees"
+    worktrees.mkdir()
+    expected_payload = news_payload()
+    publisher = GitPublisher(FakePool(expected_payload), site, worktrees)
+
+    preview = await publisher.build_preview(uuid4(), expected_payload)
+
+    assert "news-content.json" in preview.diff_summary
+    assert command("git", "rev-parse", "main", cwd=bare) == base
+    await publisher.cleanup(preview.worktree)
 
 
 @pytest.mark.asyncio

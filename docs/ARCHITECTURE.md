@@ -51,7 +51,9 @@ Telegram acceptance inserts `processed_updates`, normalized message and any requ
 5. Advance polling offset only after commit.
 6. Worker claims job, calls bounded external provider, stores result/revision and enqueues reply.
 7. User confirms transcript and draft. Reviewer separately approves. State machine rejects invalid transitions.
-8. Worker periodically projects each city and the federation into the public site contract. A deterministic evaluator records missing blocking fields and notifies subscribed, Telegram-bound superadmins only when a new content hash becomes complete.
+8. Worker periodically projects each city, the federation and approved national/city news into
+   public site contracts. A deterministic evaluator records missing blocking fields and notifies
+   subscribed, Telegram-bound superadmins only when a new content hash becomes complete.
 9. The notification button approves the immutable snapshot and builds an isolated preview. Tests and the Vite build run without commit or push.
 10. A second, actor-bound 30-minute button matching the preview nonce, approved revision hash and base commit permits one atomic push of `main` and `plesk-static`.
 11. After both remote refs are verified, the bot reports both commit IDs and asks the operator to deploy in Plesk.
@@ -69,6 +71,8 @@ at-least-once across a crash after remote acceptance and before the local `sent`
 - Free-form messages such as «добро» cannot publish. Only the one-use confirmation button tied to the exact preview can authorize commit/push.
 - Extractor input is untrusted text inside a delimited JSON envelope. Output must satisfy a Pydantic-generated JSON Schema; one validation repair is permitted.
 - Public export uses explicit Pydantic allowlist models, never DB-row serialization.
+- News bodies use typed paragraph/heading/quote blocks. The client renders block text through
+  React nodes and never executes stored markup as HTML.
 
 ## Codex subprocess boundary
 

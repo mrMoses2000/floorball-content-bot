@@ -16,6 +16,7 @@ from floorball_bot.errors import ValidationBlocked
 ALLOWED_SOURCE_CHANGES = {
     "app/src/data/generated/city-content.json",
     "app/src/data/generated/federation-content.json",
+    "app/src/data/generated/news-content.json",
 }
 
 
@@ -136,6 +137,14 @@ class GitPublisher:
                         str(source),
                         cwd=worktree,
                     )
+                elif "items" in payload:
+                    await run_command(
+                        "node",
+                        "scripts/sync-news-content.mjs",
+                        "--source",
+                        str(source),
+                        cwd=worktree,
+                    )
                 else:
                     raise ValidationBlocked("unsupported publication payload")
             finally:
@@ -157,6 +166,9 @@ class GitPublisher:
             )
             checks.append(
                 await run_command("node", "scripts/test-federation-content.mjs", cwd=worktree)
+            )
+            checks.append(
+                await run_command("node", "scripts/test-news-content.mjs", cwd=worktree)
             )
             checks.append(await run_command("npm", "--prefix", "app", "test", cwd=worktree))
             checks.append(await run_command("npm", "--prefix", "app", "run", "build", cwd=worktree))

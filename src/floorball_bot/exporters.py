@@ -11,8 +11,10 @@ from pydantic import ValidationError
 from floorball_bot.domain import (
     CityPayload,
     FederationPayload,
+    NewsPayload,
     PublicCity,
     PublicFederation,
+    PublicNewsItem,
 )
 from floorball_bot.errors import ValidationBlocked
 
@@ -72,6 +74,16 @@ def build_federation_payload(
     except ValidationError as exc:
         raise ValidationBlocked(f"federation public contract failed: {exc}") from exc
     payload = FederationPayload(generatedAt=_iso_milliseconds(generated_at), federation=public)
+    assert_private_fields_absent(payload.model_dump())
+    return payload
+
+
+def build_news_payload(items: list[dict[str, Any]], *, generated_at: datetime) -> NewsPayload:
+    try:
+        public = [PublicNewsItem.model_validate(item) for item in items]
+    except ValidationError as exc:
+        raise ValidationBlocked(f"news public contract failed: {exc}") from exc
+    payload = NewsPayload(generatedAt=_iso_milliseconds(generated_at), items=public)
     assert_private_fields_absent(payload.model_dump())
     return payload
 
@@ -339,7 +351,53 @@ async def project_federation_payload(
     )
 
 
-def deterministic_json(model: CityPayload | FederationPayload | dict[str, Any]) -> str:
+async def project_news_payload(
+    connection: asyncpg.Connection | asyncpg.Pool, *, generated_at: datetime
+) -> NewsPayload:
+    rows = await connection.fetch(
+        """
+        SELECT n.*, c.slug AS city_slug
+        FROM news_items n
+        LEFT JOIN cities c ON c.id=n.city_id
+        WHERE n.status='approved' AND n.deleted_at IS NULL
+          AND n.published_at <= $1
+          AND (n.scope='national' OR (c.active=TRUE AND c.deleted_at IS NULL))
+        ORDER BY n.published_at DESC, n.slug
+        """,
+        generated_at,
+    )
+    return build_news_payload(
+        [
+            {
+                "slug": row["slug"],
+                "scope": row["scope"],
+                "citySlug": row["city_slug"] or "",
+                "publishedAt": _iso_milliseconds(row["published_at"]),
+                "titleRu": row["title_ru"],
+                "titleKz": row["title_kz"],
+                "titleEn": row["title_en"],
+                "excerptRu": row["excerpt_ru"],
+                "excerptKz": row["excerpt_kz"],
+                "excerptEn": row["excerpt_en"],
+                "bodyRu": list(row["body_ru"]),
+                "bodyKz": list(row["body_kz"]),
+                "bodyEn": list(row["body_en"]),
+                "sources": list(row["sources"]),
+                "image": row["image_url"] if row["media_rights_confirmed"] else "",
+                "imageAltRu": row["image_alt_ru"] if row["media_rights_confirmed"] else "",
+                "imageAltKz": row["image_alt_kz"] if row["media_rights_confirmed"] else "",
+                "imageAltEn": row["image_alt_en"] if row["media_rights_confirmed"] else "",
+                "videoUrl": row["video_url"],
+            }
+            for row in rows
+        ],
+        generated_at=generated_at,
+    )
+
+
+def deterministic_json(
+    model: CityPayload | FederationPayload | NewsPayload | dict[str, Any]
+) -> str:
     value = (
         model.model_dump(mode="json", exclude_none=True) if hasattr(model, "model_dump") else model
     )

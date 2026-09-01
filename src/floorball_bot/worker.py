@@ -23,6 +23,7 @@ from floorball_bot.errors import PermanentProviderError, RetryableProviderError
 from floorball_bot.health import record_heartbeat
 from floorball_bot.media import MediaPipeline
 from floorball_bot.projection.apply import apply_approved_trainer_draft
+from floorball_bot.projection.news import apply_approved_news_draft
 from floorball_bot.providers.codex import StructuredExtractor
 from floorball_bot.providers.transcription import Transcriber
 from floorball_bot.publisher import GitPublisher
@@ -134,13 +135,26 @@ class Worker:
         chat_id = int(job.payload["chat_id"])
         async with self.pool.acquire() as connection:
             actor = await load_context_actor(connection, actor_id)
+            workflow = await connection.fetchval(
+                """
+                SELECT s.workflow FROM drafts d
+                JOIN conversation_sessions s ON s.id=d.session_id
+                WHERE d.id=$1
+                """,
+                draft_id,
+            )
         if actor is None or not actor.active:
             raise PermanentProviderError("projection actor no longer exists")
-        result = await apply_approved_trainer_draft(
-            self.pool,
-            draft_id=draft_id,
-            actor=actor,
-        )
+        if workflow == "news":
+            result = await apply_approved_news_draft(
+                self.pool, draft_id=draft_id, actor=actor
+            )
+        elif workflow == "trainer":
+            result = await apply_approved_trainer_draft(
+                self.pool, draft_id=draft_id, actor=actor
+            )
+        else:
+            raise PermanentProviderError("approved dialogue has no canonical projector")
         async with transaction(self.pool) as connection:
             await enqueue_job(
                 connection,

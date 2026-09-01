@@ -10,7 +10,11 @@ import asyncpg
 from floorball_bot.callbacks import create_callback
 from floorball_bot.context_gateway import load_context_actor
 from floorball_bot.domain import PublicCity, PublicFederation, Role
-from floorball_bot.exporters import project_city_payload, project_federation_payload
+from floorball_bot.exporters import (
+    project_city_payload,
+    project_federation_payload,
+    project_news_payload,
+)
 from floorball_bot.queue import enqueue_outbox, stable_idempotency_key
 from floorball_bot.workflow import canonical_hash
 
@@ -88,7 +92,7 @@ async def _snapshot_time(connection: asyncpg.Connection, entity_type: str) -> da
             FROM cities WHERE active=TRUE AND deleted_at IS NULL
             """
         )
-    else:
+    elif entity_type == "federation":
         value = await connection.fetchval(
             """
             SELECT max(updated_at) FROM (
@@ -97,6 +101,10 @@ async def _snapshot_time(connection: asyncpg.Connection, entity_type: str) -> da
                 SELECT updated_at FROM leadership_profiles WHERE deleted_at IS NULL
             ) source
             """
+        )
+    else:
+        value = await connection.fetchval(
+            "SELECT max(updated_at) FROM news_items WHERE deleted_at IS NULL"
         )
     return value or datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -164,10 +172,12 @@ async def scan_readiness(pool: asyncpg.Pool) -> tuple[ReadinessResult, ...]:
     ):
         city_time = await _snapshot_time(connection, "city")
         federation_time = await _snapshot_time(connection, "federation")
+        news_time = await _snapshot_time(connection, "news")
         city_payload = await project_city_payload(connection, generated_at=city_time)
         federation_payload = await project_federation_payload(
             connection, generated_at=federation_time
         )
+        news_payload = await project_news_payload(connection, generated_at=news_time)
 
     entities: list[tuple[str, str, tuple[str, ...], dict[str, Any], dict[str, Any]]] = []
     city_content = city_payload.model_dump(mode="json", exclude_none=True)
@@ -189,6 +199,16 @@ async def scan_readiness(pool: asyncpg.Pool) -> tuple[ReadinessResult, ...]:
             federation_missing(federation_payload.federation),
             federation_payload.federation.model_dump(mode="json", exclude_none=True),
             federation_content,
+        )
+    )
+    news_content = news_payload.model_dump(mode="json", exclude_none=True)
+    entities.append(
+        (
+            "news",
+            "news",
+            () if news_payload.items else ("items",),
+            news_content,
+            news_content,
         )
     )
 
@@ -297,6 +317,8 @@ async def scan_readiness(pool: asyncpg.Pool) -> tuple[ReadinessResult, ...]:
                         f"город {entity_key}"
                         if entity_type == "city"
                         else "разделы федерации"
+                        if entity_type == "federation"
+                        else "новости"
                     )
                     await enqueue_outbox(
                         connection,

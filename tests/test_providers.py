@@ -148,7 +148,7 @@ async def test_every_dialogue_codex_call_embeds_pinned_spec_and_safe_context():
             known_fields={},
         )
         assert result.mode == mode
-    assert len(extractor.prompts) == 4
+    assert len(extractor.prompts) == len(DialogueMode)
     for mode, prompt in zip(DialogueMode, extractor.prompts, strict=True):
         loaded = DialogueSpecRepository().load(mode)
         assert f"SPEC_SHA256: {loaded.sha256}" in prompt

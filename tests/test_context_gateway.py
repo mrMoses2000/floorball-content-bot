@@ -63,6 +63,7 @@ def test_context_catalog_maps_only_canonical_sources_to_site_contract():
         "strategy",
         "history",
         "leadership",
+        "news",
     }
     assert any(
         "cities[].clubs_list[]" in path

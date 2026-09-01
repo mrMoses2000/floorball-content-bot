@@ -369,6 +369,72 @@ class FederationPayload(BaseModel):
     federation: PublicFederation
 
 
+class PublicNewsBlock(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["paragraph", "heading", "quote"]
+    text: str = Field(min_length=1, max_length=2400)
+
+
+class PublicNewsSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(min_length=1, max_length=200)
+    url: str = Field(max_length=1000)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        return _validate_public_url(value)
+
+
+class PublicNewsItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    slug: str = Field(max_length=120, pattern=r"^[a-z0-9-]+$")
+    scope: Literal["national", "city"]
+    citySlug: str = Field(default="", max_length=80, pattern=r"^$|^[a-z0-9-]+$")
+    publishedAt: str = Field(max_length=60)
+    titleRu: str = Field(min_length=1, max_length=240)
+    titleKz: str = Field(min_length=1, max_length=240)
+    titleEn: str = Field(default="", max_length=240)
+    excerptRu: str = Field(min_length=1, max_length=600)
+    excerptKz: str = Field(min_length=1, max_length=600)
+    excerptEn: str = Field(default="", max_length=600)
+    bodyRu: list[PublicNewsBlock] = Field(min_length=1, max_length=30)
+    bodyKz: list[PublicNewsBlock] = Field(min_length=1, max_length=30)
+    bodyEn: list[PublicNewsBlock] = Field(default_factory=list, max_length=30)
+    sources: list[PublicNewsSource] = Field(default_factory=list, max_length=10)
+    image: str = Field(default="", max_length=1000)
+    imageAltRu: str = Field(default="", max_length=300)
+    imageAltKz: str = Field(default="", max_length=300)
+    imageAltEn: str = Field(default="", max_length=300)
+    videoUrl: str = Field(default="", max_length=1000)
+
+    @field_validator("image")
+    @classmethod
+    def validate_image(cls, value: str) -> str:
+        return _validate_public_url(value, allow_local=True)
+
+    @field_validator("videoUrl")
+    @classmethod
+    def validate_video(cls, value: str) -> str:
+        return _validate_public_url(value)
+
+    @model_validator(mode="after")
+    def validate_scope_and_media(self) -> PublicNewsItem:
+        if (self.scope == "city") != bool(self.citySlug):
+            raise ValueError("city news requires citySlug; national news forbids it")
+        if self.image and not (self.imageAltRu and self.imageAltKz):
+            raise ValueError("news image requires RU/KZ alt text")
+        return self
+
+
+class NewsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ok: Literal[True] = True
+    version: Literal[1] = 1
+    generatedAt: str = Field(max_length=60)
+    items: list[PublicNewsItem]
+
+
 class Actor(BaseModel):
     user_id: UUID
     telegram_id: int

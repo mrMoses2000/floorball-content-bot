@@ -11,6 +11,7 @@ class DialogueMode(StrEnum):
     STRATEGY = "strategy"
     HISTORY = "history"
     LEADERSHIP = "leadership"
+    NEWS = "news"
 
 
 class RequirementLevel(StrEnum):

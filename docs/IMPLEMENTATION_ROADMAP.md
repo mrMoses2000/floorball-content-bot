@@ -113,18 +113,18 @@ Gate: changing `mailto:` alone is not completion. The live delivery marker must 
 Release objective: approved national and city-scoped news appears on the homepage, news archive,
 article route and relevant city page.
 
-- [ ] Add canonical `news_items`, localized content, city links, sources and media links.
-- [ ] Add a versioned `news` dialogue specification and deterministic gap evaluator.
-- [ ] Enforce city-scope RBAC: city coaches can edit only linked cities; federation editors can
+- [x] Add canonical `news_items`, localized content, city links, sources and media links.
+- [x] Add a versioned `news` dialogue specification and deterministic gap evaluator.
+- [x] Enforce city-scope RBAC: city coaches can edit only linked cities; federation editors can
       create national news; reviewers approve; superadmins publish.
-- [ ] Require RU/KZ title, excerpt and safe body blocks; require media rights/alt text only when
+- [x] Require RU/KZ title, excerpt and safe body blocks; require media rights/alt text only when
       media is present; treat EN/gallery/video as optional.
-- [ ] Add `project_news_payload` and deterministic `news-content.json` generation.
-- [ ] Extend the publisher content allowlist without allowing JSX/config/package changes.
-- [ ] Replace i18n placeholder news with `NewsDataContext` data.
-- [ ] Add accessible non-autoplay CSS scroll-snap carousel after Geography on the homepage.
-- [ ] Add `/news`, `/news/:slug` and city-scoped news sections.
-- [ ] Add contract, localization, filtering, XSS, accessibility and route tests.
+- [x] Add `project_news_payload` and deterministic `news-content.json` generation.
+- [x] Extend the publisher content allowlist without allowing JSX/config/package changes.
+- [x] Replace i18n placeholder news with `NewsDataContext` data.
+- [x] Add accessible non-autoplay CSS scroll-snap carousel after Geography on the homepage.
+- [x] Add `/news`, `/news/:slug` and city-scoped news sections.
+- [x] Add contract, localization, filtering, XSS, accessibility and route tests.
 
 ## Phase P3: public new-city application
 
@@ -302,3 +302,17 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
 - Full site suite: `30 passed`; ESLint and production Vite build passed.
 - Release gate remains open until operator-owned SMTP/Plesk secrets are configured and a unique
   marker is observed both in `contact_requests` and the `Knff@gmail.com` inbox.
+
+### 2026-09-01 P2: approval-gated national and city news
+
+- Added a versioned `news` Telegram dialogue, canonical `news_items`, immutable approved-revision
+  projection, city-scope RBAC and deterministic public-only export.
+- Added the news bundle to the isolated publisher allowlist and its parser/build verification;
+  publication still cannot change JSX, configuration or packages.
+- Replaced placeholder homepage news with approved data, added an accessible non-autoplay
+  scroll-snap carousel after Geography, archive and article routes, and city-scoped sections.
+- RU/KZ content is mandatory, EN is optional with client fallback, and typed body blocks render as
+  text without HTML execution. Media is optional but requires rights and RU/KZ alt text when used.
+- Full bot suite against `floorball_bot_test`: `115 passed`; Ruff, compileall and dependency
+  integrity passed.
+- Full site suite: `36 passed`; ESLint, the public news contract and production Vite build passed.

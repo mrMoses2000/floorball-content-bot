@@ -159,11 +159,22 @@ class LeadershipContextSnapshot(StrictContextModel):
     coverage: ContextCoverage
 
 
+class NewsContextSnapshot(StrictContextModel):
+    schema_version: Literal["agent-context.v1"] = CONTEXT_SCHEMA_VERSION
+    site_contract_version: Literal[1] = SITE_CONTRACT_VERSION
+    mode: Literal[AgentMode.NEWS] = AgentMode.NEWS
+    access: Literal["full"] = "full"
+    can_create_national: bool
+    allowed_cities: list[CityDirectoryEntry] = Field(max_length=200)
+    recent_slugs: list[str] = Field(max_length=100)
+
+
 AgentContextSnapshot = (
     CityDirectorySnapshot
     | TrainerContextSnapshot
     | FederationContextSnapshot
     | LeadershipContextSnapshot
+    | NewsContextSnapshot
 )
 
 
@@ -199,6 +210,9 @@ _MODE_ROLES: dict[AgentMode, frozenset[Role]] = {
     ),
     AgentMode.LEADERSHIP: frozenset(
         {Role.FEDERATION_EDITOR, Role.REVIEWER, Role.SUPERADMIN}
+    ),
+    AgentMode.NEWS: frozenset(
+        {Role.FEDERATION_EDITOR, Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN}
     ),
 }
 
@@ -418,6 +432,21 @@ def context_schema_catalog() -> AgentContextCatalog:
                     "Portrait presence is reported without exposing an internal media identifier.",
                 ],
             ),
+            SiteContractMapping(
+                mode=AgentMode.NEWS,
+                db_sources=["news_items", "cities"],
+                site_paths=["items[]", "items[].citySlug"],
+                fields=[
+                    SiteFieldMapping(
+                        db_field="news_items localized text/body/source/media allowlist",
+                        site_field="items[]",
+                        rule=(
+                            "Approved non-deleted news only; city items require an active city. "
+                            "Private author and approval metadata is excluded."
+                        ),
+                    )
+                ],
+            ),
         ]
     )
     assert_agent_context_safe(catalog)
@@ -471,8 +500,10 @@ class AgentContextGateway:
                 snapshot = await self._trainer_snapshot(actor, city_slug)
         elif mode in {AgentMode.STRATEGY, AgentMode.HISTORY}:
             snapshot = await self._federation_snapshot(mode)
-        else:
+        elif mode == AgentMode.LEADERSHIP:
             snapshot = await self._leadership_snapshot()
+        else:
+            snapshot = await self._news_snapshot(actor)
         assert_agent_context_safe(snapshot)
         return snapshot
 
@@ -520,6 +551,51 @@ class AgentContextGateway:
         )
         assert_agent_context_safe(snapshot)
         return snapshot
+
+    async def _news_snapshot(self, actor: Actor) -> NewsContextSnapshot:
+        global_city_access = actor.has_any_role(
+            Role.SUPERADMIN, Role.REVIEWER, Role.FEDERATION_EDITOR
+        )
+        async with self.pool.acquire() as connection, connection.transaction(
+            isolation="repeatable_read", readonly=True
+        ):
+            if global_city_access:
+                rows = await connection.fetch(
+                    """
+                    SELECT slug, name_ru, name_kz, name_en
+                    FROM cities WHERE active=TRUE AND deleted_at IS NULL
+                    ORDER BY slug LIMIT 200
+                    """
+                )
+            else:
+                rows = await connection.fetch(
+                    """
+                    SELECT slug, name_ru, name_kz, name_en
+                    FROM cities WHERE active=TRUE AND deleted_at IS NULL
+                      AND id=ANY($1::uuid[])
+                    ORDER BY slug LIMIT 200
+                    """,
+                    list(actor.city_scopes),
+                )
+            recent = await connection.fetch(
+                """
+                SELECT slug FROM news_items
+                WHERE deleted_at IS NULL ORDER BY published_at DESC, slug LIMIT 100
+                """
+            )
+        return NewsContextSnapshot(
+            can_create_national=actor.has_any_role(Role.SUPERADMIN, Role.FEDERATION_EDITOR),
+            allowed_cities=[
+                CityDirectoryEntry(
+                    slug=row["slug"],
+                    name=LocalizedValue(
+                        ru=row["name_ru"], kz=row["name_kz"], en=row["name_en"]
+                    ),
+                )
+                for row in rows
+            ],
+            recent_slugs=[row["slug"] for row in recent],
+        )
 
     @staticmethod
     def _authorize_mode(actor: Actor, mode: AgentMode) -> None:
