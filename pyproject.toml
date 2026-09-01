@@ -9,6 +9,7 @@ description = "Approval-gated Telegram content workflow for floorball.kz"
 requires-python = ">=3.12"
 dependencies = [
   "aiogram==3.30.0",
+  "aiohttp==3.14.3",
   "assemblyai==1.0.0",
   "asyncpg==0.31.0",
   "httpx==0.28.1",

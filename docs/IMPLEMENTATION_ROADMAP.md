@@ -1,6 +1,6 @@
 # Floorball content platform implementation roadmap
 
-Last updated: 2026-08-31
+Last updated: 2026-09-01
 
 This document is the durable execution plan for the Telegram content bot and
 `/home/moses/floorball.kz`. It is intentionally stored in the bot repository because the bot
@@ -94,15 +94,15 @@ and reviewer path pass PostgreSQL E2E.
 Release objective: public contact data displays `Knff@gmail.com`, and a submitted contact request
 is durably recorded before asynchronous delivery.
 
-- [ ] Replace every public `info@floorball.kz` value and `mailto:` with `Knff@gmail.com`.
-- [ ] Remove the fake `preventDefault + alert(success)` implementation.
-- [ ] Define a versioned contact request contract: request ID, locale, name, reply-to, subject,
+- [x] Replace every public `info@floorball.kz` value and `mailto:` with `Knff@gmail.com`.
+- [x] Remove the fake `preventDefault + alert(success)` implementation.
+- [x] Define a versioned contact request contract: request ID, locale, name, reply-to, subject,
       message, honeypot and anti-abuse proof.
-- [ ] Add a dedicated contact relay (initial target: Google Apps Script + private Sheet outbox)
-      with a fixed recipient, input limits, header-injection protection and plain-text mail.
-- [ ] Add idempotency, bounded retry, sent/dead state and Telegram operator notification.
-- [ ] Make frontend copy say "Заявка принята в обработку", never "Письмо доставлено".
-- [ ] Add frontend validation/loading/error tests and relay contract tests.
+- [x] Add a dedicated loopback contact API + PostgreSQL outbox + SMTP delivery path with a fixed
+      recipient, input limits, header-injection protection and plain-text mail.
+- [x] Add idempotency, bounded retry, sent/dead state and Telegram operator notification.
+- [x] Make frontend copy say "Заявка принята в обработку", never "Письмо доставлено".
+- [x] Add frontend validation/loading/error tests and relay contract tests.
 - [ ] Perform a live smoke with a unique marker and verify both durable row and Gmail inbox.
 
 Gate: changing `mailto:` alone is not completion. The live delivery marker must be observed in
@@ -284,3 +284,21 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
 - Focused review/projection/workflow integration tests: `23 passed`.
 - Full bot suite against `floorball_bot_test`: `97 passed`.
 - Ruff, compileall and dependency integrity: passed.
+
+### 2026-09-01 P1: durable contact acceptance and SMTP delivery
+
+- Replaced every public `info@floorball.kz` occurrence with `Knff@gmail.com` and replaced the fake
+  success alert with a localized form that reports durable acceptance only.
+- Added contract v1, 16 KiB API limit, Origin allowlist, honeypot, HMAC-pseudonymized IP rate
+  limit, atomic request/job persistence and fixed-recipient delivery.
+- Added bounded SMTP retry, deterministic request Message-ID, sent/dead state and a terminal
+  Telegram notification to bound superadmins.
+- A lost HTTP response now reuses the same request UUID for unchanged form data. A worker crash
+  leaving a request in `sending` can be reclaimed from the durable job instead of being killed.
+- Added a hardened loopback `floorball-contact-api.service` and documented the Plesk reverse proxy,
+  Gmail app password, readiness check and live-smoke procedure.
+- Full bot suite against `floorball_bot_test`: `110 passed`; Ruff, compileall and dependency
+  integrity passed.
+- Full site suite: `30 passed`; ESLint and production Vite build passed.
+- Release gate remains open until operator-owned SMTP/Plesk secrets are configured and a unique
+  marker is observed both in `contact_requests` and the `Knff@gmail.com` inbox.

@@ -4,18 +4,23 @@
 
 Система принимает Telegram updates, авторизует заранее заведённых пользователей, сохраняет входные данные и медиа, формирует версионированные черновики, проводит user/reviewer approval и только затем создаёт детерминированный preview публикации для `floorball.kz`.
 
-Внешние зависимости: Telegram Bot API, AssemblyAI, локальный Codex CLI, PostgreSQL, ffmpeg/ImageMagick/Pillow, локальный clone `floorball.kz` и GitHub. Plesk остаётся ручным последним шагом.
+Внешние зависимости: Telegram Bot API, AssemblyAI, локальный Codex CLI, PostgreSQL,
+SMTP, ffmpeg/ImageMagick/Pillow, локальный clone `floorball.kz` и GitHub. Plesk остаётся
+ручным последним шагом.
 
 ## Deployment units
 
 ```mermaid
 flowchart LR
   TG[Telegram API] -->|long polling| BOT[floorball-bot]
+  SITE[floorball.kz contact form] -->|HTTPS reverse proxy| CONTACT[floorball-contact-api]
+  CONTACT -->|durable request + job| PG
   BOT -->|transaction| PG[(PostgreSQL)]
   PG --> WORKER[floorball-worker]
   WORKER --> AAI[AssemblyAI]
   WORKER --> CODEX[Codex CLI read-only]
   WORKER --> MEDIA[Local private media]
+  WORKER -->|fixed-recipient SMTP| MAIL[Knff Gmail]
   PG --> PUB[floorball-publisher]
   PUB --> WT[Isolated git worktree]
   WT --> TESTS[Parser tests + Vitest + Vite build]
@@ -25,6 +30,9 @@ flowchart LR
 
 - `floorball-bot`: `getUpdates`, durable acceptance, authorization handlers, Telegram replies/outbox dispatch, graceful SIGTERM.
 - `floorball-worker`: claims jobs with `FOR UPDATE SKIP LOCKED`, transcribes, extracts structured data, prepares media derivatives and resumes retries.
+- `floorball-contact-api`: loopback-only HTTP service; validates the versioned contact contract,
+  allowed Origin, body size, honeypot and HMAC pseudonymized IP rate limit, then atomically stores
+  the request and delivery job before returning `202 accepted`.
 - `floorball-publisher`: advisory lock, approved hash check, isolated worktree, deterministic export, tests/build, preview; commit/push is a second explicit action.
 - `floorball-backup`: `pg_dump`, media/config manifest and retention; secrets are not copied into reports.
 
@@ -48,6 +56,12 @@ Telegram acceptance inserts `processed_updates`, normalized message and any requ
 10. A second, actor-bound 30-minute button matching the preview nonce, approved revision hash and base commit permits one atomic push of `main` and `plesk-static`.
 11. After both remote refs are verified, the bot reports both commit IDs and asks the operator to deploy in Plesk.
 
+Contact requests use a separate flow: the site submits one stable UUID, the loopback API stores
+the bounded public fields and a delivery job in one transaction, and the worker sends plain text
+to the fixed recipient. Retries preserve the request UUID and deterministic Message-ID; after the
+bounded attempts, the row stays `dead` and a Telegram-bound superadmin is notified. SMTP remains
+at-least-once across a crash after remote acceptance and before the local `sent` commit.
+
 ## Interfaces
 
 - Configuration: environment only; `.env` is accepted for local development. Canonical secret names are `TG_API_KEY` and the user-provided `ASSEMBLI_AI`; alias `ASSEMBLYAI_API_KEY` is supported.
@@ -68,7 +82,8 @@ The official OpenAI non-interactive-mode documentation confirms that `codex exec
 - Auth, schema, consent, invalid transition and permanent Telegram errors go directly to review/dead state.
 - JSON structured logs include correlation/update/job/publication IDs, never full phone/token/transcript/private paths.
 - Health command checks DB, polling heartbeat, disk, dead jobs, latest backup and publication.
-- No inbound production port is required. Optional health endpoint binds only `127.0.0.1`.
+- The contact API binds only `127.0.0.1`; the existing HTTPS reverse proxy exposes only
+  `/api/contact`. Its `/healthz` checks PostgreSQL readiness and is not public by design.
 
 ## Resource model
 

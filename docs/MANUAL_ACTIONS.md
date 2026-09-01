@@ -7,7 +7,11 @@
 - AssemblyAI RU batch и KZ streaming connectivity smoke выполнен на синтетическом аудио.
   Для проверки качества распознавания всё ещё нужны короткие законные RU/KZ речевые сэмплы.
 - Создать repository-scoped GitHub deploy key и тестовую branch permission.
-- Исправить рассинхронизацию `floorball.kz/app/package-lock.json` и dependency advisories отдельным frontend change.
+- Разобрать npm dependency advisories отдельным frontend change; lockfile уже синхронизирован.
+- Добавить Gmail app password в `SMTP_PASSWORD`, задать `SMTP_USERNAME` и случайный
+  `CONTACT_API_SECRET`, не сохраняя значения в Git.
+- Установить и включить `floorball-contact-api.service`, проксировать `/api/contact/` в Plesk на
+  `127.0.0.1:8088`, затем проверить уникальную заявку и письмо в `Knff@gmail.com`.
 - После подтверждённого production preview явно разрешить main push.
 - После готовности `plesk-static` вручную нажать «Развернуть сейчас» в Plesk.
 - Настроить и проверить off-device encrypted backup.

@@ -10,8 +10,10 @@ from typing import Any
 from uuid import UUID
 
 from aiogram import Bot
+from aiohttp import web
 
 from floorball_bot.config import get_settings
+from floorball_bot.contact_api import create_contact_app
 from floorball_bot.context_gateway import (
     AgentContextGateway,
     AgentMode,
@@ -41,6 +43,7 @@ from floorball_bot.providers.transcription import (
     RoutedAssemblyAITranscriber,
 )
 from floorball_bot.publisher import GitPublisher
+from floorball_bot.smtp_mailer import SmtpContactMailer
 from floorball_bot.telegram import TelegramIngress, run_outbox
 from floorball_bot.worker import Worker
 
@@ -85,6 +88,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("migrate")
     commands.add_parser("bot")
     commands.add_parser("worker")
+    commands.add_parser("contact-api")
     commands.add_parser("health")
     context = commands.add_parser("agent-context")
     context.add_argument("--actor", required=True, type=UUID)
@@ -202,12 +206,45 @@ async def async_main(args: argparse.Namespace) -> None:
                 publisher=GitPublisher(
                     pool, settings.floorball_site_repo, settings.worktree_root
                 ),
+                contact_mailer=(
+                    SmtpContactMailer(
+                        host=settings.smtp_host,
+                        port=settings.smtp_port,
+                        username=settings.smtp_username,
+                        password=settings.smtp_password.get_secret_value(),
+                        use_ssl=settings.smtp_use_ssl,
+                    )
+                    if settings.smtp_configured()
+                    else None
+                ),
                 lease_seconds=settings.job_lease_seconds,
             )
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(worker.stop()))
             await worker.run()
+        elif args.command == "contact-api":
+            app = create_contact_app(
+                pool,
+                fingerprint_secret=settings.require_contact_api_secret(),
+                allowed_origins=settings.allowed_contact_origins(),
+            )
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(
+                runner,
+                host=settings.contact_api_host,
+                port=settings.contact_api_port,
+            )
+            await site.start()
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop.set)
+            try:
+                await stop.wait()
+            finally:
+                await runner.cleanup()
         elif args.command == "import-report":
             incoming = read_city_bundle(args.path)
             existing = {}

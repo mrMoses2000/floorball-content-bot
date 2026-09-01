@@ -8,8 +8,8 @@
 отдельная узкая роль `coach_form`, self-contact binding, durable update/job/outbox primitives,
 draft state machine, RU/KZ extraction contracts, fake и реальные provider adapters, image
 sanitization, deterministic city exporter/importer, автоматическая проверка готовности,
-Telegram-уведомления, двухшаговый publication preview/confirm, atomic Git push, systemd units
-и backup scripts.
+Telegram-уведомления, двухшаговый publication preview/confirm, atomic Git push, durable contact
+requests с асинхронной SMTP-доставкой, systemd units и backup scripts.
 
 Commit/push выполняется только после двух явных Telegram-кнопок для конкретной ревизии;
 Plesk deployment остаётся ручным.
@@ -30,11 +30,18 @@ cp .env.example .env
 .venv/bin/ruff check src tests
 ```
 
-Запуск в двух терминалах:
+Запуск основных процессов в отдельных терминалах:
 
 ```bash
 .venv/bin/floorball-bot bot
 .venv/bin/floorball-bot worker
+```
+
+После настройки `CONTACT_API_SECRET` (не менее 32 случайных байт), SMTP и reverse proxy
+`/api/contact` на `127.0.0.1:8088` запустите API формы связи:
+
+```bash
+.venv/bin/floorball-bot contact-api
 ```
 
 Сначала создайте пользователя и назначьте права:

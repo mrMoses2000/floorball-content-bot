@@ -9,6 +9,22 @@
 
 Long polling не требует домена, HTTPS, Cloudflare Tunnel, port forwarding или публичного входящего порта.
 
+## Форма связи и SMTP
+
+1. Сгенерируйте отдельный случайный `CONTACT_API_SECRET` длиной не менее 32 байт. Он используется
+   только для HMAC-псевдонимизации IP и не передаётся браузеру.
+2. Укажите `SMTP_USERNAME` и отдельный app password в `SMTP_PASSWORD`; обычный пароль Gmail не
+   используйте. Получатель жёстко задан как `Knff@gmail.com` и не принимается из HTTP-запроса.
+3. Запустите `floorball-bot contact-api` на `127.0.0.1:8088` и оставьте worker запущенным.
+4. В Plesk/Nginx проксируйте только `/api/contact/` на loopback-сервис с сохранением `Origin` и
+   `X-Forwarded-For`. Не публикуйте порт 8088 напрямую.
+5. Проверьте `GET http://127.0.0.1:8088/healthz`, затем отправьте одну заявку с уникальным marker,
+   найдите её UUID в `contact_requests` и подтвердите письмо в `Knff@gmail.com`.
+
+API возвращает только факт долговременного принятия (`202 accepted`), а не обещание доставки.
+Повтор неизменённой формы использует тот же UUID. Временная SMTP-ошибка повторяется не более пяти
+раз; окончательная ошибка остаётся видимой в БД и отправляется superadmin через Telegram outbox.
+
 ## AssemblyAI
 
 - Пользовательское имя секрета: `ASSEMBLI_AI`; также принят canonical alias `ASSEMBLYAI_API_KEY`.
@@ -31,4 +47,3 @@ Long polling не требует домена, HTTPS, Cloudflare Tunnel, port fo
 4. Измените repository remote на `git@github-floorball:Sherzattv/floorball.kz.git` только после тестового fetch/push в отдельную ветку.
 
 Никогда не добавляйте private key в репозиторий или `/etc/floorball-bot.env`.
-

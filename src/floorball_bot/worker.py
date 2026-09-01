@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from floorball_bot.callbacks import create_callback
+from floorball_bot.contact_requests import ContactDelivery, ContactMailer
 from floorball_bot.context_gateway import AgentContextGateway, AgentMode, load_context_actor
 from floorball_bot.db import transaction
 from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
@@ -48,6 +49,7 @@ class Worker:
         transcriber: Transcriber,
         media_pipeline: MediaPipeline | None = None,
         publisher: GitPublisher | None = None,
+        contact_mailer: ContactMailer | None = None,
         lease_seconds: int = 300,
         readiness_interval_seconds: int = 60,
     ) -> None:
@@ -56,6 +58,7 @@ class Worker:
         self.transcriber = transcriber
         self.media_pipeline = media_pipeline
         self.publisher = publisher
+        self.contact_mailer = contact_mailer
         self.dialogues = DialogueSpecRepository()
         self.context_gateway = AgentContextGateway(pool)
         self.lease_seconds = lease_seconds
@@ -104,6 +107,8 @@ class Worker:
                 await scan_readiness(self.pool)
             elif job.kind == "apply_projection":
                 await self._apply_projection(job)
+            elif job.kind == "contact_delivery":
+                await self._contact_delivery(job)
             elif job.kind == "publish_preview":
                 await self._publish_preview(job)
             elif job.kind == "publish_confirm":
@@ -165,6 +170,97 @@ class Worker:
                     "projection-applied", result.application_id, chat_id
                 ),
             )
+
+    async def _contact_delivery(self, job: ClaimedJob) -> None:
+        request_id = UUID(str(job.payload["request_id"]))
+        async with transaction(self.pool) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE contact_requests SET status='sending', attempts=attempts+1,
+                    locked_at=now(), locked_by=$2, updated_at=now()
+                WHERE id=$1 AND status IN ('pending','retry','sending')
+                RETURNING id AS request_id, locale, name, reply_to, subject,
+                          message, recipient, attempts
+                """,
+                request_id,
+                self.worker_id,
+            )
+            if not row:
+                status = await connection.fetchval(
+                    "SELECT status FROM contact_requests WHERE id=$1", request_id
+                )
+                if status == "sent":
+                    return
+                raise PermanentProviderError("contact request is not deliverable")
+        if self.contact_mailer is None:
+            await self.pool.execute(
+                """
+                UPDATE contact_requests SET status='dead', last_error='mailer_not_configured',
+                    locked_at=NULL, locked_by=NULL, updated_at=now() WHERE id=$1
+                """,
+                request_id,
+            )
+            await self._notify_contact_failure(request_id, "mailer_not_configured")
+            raise PermanentProviderError("contact mailer is not configured")
+        delivery_data = dict(row)
+        delivery_data.pop("attempts")
+        delivery = ContactDelivery.model_validate(delivery_data)
+        try:
+            external_id = await self.contact_mailer.send(delivery)
+        except Exception as exc:
+            terminal = row["attempts"] >= job.max_attempts
+            await self.pool.execute(
+                """
+                UPDATE contact_requests SET status=$2,
+                    available_at=now()+interval '30 seconds',
+                    last_error=$3, locked_at=NULL, locked_by=NULL, updated_at=now()
+                WHERE id=$1
+                """,
+                request_id,
+                "dead" if terminal else "retry",
+                type(exc).__name__,
+            )
+            if terminal:
+                await self._notify_contact_failure(request_id, type(exc).__name__)
+                raise PermanentProviderError("contact delivery exhausted retries") from exc
+            raise RetryableProviderError("contact delivery failed") from exc
+        await self.pool.execute(
+            """
+            UPDATE contact_requests SET status='sent', external_id=$2, sent_at=now(),
+                last_error='', locked_at=NULL, locked_by=NULL, updated_at=now()
+            WHERE id=$1
+            """,
+            request_id,
+            external_id[:500],
+        )
+
+    async def _notify_contact_failure(self, request_id: UUID, error_class: str) -> None:
+        recipients = await self.pool.fetch(
+            """
+            SELECT DISTINCT u.id, u.telegram_id
+            FROM users u
+            JOIN user_roles ur ON ur.user_id=u.id AND ur.role_name='superadmin'
+                              AND ur.revoked_at IS NULL
+            WHERE u.active=TRUE AND u.deleted_at IS NULL AND u.telegram_id IS NOT NULL
+            """
+        )
+        async with transaction(self.pool) as connection:
+            for recipient in recipients:
+                await enqueue_outbox(
+                    connection,
+                    event_type="telegram_message",
+                    payload={
+                        "chat_id": recipient["telegram_id"],
+                        "text": (
+                            "Заявка с сайта не доставлена после повторных попыток. "
+                            f"Request ID: {request_id}. Ошибка: {error_class}. "
+                            "Данные сохранены в contact_requests; нужна ручная проверка SMTP."
+                        ),
+                    },
+                    idempotency_key=stable_idempotency_key(
+                        "contact-delivery-dead", request_id, recipient["id"]
+                    ),
+                )
 
     async def _publication_recipients(self, fallback_chat_id: int) -> set[int]:
         rows = await self.pool.fetch(

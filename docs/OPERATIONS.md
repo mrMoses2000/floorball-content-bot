@@ -11,15 +11,19 @@
 
 ## Installation handoff
 
-После всех тестов оператор создаёт непривилегированного user/group, каталоги с минимальными правами, копирует units из `deploy/systemd`, выполняет `systemd-analyze verify`, затем `daemon-reload` и включает bot/worker/backup timer. Эти действия не выполнены автоматически.
+После всех тестов оператор создаёт непривилегированного user/group, каталоги с минимальными
+правами, копирует units из `deploy/systemd`, выполняет `systemd-analyze verify`, затем
+`daemon-reload` и включает bot/worker/contact-api/backup timer. Эти действия не выполнены
+автоматически.
 
 Проверки:
 
 ```bash
-systemctl status floorball-bot floorball-worker
+systemctl status floorball-bot floorball-worker floorball-contact-api
 systemctl list-timers floorball-backup.timer
 journalctl -u floorball-bot -u floorball-worker --since today
 sudo -u floorballbot /opt/floorball-content-bot/.venv/bin/floorball-bot health
+curl --fail --silent http://127.0.0.1:8088/healthz
 ```
 
 ## Текущий локальный запуск
@@ -75,6 +79,10 @@ Health timer запускает эту проверку каждые пять м
 После успешного main push и проверки remote `plesk-static` бот сообщает commit IDs. Оператор открывает Plesk repository `floorball-build.git`, проверяет ветку `plesk-static` и нажимает «Получить сейчас»/«Развернуть сейчас». Автоматический click не выполняется.
 
 Проверить `https://floorball.kz`, прямой reload `/clubs/almaty`, RU/KZ/EN, hero, gallery и игрока без фото.
+
+Для формы связи Plesk/Nginx проксирует `/api/contact/` на `http://127.0.0.1:8088/api/contact/`.
+Перед публикацией frontend убедитесь, что contact API и worker запущены, миграция
+`012_contact_requests.sql` применена, а SMTP app password проверен уникальной тестовой заявкой.
 
 ## Уведомления о готовности и публикация
 
