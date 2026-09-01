@@ -182,12 +182,14 @@ class GitPublisher:
         worktree_root: Path,
         *,
         screenshot_capture: ScreenshotCapture | None = None,
+        publish_enabled: bool = True,
     ) -> None:
         self.pool = pool
         self.repository = repository.resolve()
         self.worktree_root = worktree_root.resolve()
         self.artifact_root = (self.worktree_root / "_artifacts").resolve()
         self.screenshot_capture = screenshot_capture or self._capture_screenshots
+        self.publish_enabled = publish_enabled
 
     @staticmethod
     def _bundle_path(payload: dict) -> str:
@@ -615,6 +617,8 @@ class GitPublisher:
         *,
         chat_id: int | None = None,
     ) -> tuple[str, str]:
+        if not self.publish_enabled:
+            raise ValidationBlocked("publishing is disabled by PUBLISH_ENABLED=false")
         lease_owner = f"confirm-{uuid4()}"
         async with self.pool.acquire() as connection, connection.transaction():
             row = await connection.fetchrow(
@@ -924,6 +928,19 @@ class GitPublisher:
                 await self._remote_ref(worktree, "refs/heads/plesk-static"),
             )
             if remote == (row["base_commit"], row["base_static_commit"]):
+                if not self.publish_enabled:
+                    await self.pool.execute(
+                        """
+                        UPDATE publication_jobs SET publish_lease_expires_at=now(),
+                            reconciliation_error='publishing disabled', updated_at=now()
+                        WHERE id=$1 AND publish_lease_owner=$2
+                        """,
+                        publication_id,
+                        lease_owner,
+                    )
+                    raise RetryableProviderError(
+                        "publishing is disabled by PUBLISH_ENABLED=false"
+                    )
                 await run_command(
                     "git",
                     "push",

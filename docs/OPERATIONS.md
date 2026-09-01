@@ -154,3 +154,33 @@ git -C /home/moses/floorball.kz ls-remote origin refs/heads/main refs/heads/ples
 Не применяйте force-push. Сопоставьте `base_*`, `expected_*`, `main_commit` и `static_commit` из
 `publication_jobs`, затем оформите обычный forward/revert commit или отмените публикацию после
 зафиксированного операторского решения.
+
+## Staging gate
+
+Production worker должен явно иметь `PUBLISH_ENABLED=true` в защищённом EnvironmentFile. В
+`.env.example` и `.env.staging.example` значение намеренно `false`; без явного production opt-in
+confirm завершается до DB/Git mutation.
+
+Один раз создайте отдельную БД от имени локального PostgreSQL-администратора:
+
+```bash
+sudo -u postgres createdb --owner=moses floorball_bot_staging
+cp .env.staging.example .env.staging
+chmod 600 .env.staging
+```
+
+Затем вставьте в `.env.staging` отдельный токен бота, созданного через BotFather, и реальный
+loopback DSN staging-БД. Не копируйте production `TG_API_KEY`. Первый gate не запускает polling,
+внешних провайдеров или почту:
+
+```bash
+set -a
+. ./.env.staging
+set +a
+export STAGING_POSTGRES_DSN="$POSTGRES_DSN"
+.venv/bin/python scripts/staging_gate.py
+```
+
+Gate разрешает только БД с suffix `_staging`/`_test`, принудительно требует
+`PUBLISH_ENABLED=false` и использует local bare Git внутри тестовых каталогов. После зелёного gate
+staging polling можно запускать отдельным unit только с отдельными token, DB, media и worktree.

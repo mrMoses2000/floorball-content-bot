@@ -227,6 +227,22 @@ def test_content_and_code_template_change_manifests_use_separate_allowlists(tmp_
 
 
 @pytest.mark.asyncio
+async def test_publish_enabled_false_refuses_before_touching_git_or_database(tmp_path):
+    repository = tmp_path / "site"
+    worktrees = tmp_path / "worktrees"
+    repository.mkdir()
+    worktrees.mkdir()
+    publisher = GitPublisher(
+        object(), repository, worktrees, publish_enabled=False
+    )
+
+    with pytest.raises(ValidationBlocked, match="PUBLISH_ENABLED=false"):
+        await publisher.confirm_and_push(
+            uuid4(), "nonce", uuid4(), "e" * 64
+        )
+
+
+@pytest.mark.asyncio
 async def test_publication_preview_uses_isolated_worktree_and_does_not_push(tmp_path):
     site, bare, base = make_site(tmp_path)
     worktrees = tmp_path / "worktrees"

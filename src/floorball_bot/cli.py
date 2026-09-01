@@ -211,7 +211,10 @@ async def async_main(args: argparse.Namespace) -> None:
                     max_derivative_bytes=settings.max_derivative_bytes,
                 ),
                 publisher=GitPublisher(
-                    pool, settings.floorball_site_repo, settings.worktree_root
+                    pool,
+                    settings.floorball_site_repo,
+                    settings.worktree_root,
+                    publish_enabled=settings.publish_enabled,
                 ),
                 contact_mailer=(
                     SmtpContactMailer(
@@ -365,7 +368,12 @@ async def async_main(args: argparse.Namespace) -> None:
                 row["content_hash"],
                 args.actor,
             )
-            publisher = GitPublisher(pool, settings.floorball_site_repo, settings.worktree_root)
+            publisher = GitPublisher(
+                pool,
+                settings.floorball_site_repo,
+                settings.worktree_root,
+                publish_enabled=settings.publish_enabled,
+            )
             preview_result = await publisher.build_preview(publication_id, row["content"])
             print(
                 json.dumps(
@@ -382,7 +390,12 @@ async def async_main(args: argparse.Namespace) -> None:
                 )
             )
         elif args.command == "publish-confirm":
-            publisher = GitPublisher(pool, settings.floorball_site_repo, settings.worktree_root)
+            publisher = GitPublisher(
+                pool,
+                settings.floorball_site_repo,
+                settings.worktree_root,
+                publish_enabled=settings.publish_enabled,
+            )
             manifest_hash = await pool.fetchval(
                 "SELECT screenshot_manifest_hash FROM publication_jobs WHERE id=$1",
                 args.publication,
@@ -394,7 +407,12 @@ async def async_main(args: argparse.Namespace) -> None:
             )
             print(json.dumps({"main_commit": main_commit, "plesk_static_commit": static_commit}))
         elif args.command == "publish-reconcile":
-            publisher = GitPublisher(pool, settings.floorball_site_repo, settings.worktree_root)
+            publisher = GitPublisher(
+                pool,
+                settings.floorball_site_repo,
+                settings.worktree_root,
+                publish_enabled=settings.publish_enabled,
+            )
             main_commit, static_commit = await publisher.reconcile_publication(args.publication)
             print(json.dumps({"main_commit": main_commit, "plesk_static_commit": static_commit}))
     finally:

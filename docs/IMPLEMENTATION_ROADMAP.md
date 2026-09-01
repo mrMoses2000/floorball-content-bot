@@ -179,28 +179,28 @@ publication or an ambiguous success message.
 ## Phase P6: staging and release
 
 - [ ] Create a separate staging Telegram bot and PostgreSQL database.
-- [ ] Use a local bare Git remote and `PUBLISH_ENABLED=false` for the first E2E.
-- [ ] Test synthetic trainer flow, national news, city news and duplicate new-city application.
-- [ ] Verify screenshots and stale approvals without touching production refs.
+- [x] Use a local bare Git remote and `PUBLISH_ENABLED=false` for the first E2E.
+- [x] Test synthetic trainer flow, national news, city news and duplicate new-city application.
+- [x] Verify screenshots and stale approvals without touching production refs.
 - [ ] Pilot one real national news item.
 - [ ] Pilot one real city news item.
 - [ ] Pilot one real new city.
-- [ ] Run clean-clone install/test/lint/build, backup and restore drill.
+- [x] Run clean-clone install/test/lint/build, backup and restore drill.
 - [ ] Manually deploy verified `plesk-static` in Plesk and smoke-test direct route reloads and
       RU/KZ/EN.
 
 ## Cross-cutting release gates
 
 - [x] `pytest -m 'not postgres'`, full disposable-PostgreSQL suite and Ruff are green.
-- [ ] Site `npm ci`, Vitest, ESLint and production build are green from a clean checkout.
-- [ ] DB-to-JSON-to-frontend round trips do not expose private fields.
-- [ ] RBAC/IDOR and applicant isolation tests are green.
+- [x] Site `npm ci`, Vitest, ESLint and production build are green from a clean checkout.
+- [x] DB-to-JSON-to-frontend round trips do not expose private fields.
+- [x] RBAC/IDOR and applicant isolation tests are green.
 - [ ] Media consent withdrawal removes the public derivative on the next projection.
 - [ ] Contact live delivery is verified.
 - [x] Both desktop/mobile screenshot sets exist for visual changes.
 - [x] Old callbacks fail after revision or base commit changes.
 - [x] Remote main/static commit IDs are verified before Telegram reports success.
-- [ ] Backup/restore drill succeeds.
+- [x] Backup/restore drill succeeds.
 
 ## Execution evidence
 
@@ -373,3 +373,23 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
   main/static push → published → idempotent reconcile. The DB boundary independently rechecks an
   active superadmin role, including for the recovery/CLI path. Focused PostgreSQL/unit suite:
   `27 passed`; full bot suite: `139 passed`; Ruff, compileall and dependency integrity passed.
+
+### 2026-09-01 P6 iteration 1: fail-closed local staging gate
+
+- Added `PUBLISH_ENABLED` at the CLI/worker publisher boundary; the committed example and staging
+  profile default to `false`. Disabled confirmation fails before DB or Git mutation, and a
+  reconciler also refuses to push old refs while publishing is disabled.
+- Added `.env.staging.example` and `scripts/staging_gate.py`. The gate refuses DB names without
+  `_staging`/`_test`, migrates only that DB, forces publishing off, runs the synthetic trainer,
+  national/city news, duplicate-city, applicant isolation, screenshot, stale-callback and local
+  bare-Git suites, then runs site Vitest/ESLint/build. Email tests and delivery are excluded.
+- First disposable gate on `floorball_bot_test`: `50 passed`; site `37 passed`, ESLint and Vite
+  build passed. No production Git refs were contacted by publication tests.
+- Post-`016` backup `database-20260901T155354Z.dump` restored into
+  `floorball_bot_restore_test`; all 16 migrations were present.
+- Clean clones on a separate temporary filesystem passed from locked installs: backend fresh venv,
+  Ruff, `140 passed`, compileall and pip check; site `npm ci`, `37 passed`, ESLint and production
+  build. Both clones remained free of tracked changes. The 14 existing npm advisories remain
+  explicitly deferred to a separate dependency-upgrade change.
+- Permanent `floorball_bot_staging` creation is pending because both `CREATEDB` and passwordless
+  sudo are intentionally unavailable. A separate BotFather staging token is also operator-owned.

@@ -16,6 +16,15 @@ systemd units и backup scripts.
 Commit/push выполняется только после двух явных Telegram-кнопок для конкретной ревизии;
 Plesk deployment остаётся ручным.
 
+Git push fail-closed: worker/CLI требуют явный `PUBLISH_ENABLED=true`. Первый staging gate всегда
+работает с `false`, принимает только disposable `_staging`/`_test` БД, использует local bare Git и
+не запускает почтовую доставку:
+
+```bash
+export STAGING_POSTGRES_DSN='postgresql:///floorball_bot_staging?host=/var/run/postgresql'
+PUBLISH_ENABLED=false .venv/bin/python scripts/staging_gate.py
+```
+
 Проверяется unit/contract и PostgreSQL integration suite, Ruff, `compileall`, `pip check`,
 Telegram Bot API, Codex CLI и AssemblyAI RU/KZ маршруты. Проверка качества распознавания
 всё ещё требует разрешённых речевых RU/KZ сэмплов.

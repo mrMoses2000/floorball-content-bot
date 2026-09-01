@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     max_job_attempts: int = 5
     poll_timeout_seconds: int = 30
     run_external_tests: bool = Field(default=False, validation_alias="RUN_EXTERNAL_TESTS")
+    publish_enabled: bool = Field(default=False, validation_alias="PUBLISH_ENABLED")
     smtp_host: str = Field(default="smtp.gmail.com", validation_alias="SMTP_HOST")
     smtp_port: int = Field(default=465, validation_alias="SMTP_PORT")
     smtp_username: str = Field(default="", validation_alias="SMTP_USERNAME")
