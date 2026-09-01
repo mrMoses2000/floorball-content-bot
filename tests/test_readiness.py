@@ -181,18 +181,21 @@ class FakePublisher:
             artifacts=(),
         )
 
-    async def confirm_and_push(self, publication_id, nonce, actor_id, manifest_hash):
+    async def confirm_and_push(
+        self, publication_id, nonce, actor_id, manifest_hash, *, chat_id=None
+    ):
         assert nonce == "preview-nonce"
         assert manifest_hash == "e" * 64
         await self.pool.execute(
             """
             UPDATE publication_jobs SET status='published', confirmed_by=$2,
-                main_commit=$3, static_commit=$4 WHERE id=$1
+                main_commit=$3, static_commit=$4, confirmation_chat_id=$5 WHERE id=$1
             """,
             publication_id,
             actor_id,
             "b" * 40,
             "c" * 40,
+            chat_id,
         )
         return "b" * 40, "c" * 40
 

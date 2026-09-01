@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,8 +10,31 @@ import pytest
 from PIL import Image, ImageDraw
 
 from floorball_bot import publisher as publisher_module
+from floorball_bot.db import create_pool, run_migrations
 from floorball_bot.errors import ValidationBlocked
-from floorball_bot.publisher import CommandFailed, GitPublisher, derive_affected_routes
+from floorball_bot.publisher import (
+    CommandFailed,
+    GitPublisher,
+    build_change_manifest,
+    derive_affected_routes,
+)
+from floorball_bot.workflow import canonical_hash
+
+
+@pytest.fixture
+async def publisher_pg_pool():
+    dsn = os.getenv("TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("TEST_POSTGRES_DSN is not configured")
+    pool = await create_pool(dsn)
+    await run_migrations(pool, Path(__file__).parents[1] / "migrations")
+    database = await pool.fetchval("SELECT current_database()")
+    if not database.endswith("_test"):
+        await pool.close()
+        raise RuntimeError(f"refusing destructive fixture database: {database}")
+    await pool.execute("TRUNCATE users, publication_jobs RESTART IDENTITY CASCADE")
+    yield pool
+    await pool.close()
 
 
 class FakePool:
@@ -173,6 +197,35 @@ def news_payload() -> dict:
     }
 
 
+def test_content_and_code_template_change_manifests_use_separate_allowlists(tmp_path):
+    content = tmp_path / "app/src/data/generated/city-content.json"
+    generated = tmp_path / "app/dist/index.html"
+    component = tmp_path / "app/src/components/Card.jsx"
+    content.parent.mkdir(parents=True)
+    generated.parent.mkdir(parents=True)
+    component.parent.mkdir(parents=True)
+    content.write_text("{}\n")
+    generated.write_text("<html></html>\n")
+    component.write_text("export default null\n")
+
+    content_manifest = build_change_manifest(
+        tmp_path,
+        {"app/src/data/generated/city-content.json", "app/dist/index.html"},
+        change_class="content",
+    )
+    assert content_manifest["class"] == "content"
+    with pytest.raises(ValidationBlocked, match="unexpected"):
+        build_change_manifest(
+            tmp_path, {"app/src/components/Card.jsx"}, change_class="content"
+        )
+    code_manifest = build_change_manifest(
+        tmp_path,
+        {"app/src/components/Card.jsx", "app/dist/index.html"},
+        change_class="code_template",
+    )
+    assert code_manifest["class"] == "code_template"
+
+
 @pytest.mark.asyncio
 async def test_publication_preview_uses_isolated_worktree_and_does_not_push(tmp_path):
     site, bare, base = make_site(tmp_path)
@@ -195,6 +248,85 @@ async def test_publication_preview_uses_isolated_worktree_and_does_not_push(tmp_
     assert len(preview.artifacts) == 18
     await publisher.cleanup(preview.worktree)
     assert not preview.worktree.exists()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_full_preview_confirm_atomic_push_and_reconcile_roundtrip(
+    publisher_pg_pool, tmp_path
+):
+    site, bare, base = make_site(tmp_path)
+    command("git", "config", "user.name", "Test Publisher", cwd=site)
+    command("git", "config", "user.email", "publisher@example.invalid", cwd=site)
+    worktrees = tmp_path / "worktrees"
+    worktrees.mkdir()
+    actor_id = await publisher_pg_pool.fetchval(
+        "INSERT INTO users(phone_e164,display_name) VALUES ($1,'Publisher') RETURNING id",
+        f"+77{uuid4().int % 10**9:09d}",
+    )
+    await publisher_pg_pool.execute(
+        "INSERT INTO user_roles(user_id,role_name) VALUES ($1,'superadmin')", actor_id
+    )
+    session_id = await publisher_pg_pool.fetchval(
+        "INSERT INTO conversation_sessions(user_id,workflow) VALUES ($1,'publish') RETURNING id",
+        actor_id,
+    )
+    draft_id = await publisher_pg_pool.fetchval(
+        """
+        INSERT INTO drafts(
+            session_id,entity_type,status,current_revision,approved_revision,created_by,updated_by
+        ) VALUES ($1,'city','approved',1,1,$2,$2) RETURNING id
+        """,
+        session_id,
+        actor_id,
+    )
+    expected_payload = payload()
+    revision_hash = canonical_hash(expected_payload)
+    await publisher_pg_pool.execute(
+        """
+        INSERT INTO draft_revisions(draft_id,revision,content,content_hash,created_by)
+        VALUES ($1,1,$2::jsonb,$3,$4)
+        """,
+        draft_id,
+        expected_payload,
+        revision_hash,
+        actor_id,
+    )
+    publication_id = await publisher_pg_pool.fetchval(
+        """
+        INSERT INTO publication_jobs(draft_id,revision,revision_hash,requested_by)
+        VALUES ($1,1,$2,$3) RETURNING id
+        """,
+        draft_id,
+        revision_hash,
+        actor_id,
+    )
+    publisher = GitPublisher(
+        publisher_pg_pool,
+        site,
+        worktrees,
+        screenshot_capture=fake_screenshot_capture,
+    )
+
+    preview = await publisher.build_preview(publication_id, expected_payload)
+    main_commit, static_commit = await publisher.confirm_and_push(
+        publication_id,
+        preview.nonce,
+        actor_id,
+        preview.screenshot_manifest_hash,
+        chat_id=778899,
+    )
+
+    assert command("git", "rev-parse", "main", cwd=bare) == main_commit
+    assert command("git", "rev-parse", "plesk-static", cwd=bare) == static_commit
+    assert main_commit != base
+    assert await publisher_pg_pool.fetchval(
+        "SELECT status FROM publication_jobs WHERE id=$1", publication_id
+    ) == "published"
+    assert await publisher.reconcile_publication(publication_id) == (
+        main_commit,
+        static_commit,
+    )
 
 
 @pytest.mark.asyncio
@@ -238,79 +370,61 @@ async def test_build_failure_does_not_push_and_cleans_worktree(tmp_path):
     assert not (worktrees / str(publication_id)).exists()
 
 
-class FakeConfirmConnection:
-    def __init__(self, row):
-        self.row = row
+class FakePushPool:
+    def __init__(self, publication_id):
+        self.publication_id = publication_id
         self.executions = []
 
-    @asynccontextmanager
-    async def transaction(self):
-        yield
-
-    async def fetchrow(self, *_args):
-        return self.row
+    async def fetchval(self, *args):
+        self.executions.append(args)
+        return self.publication_id
 
     async def execute(self, *args):
         self.executions.append(args)
 
 
-class FakeConfirmPool:
-    def __init__(self, row):
-        self.connection = FakeConfirmConnection(row)
-
-    @asynccontextmanager
-    async def acquire(self):
-        yield self.connection
-
-
 @pytest.mark.asyncio
-async def test_confirm_pushes_main_and_static_atomically_and_verifies_refs(
+async def test_reconciler_pushes_expected_main_and_static_atomically_and_verifies_refs(
     tmp_path, monkeypatch
 ):
     publication_id = uuid4()
-    actor_id = uuid4()
-    nonce = "one-use-preview-nonce"
     base = "a" * 40
+    base_static = "d" * 40
     main_commit = "b" * 40
     static_commit = "c" * 40
-    pool = FakeConfirmPool(
-        {
-            "preview_nonce_hash": hashlib.sha256(nonce.encode()).hexdigest(),
-            "base_commit": base,
-            "approved_hash": "d" * 64,
-            "revision_hash": "d" * 64,
-        }
-    )
+    pool = FakePushPool(publication_id)
     repository = tmp_path / "site"
     worktrees = tmp_path / "worktrees"
     worktree = worktrees / str(publication_id)
     repository.mkdir()
     worktree.mkdir(parents=True)
     calls = []
+    pushed = False
 
     async def fake_run_command(*args, **_kwargs):
+        nonlocal pushed
         calls.append(args)
-        if args[:3] == ("git", "rev-parse", "origin/main"):
-            return base
-        if args[:3] == ("git", "rev-parse", "HEAD"):
-            return main_commit
-        if args[:3] == ("git", "subtree", "split"):
-            return static_commit
         if args[:3] == ("git", "ls-remote", "origin"):
-            commit = main_commit if args[3] == "refs/heads/main" else static_commit
+            if args[3] == "refs/heads/main":
+                commit = main_commit if pushed else base
+            else:
+                commit = static_commit if pushed else base_static
             return f"{commit}\t{args[3]}\n"
+        if args[:3] == ("git", "push", "--atomic"):
+            pushed = True
         return ""
 
     monkeypatch.setattr(publisher_module, "run_command", fake_run_command)
     publisher = GitPublisher(pool, repository, worktrees)
-
-    async def fake_verify_manifest(*_args):
-        return None
-
-    monkeypatch.setattr(publisher, "_verify_persisted_manifest", fake_verify_manifest)
-
-    result = await publisher.confirm_and_push(
-        publication_id, nonce, actor_id, "e" * 64
+    result = await publisher._push_or_observe(
+        {
+            "id": publication_id,
+            "base_commit": base,
+            "base_static_commit": base_static,
+            "expected_main_commit": main_commit,
+            "expected_static_commit": static_commit,
+        },
+        "lease-owner",
     )
 
     assert result == (main_commit, static_commit)
@@ -319,10 +433,10 @@ async def test_confirm_pushes_main_and_static_atomically_and_verifies_refs(
         "push",
         "--atomic",
         "origin",
-        "HEAD:main",
+        f"{main_commit}:refs/heads/main",
         f"{static_commit}:refs/heads/plesk-static",
     ) in calls
-    assert any("status='published'" in execution[0] for execution in pool.connection.executions)
+    assert any("status='remote_verified'" in execution[0] for execution in pool.executions)
 
 
 def test_affected_routes_are_derived_from_changed_news_entity():

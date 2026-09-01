@@ -65,9 +65,13 @@ Telegram acceptance inserts `processed_updates`, normalized message and any requ
 10. Screenshot rows and one manifest hash bind paths, dimensions, SHA-256 and revision. Telegram
     sends them in durable media groups followed by Approve / Needs changes / Cancel controls.
 11. The actor-bound 30-minute approval matching the preview nonce, publication, approved revision
-    and screenshot manifest permits one atomic push of `main` and `plesk-static`. Any new revision,
-    change request or cancellation invalidates every prior preview artifact and callback.
-12. After both remote refs are verified, the bot reports both commit IDs and asks the operator to deploy in Plesk.
+    and screenshot manifest claims a renewable lease. Short transactions record `confirming`, the
+    expected commits and `pushing`; Git commit/push runs without an open DB transaction.
+12. The atomic push has a durable reconciliation job. Both old remote refs allow a safe retry;
+    both expected refs advance to `remote_verified`; any mixed/foreign refs require manual
+    recovery. Finalization is idempotent and only then records `published` and reports both commit
+    IDs. Any new revision, change request or cancellation invalidates every prior artifact/button.
+13. After both remote refs are verified, the bot asks the operator to deploy in Plesk.
 
 Contact requests use a separate flow: the site submits one stable UUID, the loopback API stores
 the bounded public fields and a delivery job in one transaction, and the worker sends plain text
@@ -104,6 +108,8 @@ The official OpenAI non-interactive-mode documentation confirms that `codex exec
 - Auth, schema, consent, invalid transition and permanent Telegram errors go directly to review/dead state.
 - JSON structured logs include correlation/update/job/publication IDs, never full phone/token/transcript/private paths.
 - Health command checks DB, polling heartbeat, disk, dead jobs, latest backup and publication.
+- Health also reports active/stuck publication reconciliation and treats a persistent remote-ref
+  mismatch as unhealthy until an operator resolves it.
 - The contact API binds only `127.0.0.1`; the existing HTTPS reverse proxy exposes only
   `/api/contact`. Its `/healthz` checks PostgreSQL readiness and is not public by design.
 

@@ -129,6 +129,8 @@ def parser() -> argparse.ArgumentParser:
     confirm.add_argument("--publication", required=True, type=UUID)
     confirm.add_argument("--nonce", required=True)
     confirm.add_argument("--actor", required=True, type=UUID)
+    reconcile = commands.add_parser("publish-reconcile")
+    reconcile.add_argument("--publication", required=True, type=UUID)
     return root
 
 
@@ -373,15 +375,27 @@ async def async_main(args: argparse.Namespace) -> None:
                         "revision_hash": preview_result.revision_hash,
                         "nonce": preview_result.nonce,
                         "diff_summary": preview_result.diff_summary,
+                        "screenshot_manifest_hash": preview_result.screenshot_manifest_hash,
+                        "artifact_count": len(preview_result.artifacts),
                     },
                     ensure_ascii=False,
                 )
             )
         elif args.command == "publish-confirm":
             publisher = GitPublisher(pool, settings.floorball_site_repo, settings.worktree_root)
-            main_commit, static_commit = await publisher.confirm_and_push(
-                args.publication, args.nonce, args.actor
+            manifest_hash = await pool.fetchval(
+                "SELECT screenshot_manifest_hash FROM publication_jobs WHERE id=$1",
+                args.publication,
             )
+            if not manifest_hash:
+                raise RuntimeError("publication screenshot manifest is missing")
+            main_commit, static_commit = await publisher.confirm_and_push(
+                args.publication, args.nonce, args.actor, manifest_hash
+            )
+            print(json.dumps({"main_commit": main_commit, "plesk_static_commit": static_commit}))
+        elif args.command == "publish-reconcile":
+            publisher = GitPublisher(pool, settings.floorball_site_repo, settings.worktree_root)
+            main_commit, static_commit = await publisher.reconcile_publication(args.publication)
             print(json.dumps({"main_commit": main_commit, "plesk_static_commit": static_commit}))
     finally:
         await pool.close()

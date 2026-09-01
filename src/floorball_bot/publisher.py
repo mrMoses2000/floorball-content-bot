@@ -11,22 +11,57 @@ import socket
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 from PIL import Image
 
-from floorball_bot.errors import ValidationBlocked
+from floorball_bot.errors import RetryableProviderError, ValidationBlocked
 
 ALLOWED_SOURCE_CHANGES = {
     "app/src/data/generated/city-content.json",
     "app/src/data/generated/federation-content.json",
     "app/src/data/generated/news-content.json",
 }
+CODE_TEMPLATE_PREFIXES = (
+    "app/src/components/",
+    "app/src/pages/",
+    "app/src/styles/",
+    "app/public/",
+)
 
 
-def is_allowed_change(path: str) -> bool:
-    return path in ALLOWED_SOURCE_CHANGES or path.startswith("app/dist/")
+def is_allowed_change(path: str, change_class: str = "content") -> bool:
+    if change_class == "content":
+        return path in ALLOWED_SOURCE_CHANGES or path.startswith("app/dist/")
+    if change_class == "code_template":
+        return path.startswith(CODE_TEMPLATE_PREFIXES) or path.startswith("app/dist/")
+    return False
+
+
+def build_change_manifest(
+    worktree: Path, paths: set[str], *, change_class: str
+) -> dict:
+    if change_class not in {"content", "code_template"}:
+        raise ValidationBlocked("unknown publication change class")
+    unexpected = sorted(path for path in paths if not is_allowed_change(path, change_class))
+    if unexpected:
+        raise ValidationBlocked(f"publication changed unexpected files: {unexpected}")
+    source: list[dict] = []
+    generated: list[dict] = []
+    root = worktree.resolve()
+    for relative in sorted(paths):
+        target = (worktree / relative).resolve()
+        if not target.is_relative_to(root):
+            raise ValidationBlocked("publication change path escapes its worktree")
+        entry: dict[str, object] = {"path": relative, "deleted": not target.is_file()}
+        if target.is_file():
+            body = target.read_bytes()
+            entry.update({"sha256": hashlib.sha256(body).hexdigest(), "byteSize": len(body)})
+        (generated if relative.startswith("app/dist/") else source).append(entry)
+    if not source:
+        raise ValidationBlocked("publication change manifest has no source changes")
+    return {"version": 1, "class": change_class, "source": source, "generated": generated}
 
 
 @dataclass(frozen=True)
@@ -116,8 +151,18 @@ async def run_command(
     try:
         output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
     except TimeoutError as exc:
-        process.kill()
-        await process.wait()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10)
+        except TimeoutError:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.wait()
         raise CommandFailed(f"command timeout: {command[0]}") from exc
     text = output.decode(errors="replace")
     if len(text) > 2_000_000:
@@ -128,6 +173,8 @@ async def run_command(
 
 
 class GitPublisher:
+    publish_lease_seconds = 300
+
     def __init__(
         self,
         pool: asyncpg.Pool,
@@ -157,6 +204,12 @@ class GitPublisher:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
             candidate.bind(("127.0.0.1", 0))
             return int(candidate.getsockname()[1])
+
+    @staticmethod
+    async def _remote_ref(cwd: Path, ref: str) -> str:
+        output = await run_command("git", "ls-remote", "origin", ref, cwd=cwd)
+        parts = output.split()
+        return parts[0] if parts else ""
 
     async def _capture_screenshots(
         self, worktree: Path, routes: tuple[str, ...], output_dir: Path
@@ -390,6 +443,9 @@ class GitPublisher:
         base_commit = (
             await run_command("git", "rev-parse", "origin/main", cwd=self.repository)
         ).strip()
+        base_static_commit = await self._remote_ref(
+            self.repository, "refs/heads/plesk-static"
+        )
         await run_command(
             "git", "worktree", "add", "--detach", str(worktree), "origin/main", cwd=self.repository
         )
@@ -465,9 +521,9 @@ class GitPublisher:
                 ).splitlines()
                 if len(line) > 3
             }
-            unexpected = sorted(path for path in all_changes if not is_allowed_change(path))
-            if unexpected:
-                raise ValidationBlocked(f"publication changed unexpected files: {unexpected}")
+            change_manifest = build_change_manifest(
+                worktree, all_changes, change_class="content"
+            )
             diff = await run_command("git", "diff", "--stat", cwd=worktree)
             raw_artifacts = await self.screenshot_capture(
                 worktree, affected_routes, artifact_dir
@@ -518,7 +574,11 @@ class GitPublisher:
                         preview_nonce_hash=$4,
                         preview_expires_at=now()+interval '30 minutes',
                         screenshot_manifest_hash=$5, artifacts_invalidated_at=NULL,
-                        diff_summary=$6, check_output=$7, updated_at=now()
+                        diff_summary=$6, check_output=$7, base_static_commit=$8,
+                        change_class='content', change_manifest=$9::jsonb,
+                        expected_main_commit='', expected_static_commit='',
+                        publish_lease_owner='', publish_lease_expires_at=NULL,
+                        reconciliation_error='', updated_at=now()
                     WHERE id=$1
                     """,
                     publication_id,
@@ -528,6 +588,8 @@ class GitPublisher:
                     manifest_hash,
                     diff,
                     "\n".join(checks)[-100_000:],
+                    base_static_commit,
+                    change_manifest,
                 )
             return PublicationPreview(
                 publication_id,
@@ -550,47 +612,251 @@ class GitPublisher:
         nonce: str,
         actor_id: UUID,
         expected_manifest_hash: str,
+        *,
+        chat_id: int | None = None,
     ) -> tuple[str, str]:
+        lease_owner = f"confirm-{uuid4()}"
         async with self.pool.acquire() as connection, connection.transaction():
-            await connection.execute(
-                "SELECT pg_advisory_xact_lock(hashtext('floorball-publication'))"
-            )
             row = await connection.fetchrow(
                 """
-                SELECT p.*, d.status AS draft_status, r.content_hash AS approved_hash
+                SELECT p.*, d.status AS draft_status, r.content_hash AS approved_hash,
+                       (p.publish_lease_expires_at IS NULL
+                        OR p.publish_lease_expires_at < now()) AS lease_available,
+                       (p.preview_expires_at > now()) AS preview_live,
+                       EXISTS (
+                           SELECT 1 FROM users u
+                           JOIN user_roles ur ON ur.user_id=u.id
+                           WHERE u.id=$2 AND u.active=TRUE AND u.deleted_at IS NULL
+                             AND ur.role_name='superadmin' AND ur.revoked_at IS NULL
+                       ) AS actor_authorized
                 FROM publication_jobs p
                 JOIN drafts d ON d.id=p.draft_id AND d.approved_revision=p.revision
                 JOIN draft_revisions r ON r.draft_id=d.id AND r.revision=p.revision
-                WHERE p.id=$1 AND p.status='preview_ready'
-                  AND p.preview_expires_at > now() AND d.status='approved'
-                  AND p.artifacts_invalidated_at IS NULL
-                  AND p.screenshot_manifest_hash=$2
+                WHERE p.id=$1
                 FOR UPDATE OF p
                 """,
                 publication_id,
-                expected_manifest_hash,
+                actor_id,
             )
-            if not row or not secrets.compare_digest(
-                row["preview_nonce_hash"], hashlib.sha256(nonce.encode()).hexdigest()
+            if (
+                not row
+                or not row["actor_authorized"]
+                or row["artifacts_invalidated_at"] is not None
+                or not secrets.compare_digest(
+                    row["screenshot_manifest_hash"], expected_manifest_hash
+                )
             ):
                 raise ValidationBlocked("publication confirmation is invalid or expired")
-            if row["approved_hash"] != row["revision_hash"]:
+            if row["status"] == "published":
+                return row["main_commit"], row["static_commit"]
+            if (
+                row["draft_status"] != "approved"
+                or row["approved_hash"] != row["revision_hash"]
+            ):
                 raise ValidationBlocked("approved revision hash changed")
-            await self._verify_persisted_manifest(
-                connection, publication_id, expected_manifest_hash
-            )
-            current = (
-                await run_command("git", "rev-parse", "origin/main", cwd=self.repository)
-            ).strip()
-            if current != row["base_commit"]:
+            if row["status"] == "preview_ready":
+                if (
+                    not row["preview_live"]
+                    or not secrets.compare_digest(
+                        row["preview_nonce_hash"],
+                        hashlib.sha256(nonce.encode()).hexdigest(),
+                    )
+                ):
+                    raise ValidationBlocked("publication confirmation is invalid or expired")
                 await connection.execute(
-                    "UPDATE publication_jobs SET status='cancelled', updated_at=now() WHERE id=$1",
+                    """
+                    UPDATE publication_jobs SET status='confirming', confirmed_by=$2,
+                        confirmation_chat_id=COALESCE($3,confirmation_chat_id),
+                        publish_lease_owner=$4,
+                        publish_lease_expires_at=now()+make_interval(secs => $5),
+                        reconciliation_error='', updated_at=now()
+                    WHERE id=$1
+                    """,
                     publication_id,
+                    actor_id,
+                    chat_id,
+                    lease_owner,
+                    self.publish_lease_seconds,
                 )
-                raise ValidationBlocked("origin/main changed; build a new preview")
-            worktree = self.worktree_root / str(publication_id)
+            elif row["status"] in {"confirming", "pushing", "remote_verified"}:
+                if row["confirmed_by"] != actor_id or not row["lease_available"]:
+                    raise RetryableProviderError("publication confirmation is already leased")
+                await connection.execute(
+                    """
+                    UPDATE publication_jobs SET publish_lease_owner=$2,
+                        publish_lease_expires_at=now()+make_interval(secs => $3),
+                        confirmation_chat_id=COALESCE(confirmation_chat_id,$4), updated_at=now()
+                    WHERE id=$1
+                    """,
+                    publication_id,
+                    lease_owner,
+                    self.publish_lease_seconds,
+                    chat_id,
+                )
+            else:
+                raise ValidationBlocked(f"publication is not confirmable: {row['status']}")
+        return await self._advance_publication(publication_id, lease_owner)
+
+    async def reconcile_publication(self, publication_id: UUID) -> tuple[str, str]:
+        lease_owner = f"reconcile-{uuid4()}"
+        row = await self.pool.fetchrow(
+            """
+            UPDATE publication_jobs SET publish_lease_owner=$2,
+                publish_lease_expires_at=now()+make_interval(secs => $3),
+                last_reconciled_at=now(), updated_at=now()
+            WHERE id=$1 AND status IN ('confirming','pushing','remote_verified')
+              AND (publish_lease_expires_at IS NULL OR publish_lease_expires_at < now())
+            RETURNING *
+            """,
+            publication_id,
+            lease_owner,
+            self.publish_lease_seconds,
+        )
+        if row:
+            return await self._advance_publication(publication_id, lease_owner)
+        published = await self.pool.fetchrow(
+            """
+            SELECT main_commit, static_commit FROM publication_jobs
+            WHERE id=$1 AND status='published'
+            """,
+            publication_id,
+        )
+        if published:
+            return published["main_commit"], published["static_commit"]
+        raise RetryableProviderError("publication is active or not reconcilable")
+
+    async def stale_publications(self, limit: int = 20) -> tuple[UUID, ...]:
+        rows = await self.pool.fetch(
+            """
+            SELECT id FROM publication_jobs
+            WHERE status IN ('confirming','pushing','remote_verified')
+              AND (publish_lease_expires_at IS NULL OR publish_lease_expires_at < now())
+            ORDER BY updated_at LIMIT $1
+            """,
+            limit,
+        )
+        return tuple(row["id"] for row in rows)
+
+    async def _renew_publish_lease(self, publication_id: UUID, lease_owner: str) -> None:
+        renewed = await self.pool.fetchval(
+            """
+            UPDATE publication_jobs
+            SET publish_lease_expires_at=now()+make_interval(secs => $3), updated_at=now()
+            WHERE id=$1 AND publish_lease_owner=$2
+              AND status IN ('confirming','pushing','remote_verified')
+            RETURNING id
+            """,
+            publication_id,
+            lease_owner,
+            self.publish_lease_seconds,
+        )
+        if not renewed:
+            raise RetryableProviderError("publication lease was lost")
+
+    async def _load_owned_publication(
+        self, publication_id: UUID, lease_owner: str
+    ) -> asyncpg.Record:
+        row = await self.pool.fetchrow(
+            """
+            SELECT * FROM publication_jobs
+            WHERE id=$1 AND publish_lease_owner=$2
+              AND status IN ('confirming','pushing','remote_verified')
+            """,
+            publication_id,
+            lease_owner,
+        )
+        if not row:
+            raise RetryableProviderError("publication lease is no longer owned")
+        return row
+
+    @staticmethod
+    def _verify_change_manifest(row: asyncpg.Record, worktree: Path) -> None:
+        manifest = row["change_manifest"]
+        if not isinstance(manifest, dict) or manifest.get("class") != row["change_class"]:
+            raise ValidationBlocked("publication change manifest is invalid")
+        source = manifest.get("source")
+        generated = manifest.get("generated")
+        if not isinstance(source, list) or not isinstance(generated, list):
+            raise ValidationBlocked("publication change manifest entries are invalid")
+        entries = [*source, *generated]
+        if not entries or any(not isinstance(entry, dict) for entry in entries):
+            raise ValidationBlocked("publication change manifest is empty")
+        paths = [str(entry.get("path", "")) for entry in entries]
+        if len(set(paths)) != len(paths):
+            raise ValidationBlocked("publication change manifest contains duplicate paths")
+        root = worktree.resolve()
+        for entry in entries:
+            relative = str(entry.get("path", ""))
+            if not is_allowed_change(relative, row["change_class"]):
+                raise ValidationBlocked("publication change manifest escaped its allowlist")
+            target = (worktree / relative).resolve()
+            if not target.is_relative_to(root):
+                raise ValidationBlocked("publication change manifest escaped its worktree")
+            if entry.get("deleted"):
+                if target.exists():
+                    raise ValidationBlocked("a manifest deletion no longer matches the worktree")
+                continue
+            if not target.is_file():
+                raise ValidationBlocked("a manifest file is missing from the worktree")
+            body = target.read_bytes()
+            if (
+                len(body) != entry.get("byteSize")
+                or hashlib.sha256(body).hexdigest() != entry.get("sha256")
+            ):
+                raise ValidationBlocked("a manifest file changed after preview")
+
+    @staticmethod
+    def _manifest_paths(row: asyncpg.Record) -> set[str]:
+        manifest = row["change_manifest"]
+        return {
+            str(entry["path"])
+            for entry in [*manifest.get("source", []), *manifest.get("generated", [])]
+        }
+
+    async def _prepare_publication_commits(
+        self, row: asyncpg.Record, lease_owner: str
+    ) -> tuple[str, str]:
+        publication_id = row["id"]
+        worktree = self.worktree_root / str(publication_id)
+        if not worktree.is_dir():
+            raise ValidationBlocked("publication worktree is missing")
+        await self._renew_publish_lease(publication_id, lease_owner)
+        async with self.pool.acquire() as connection:
+            await self._verify_persisted_manifest(
+                connection, publication_id, row["screenshot_manifest_hash"]
+            )
+        self._verify_change_manifest(row, worktree)
+        manifest_paths = self._manifest_paths(row)
+        try:
+            remote_main = await self._remote_ref(worktree, "refs/heads/main")
+            remote_static = await self._remote_ref(worktree, "refs/heads/plesk-static")
+        except CommandFailed as exc:
+            raise RetryableProviderError("remote refs are temporarily unavailable") from exc
+        if remote_main != row["base_commit"] or remote_static != row["base_static_commit"]:
+            await self.pool.execute(
+                """
+                UPDATE publication_jobs SET status='cancelled', reconciliation_error=$2,
+                    publish_lease_owner='', publish_lease_expires_at=NULL, updated_at=now()
+                WHERE id=$1 AND publish_lease_owner=$3
+                """,
+                publication_id,
+                "remote refs changed before push",
+                lease_owner,
+            )
+            raise ValidationBlocked("remote refs changed; build a new preview")
+        head = (await run_command("git", "rev-parse", "HEAD", cwd=worktree)).strip()
+        if head == row["base_commit"]:
+            current_changes = {
+                line[3:]
+                for line in (
+                    await run_command("git", "status", "--porcelain", cwd=worktree)
+                ).splitlines()
+                if len(line) > 3
+            }
+            if current_changes != manifest_paths:
+                raise ValidationBlocked("worktree changes no longer match the preview manifest")
             await run_command(
-                "git", "add", *sorted(ALLOWED_SOURCE_CHANGES), "app/dist", cwd=worktree
+                "git", "add", "--all", "--", *sorted(manifest_paths), cwd=worktree
             )
             await run_command(
                 "git",
@@ -599,46 +865,162 @@ class GitPublisher:
                 f"content: publish approved revision {publication_id}",
                 cwd=worktree,
             )
-            main_commit = (await run_command("git", "rev-parse", "HEAD", cwd=worktree)).strip()
-            static_commit = (
-                await run_command(
-                    "git", "subtree", "split", "--prefix=app/dist", "HEAD", cwd=worktree
-                )
-            ).strip()
-            await run_command(
-                "git",
-                "push",
-                "--atomic",
-                "origin",
-                "HEAD:main",
-                f"{static_commit}:refs/heads/plesk-static",
-                cwd=worktree,
-                timeout_seconds=120,
+            head = (await run_command("git", "rev-parse", "HEAD", cwd=worktree)).strip()
+        else:
+            parent = (await run_command("git", "rev-parse", "HEAD^", cwd=worktree)).strip()
+            changed = set(
+                (await run_command(
+                    "git", "diff", "--name-only", f"{row['base_commit']}..HEAD", cwd=worktree
+                )).splitlines()
             )
-            remote_main = (
-                await run_command(
-                    "git", "ls-remote", "origin", "refs/heads/main", cwd=worktree
-                )
-            ).split()[0]
-            remote_static = (
-                await run_command(
-                    "git", "ls-remote", "origin", "refs/heads/plesk-static", cwd=worktree
-                )
-            ).split()[0]
-            if remote_main != main_commit or remote_static != static_commit:
-                raise ValidationBlocked("remote main/plesk-static verification failed")
-            await connection.execute(
+            if parent != row["base_commit"] or changed != manifest_paths:
+                raise ValidationBlocked("publication worktree commit is not recoverable")
+        await self._renew_publish_lease(publication_id, lease_owner)
+        static_commit = (
+            await run_command(
+                "git", "subtree", "split", "--quiet", "--prefix=app/dist", "HEAD", cwd=worktree
+            )
+        ).strip()
+        async with self.pool.acquire() as connection, connection.transaction():
+            updated = await connection.fetchval(
                 """
-                UPDATE publication_jobs SET status='published', confirmed_by=$2,
-                    main_commit=$3, static_commit=$4, updated_at=now() WHERE id=$1
+                UPDATE publication_jobs SET status='pushing', expected_main_commit=$3,
+                    expected_static_commit=$4, push_started_at=COALESCE(push_started_at,now()),
+                    publish_lease_expires_at=now()+make_interval(secs => $5), updated_at=now()
+                WHERE id=$1 AND publish_lease_owner=$2 AND status='confirming'
+                RETURNING id
                 """,
                 publication_id,
-                actor_id,
-                main_commit,
+                lease_owner,
+                head,
                 static_commit,
+                self.publish_lease_seconds,
             )
-        await self.cleanup(self.worktree_root / str(publication_id))
-        return main_commit, static_commit
+            if not updated:
+                raise RetryableProviderError("publication state changed while preparing push")
+            await connection.execute(
+                """
+                INSERT INTO jobs(kind,payload,idempotency_key,max_attempts,available_at)
+                VALUES ('publish_reconcile',$1::jsonb,$2,20,now()+interval '30 seconds')
+                ON CONFLICT (idempotency_key) DO NOTHING
+                """,
+                {"publication_id": str(publication_id)},
+                f"publish-reconcile:{publication_id}",
+            )
+        return head, static_commit
+
+    async def _push_or_observe(
+        self, row: asyncpg.Record, lease_owner: str
+    ) -> tuple[str, str]:
+        publication_id = row["id"]
+        worktree = self.worktree_root / str(publication_id)
+        expected = (row["expected_main_commit"], row["expected_static_commit"])
+        if not all(expected):
+            raise ValidationBlocked("expected publication commits are missing")
+        await self._renew_publish_lease(publication_id, lease_owner)
+        try:
+            remote = (
+                await self._remote_ref(worktree, "refs/heads/main"),
+                await self._remote_ref(worktree, "refs/heads/plesk-static"),
+            )
+            if remote == (row["base_commit"], row["base_static_commit"]):
+                await run_command(
+                    "git",
+                    "push",
+                    "--atomic",
+                    "origin",
+                    f"{expected[0]}:refs/heads/main",
+                    f"{expected[1]}:refs/heads/plesk-static",
+                    cwd=worktree,
+                    timeout_seconds=120,
+                )
+                remote = (
+                    await self._remote_ref(worktree, "refs/heads/main"),
+                    await self._remote_ref(worktree, "refs/heads/plesk-static"),
+                )
+        except CommandFailed as exc:
+            await self.pool.execute(
+                """
+                UPDATE publication_jobs SET reconciliation_error=$2,
+                    publish_lease_expires_at=now(), last_reconciled_at=now(), updated_at=now()
+                WHERE id=$1 AND publish_lease_owner=$3 AND status='pushing'
+                """,
+                publication_id,
+                str(exc)[-4000:],
+                lease_owner,
+            )
+            raise RetryableProviderError("atomic push outcome requires reconciliation") from exc
+        if remote != expected:
+            await self.pool.execute(
+                """
+                UPDATE publication_jobs SET status='failed', reconciliation_error=$2,
+                    publish_lease_owner='', publish_lease_expires_at=NULL,
+                    last_reconciled_at=now(), updated_at=now()
+                WHERE id=$1 AND publish_lease_owner=$3
+                """,
+                publication_id,
+                f"remote ref mismatch main={remote[0]} static={remote[1]}",
+                lease_owner,
+            )
+            raise ValidationBlocked("remote main/plesk-static mismatch; manual recovery required")
+        updated = await self.pool.fetchval(
+            """
+            UPDATE publication_jobs SET status='remote_verified', main_commit=$3,
+                static_commit=$4, remote_verified_at=now(), reconciliation_error='',
+                publish_lease_expires_at=now()+make_interval(secs => $5),
+                last_reconciled_at=now(), updated_at=now()
+            WHERE id=$1 AND publish_lease_owner=$2 AND status='pushing'
+            RETURNING id
+            """,
+            publication_id,
+            lease_owner,
+            expected[0],
+            expected[1],
+            self.publish_lease_seconds,
+        )
+        if not updated:
+            raise RetryableProviderError("publication state changed after remote verification")
+        return expected
+
+    async def _advance_publication(
+        self, publication_id: UUID, lease_owner: str
+    ) -> tuple[str, str]:
+        row = await self._load_owned_publication(publication_id, lease_owner)
+        if row["status"] == "confirming":
+            await self._prepare_publication_commits(row, lease_owner)
+            row = await self._load_owned_publication(publication_id, lease_owner)
+        if row["status"] == "pushing":
+            await self._push_or_observe(row, lease_owner)
+            row = await self._load_owned_publication(publication_id, lease_owner)
+        if row["status"] != "remote_verified":
+            raise RetryableProviderError("publication has not reached remote verification")
+        try:
+            await self.cleanup(self.worktree_root / str(publication_id))
+        except CommandFailed as exc:
+            await self.pool.execute(
+                """
+                UPDATE publication_jobs SET publish_lease_expires_at=now(),
+                    reconciliation_error=$2, updated_at=now()
+                WHERE id=$1 AND publish_lease_owner=$3
+                """,
+                publication_id,
+                str(exc)[-4000:],
+                lease_owner,
+            )
+            raise RetryableProviderError("published worktree cleanup must be reconciled") from exc
+        published = await self.pool.fetchrow(
+            """
+            UPDATE publication_jobs SET status='published', publish_lease_owner='',
+                publish_lease_expires_at=NULL, reconciliation_error='', updated_at=now()
+            WHERE id=$1 AND publish_lease_owner=$2 AND status='remote_verified'
+            RETURNING main_commit, static_commit
+            """,
+            publication_id,
+            lease_owner,
+        )
+        if not published:
+            raise RetryableProviderError("publication finalization lost its lease")
+        return published["main_commit"], published["static_commit"]
 
     async def cleanup(self, worktree: Path) -> None:
         if worktree.parent != self.worktree_root:

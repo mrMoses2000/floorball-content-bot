@@ -127,3 +127,30 @@ PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npm exec -- playwright install
 Текущая ожидаемая связка — Chromium `145.0.7632.6`, Playwright revision `1208`. После обновления
 lock-файла повторите установку и реальный smoke. Не подменяйте browser executable системным Chrome:
 иначе воспроизводимость preview теряется.
+
+## Publisher reconciliation
+
+Нормальный путь проходит состояния `preview_ready → confirming → pushing → remote_verified →
+published`. `confirming`, `pushing` или `remote_verified` старше lease автоматически подхватывает
+worker; отдельный durable `publish_reconcile` job сохраняется до сетевого push.
+
+Read-only диагностика строки и refs выполняется до любых ручных действий:
+
+```bash
+cd /home/moses/tg_bot_floorball_site
+.venv/bin/floorball-bot health
+.venv/bin/floorball-bot publish-reconcile --publication PUBLICATION_UUID
+```
+
+Если обе ветки ещё равны сохранённым base refs, reconciler повторит тот же atomic push. Если обе
+уже равны expected refs, он только завершит локальное состояние и уведомление. При смешанных или
+посторонних refs публикация остаётся `failed`, health показывает `ref_mismatch`, а бот запрещает
+deploy. В этом случае не удаляйте worktree и не собирайте новый preview до ручной сверки:
+
+```bash
+git -C /home/moses/floorball.kz ls-remote origin refs/heads/main refs/heads/plesk-static
+```
+
+Не применяйте force-push. Сопоставьте `base_*`, `expected_*`, `main_commit` и `static_commit` из
+`publication_jobs`, затем оформите обычный forward/revert commit или отмените публикацию после
+зафиксированного операторского решения.

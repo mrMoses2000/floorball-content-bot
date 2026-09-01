@@ -168,13 +168,13 @@ revision and supports an invalidate-and-rebuild change loop.
 Release objective: a worker crash during Git/network activity can be reconciled without duplicate
 publication or an ambiguous success message.
 
-- [ ] Replace the long external-operation transaction with states:
+- [x] Replace the long external-operation transaction with states:
       `preview_ready -> confirming -> pushing -> remote_verified -> published`.
-- [ ] Use short transactions and a renewable lease around state ownership.
-- [ ] Add a reconciler that compares expected commit IDs with remote `main` and `plesk-static`.
-- [ ] Keep atomic push of both refs and reject base-commit drift.
-- [ ] Separate content and code/template change manifests and allowlists.
-- [ ] Add crash-before-push, crash-after-push, ref-mismatch and concurrent-confirm tests.
+- [x] Use short transactions and a renewable lease around state ownership.
+- [x] Add a reconciler that compares expected commit IDs with remote `main` and `plesk-static`.
+- [x] Keep atomic push of both refs and reject base-commit drift.
+- [x] Separate content and code/template change manifests and allowlists.
+- [x] Add crash-before-push, crash-after-push, ref-mismatch and concurrent-confirm tests.
 
 ## Phase P6: staging and release
 
@@ -199,7 +199,7 @@ publication or an ambiguous success message.
 - [ ] Contact live delivery is verified.
 - [x] Both desktop/mobile screenshot sets exist for visual changes.
 - [x] Old callbacks fail after revision or base commit changes.
-- [ ] Remote main/static commit IDs are verified before Telegram reports success.
+- [x] Remote main/static commit IDs are verified before Telegram reports success.
 - [ ] Backup/restore drill succeeds.
 
 ## Execution evidence
@@ -351,3 +351,25 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
   compileall and dependency integrity passed. Clean `npm ci` site suite: `37 passed`; ESLint and
   production Vite build passed. The existing npm audit still reports 14 dependency advisories
   and remains separate frontend-maintenance work.
+
+### 2026-09-01 P5: crash-safe Git publisher
+
+- Added migration `016_crash_safe_publisher.sql` and explicit `confirming`, `pushing` and
+  `remote_verified` states. Long Git/network work no longer runs inside a PostgreSQL transaction;
+  short compare-and-set transitions are protected by a five-minute renewable publication lease.
+- Before network mutation, the publisher persists the expected main/static commit IDs, both base
+  remote refs and a durable reconcile job. A worker idle scan also claims expired leases, covering
+  a crash before the reconcile job itself was inserted.
+- Reconciliation treats atomic outcomes deterministically: both old refs permit a retry, both
+  expected refs permit finalization without another push, and any mixed/foreign pair becomes a
+  visible manual-recovery failure. Draft finalization and Telegram success use stable idempotency
+  keys, so a crash after remote verification cannot lose or duplicate the final notification.
+- Content and code/template manifests have separate allowlists. The bot workflow emits only a
+  content manifest with per-file hash/size/deletion state; code/template paths remain a distinct
+  class and cannot enter routine content publication.
+- Added `publish-reconcile --publication UUID`, reconciliation health counters and regression
+  scenarios for crash-before-push, crash-after-push, ref mismatch, lease contention and exact
+  confirmation binding. A real local-bare-Git round trip also verified preview → commit → atomic
+  main/static push → published → idempotent reconcile. The DB boundary independently rechecks an
+  active superadmin role, including for the recovery/CLI path. Focused PostgreSQL/unit suite:
+  `27 passed`; full bot suite: `139 passed`; Ruff, compileall and dependency integrity passed.

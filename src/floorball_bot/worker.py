@@ -19,7 +19,11 @@ from floorball_bot.dialogue.patches import (
     apply_dialogue_patch,
     canonical_context,
 )
-from floorball_bot.errors import PermanentProviderError, RetryableProviderError
+from floorball_bot.errors import (
+    PermanentProviderError,
+    RetryableProviderError,
+    ValidationBlocked,
+)
 from floorball_bot.health import record_heartbeat
 from floorball_bot.media import MediaPipeline
 from floorball_bot.projection.apply import apply_approved_trainer_draft
@@ -65,6 +69,7 @@ class Worker:
         self.lease_seconds = lease_seconds
         self.readiness_interval_seconds = readiness_interval_seconds
         self._last_readiness_scan = 0.0
+        self._last_publication_reconcile = 0.0
         self._last_heartbeat = 0.0
         self.worker_id = f"worker-{uuid4()}"
         self.stop_event = asyncio.Event()
@@ -83,6 +88,15 @@ class Worker:
             )
             if job is None:
                 now = time.monotonic()
+                if (
+                    self.publisher is not None
+                    and now - self._last_publication_reconcile >= 30
+                ):
+                    self._last_publication_reconcile = now
+                    try:
+                        await self._reconcile_one_stale_publication()
+                    except Exception:
+                        logger.exception("publication_reconcile_scan_failed")
                 if now - self._last_readiness_scan >= self.readiness_interval_seconds:
                     self._last_readiness_scan = now
                     try:
@@ -114,6 +128,8 @@ class Worker:
                 await self._publish_preview(job)
             elif job.kind == "publish_confirm":
                 await self._publish_confirm(job)
+            elif job.kind == "publish_reconcile":
+                await self._publish_reconcile(job)
             else:
                 raise PermanentProviderError(f"unsupported job kind: {job.kind}")
             await complete_job(self.pool, job.id)
@@ -276,7 +292,7 @@ class Worker:
                     ),
                 )
 
-    async def _publication_recipients(self, fallback_chat_id: int) -> set[int]:
+    async def _publication_recipients(self, fallback_chat_id: int | None) -> set[int]:
         rows = await self.pool.fetch(
             """
             SELECT DISTINCT u.telegram_id
@@ -288,7 +304,10 @@ class Worker:
               AND u.telegram_id IS NOT NULL
             """
         )
-        return {fallback_chat_id, *(int(row["telegram_id"]) for row in rows)}
+        recipients = {int(row["telegram_id"]) for row in rows}
+        if fallback_chat_id is not None:
+            recipients.add(fallback_chat_id)
+        return recipients
 
     async def _publish_preview(self, job: ClaimedJob) -> None:
         publisher = self._require_publisher()
@@ -492,22 +511,32 @@ class Worker:
                 str(job.payload["nonce"]),
                 actor_id,
                 str(job.payload["manifest_hash"]),
+                chat_id=chat_id,
             )
+        except RetryableProviderError:
+            raise
         except Exception as exc:
             await self.pool.execute(
-                "UPDATE publication_jobs SET status='failed', updated_at=now() WHERE id=$1",
+                """
+                UPDATE publication_jobs SET status='failed', reconciliation_error=$2,
+                    publish_lease_owner='', publish_lease_expires_at=NULL, updated_at=now()
+                WHERE id=$1 AND status NOT IN ('failed','cancelled','published')
+                """,
+                publication_id,
+                f"{type(exc).__name__}: {str(exc)[-3000:]}",
+            )
+            publication_state = await self.pool.fetchrow(
+                "SELECT status,reconciliation_error FROM publication_jobs WHERE id=$1",
                 publication_id,
             )
-            try:
-                await publisher.cleanup(publisher.worktree_root / str(publication_id))
-            except Exception:
-                logger.exception(
-                    "publication_cleanup_failed", extra={"publication_id": str(publication_id)}
-                )
+            manual_recovery = bool(
+                publication_state
+                and "remote ref mismatch" in publication_state["reconciliation_error"]
+            )
             async with transaction(self.pool) as connection:
                 actor = await load_context_actor(connection, actor_id)
                 retry_markup = None
-                if actor is not None and draft_id is not None:
+                if actor is not None and draft_id is not None and not manual_recovery:
                     retry = await create_callback(
                         connection,
                         actor=actor,
@@ -528,7 +557,12 @@ class Worker:
                         "chat_id": chat_id,
                         "text": (
                             "Публикация не завершена. Автоматическое развёртывание не запускайте. "
-                            f"Причина: {type(exc).__name__}. Нужно собрать новый preview."
+                            f"Причина: {type(exc).__name__}. "
+                            + (
+                                "Сначала оператор должен сверить удалённые ветки вручную."
+                                if manual_recovery
+                                else "Нужно собрать новый preview."
+                            )
                         ),
                         "reply_markup": retry_markup,
                     },
@@ -537,15 +571,45 @@ class Worker:
                     ),
                 )
             raise
+        await self._finalize_publication(
+            publication_id,
+            main_commit=main_commit,
+            static_commit=static_commit,
+            fallback_chat_id=chat_id,
+        )
+
+    async def _finalize_publication(
+        self,
+        publication_id: UUID,
+        *,
+        main_commit: str,
+        static_commit: str,
+        fallback_chat_id: int | None,
+    ) -> None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT draft_id, confirmed_by, confirmation_chat_id
+            FROM publication_jobs WHERE id=$1 AND status='published'
+              AND main_commit=$2 AND static_commit=$3
+            """,
+            publication_id,
+            main_commit,
+            static_commit,
+        )
+        if not row or row["confirmed_by"] is None:
+            raise RetryableProviderError("published state is not ready for final notification")
         await self.pool.execute(
             """
             UPDATE drafts SET status='published', updated_by=$2, updated_at=now()
             WHERE id=$1 AND status='approved'
             """,
-            draft_id,
-            actor_id,
+            row["draft_id"],
+            row["confirmed_by"],
         )
-        recipients = await self._publication_recipients(chat_id)
+        confirmed_chat = row["confirmation_chat_id"]
+        recipients = await self._publication_recipients(
+            int(confirmed_chat) if confirmed_chat is not None else fallback_chat_id
+        )
         async with transaction(self.pool) as connection:
             for recipient in recipients:
                 await enqueue_outbox(
@@ -563,6 +627,73 @@ class Worker:
                         "publish-succeeded", publication_id, recipient
                     ),
                 )
+
+    async def _publish_reconcile(self, job: ClaimedJob) -> None:
+        publisher = self._require_publisher()
+        publication_id = UUID(str(job.payload["publication_id"]))
+        terminal = await self.pool.fetchval(
+            "SELECT status FROM publication_jobs WHERE id=$1", publication_id
+        )
+        if terminal in {"failed", "cancelled"}:
+            await self._notify_reconciliation_failure(publication_id)
+            return
+        try:
+            main_commit, static_commit = await publisher.reconcile_publication(publication_id)
+        except ValidationBlocked:
+            await self._notify_reconciliation_failure(publication_id)
+            return
+        await self._finalize_publication(
+            publication_id,
+            main_commit=main_commit,
+            static_commit=static_commit,
+            fallback_chat_id=None,
+        )
+
+    async def _reconcile_one_stale_publication(self) -> None:
+        publisher = self._require_publisher()
+        stale = await publisher.stale_publications(limit=1)
+        if not stale:
+            return
+        publication_id = stale[0]
+        try:
+            main_commit, static_commit = await publisher.reconcile_publication(publication_id)
+        except ValidationBlocked:
+            await self._notify_reconciliation_failure(publication_id)
+            return
+        await self._finalize_publication(
+            publication_id,
+            main_commit=main_commit,
+            static_commit=static_commit,
+            fallback_chat_id=None,
+        )
+
+    async def _notify_reconciliation_failure(self, publication_id: UUID) -> None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT confirmation_chat_id, reconciliation_error
+            FROM publication_jobs WHERE id=$1
+            """,
+            publication_id,
+        )
+        if not row or row["confirmation_chat_id"] is None:
+            return
+        async with transaction(self.pool) as connection:
+            await enqueue_outbox(
+                connection,
+                event_type="telegram_message",
+                payload={
+                    "chat_id": int(row["confirmation_chat_id"]),
+                    "text": (
+                        "Reconciler не подтвердил обе удалённые ветки публикации. "
+                        "Не запускайте развёртывание и не собирайте новый preview, пока оператор "
+                        "не сверит main/plesk-static. "
+                        f"Причина: {row['reconciliation_error'] or 'state mismatch'}."
+                    ),
+                },
+                idempotency_key=stable_idempotency_key(
+                    "publish-reconcile-failed", publication_id
+                ),
+            )
 
     async def _transcribe(self, job: ClaimedJob) -> None:
         path = Path(job.payload["path"])

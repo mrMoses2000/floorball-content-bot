@@ -21,7 +21,8 @@
 | Private data in public JSON | Explicit public schemas/allowlist; consent gates; regression test rejects phones, Telegram IDs, raw paths, notes and consent documents. |
 | Stolen secrets from logs/Git | Secret types, masked logs, env files mode 600, `.env` ignored, secret scan before release. |
 | Queue loss/crash | PostgreSQL transaction, leased claim, attempts/dead-letter, stale-job recovery and outbox. |
-| Double publish/race | DB advisory lock, approved revision hash, preview nonce, base-commit recheck, non-force push. |
+| Double publish/race | Short compare-and-set state transitions, renewable owner lease, approved revision/manifest recheck, base-ref check and atomic non-force push. |
+| Crash around Git push | Expected commit IDs persisted before push; durable reconciler distinguishes both-old, both-expected and mixed refs; idempotent final notification. |
 | Screenshot substitution/stale approval | Persisted per-file SHA-256 and dimensions, revision + manifest binding, one-use actor callback, revalidation immediately before push. |
 | Preview browser data exfiltration | Allocated loopback server, non-loopback request abort, service workers blocked, pinned Playwright Chromium and secret-free subprocess environment. |
 | Compromised content editor | Least-privilege roles/city scopes, immutable revisions and audit log; reviewer + superadmin gates. |

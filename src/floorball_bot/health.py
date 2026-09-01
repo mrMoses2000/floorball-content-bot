@@ -38,6 +38,22 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
     latest_publication = await pool.fetchval(
         "SELECT max(updated_at) FROM publication_jobs WHERE status='published'"
     )
+    publication_reconciliation = await pool.fetchrow(
+        """
+        SELECT
+            count(*) FILTER (
+                WHERE status IN ('confirming','pushing','remote_verified')
+            )::integer AS active,
+            count(*) FILTER (
+                WHERE status IN ('confirming','pushing','remote_verified')
+                  AND updated_at < now()-interval '15 minutes'
+            )::integer AS stuck,
+            count(*) FILTER (
+                WHERE status='failed' AND reconciliation_error LIKE 'remote ref mismatch%'
+            )::integer AS ref_mismatch
+        FROM publication_jobs
+        """
+    )
     backlog = await pool.fetchrow(
         """
         SELECT
@@ -80,6 +96,8 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
             and telegram_fresh
             and worker_fresh
             and backup_fresh
+            and publication_reconciliation["stuck"] == 0
+            and publication_reconciliation["ref_mismatch"] == 0
         ),
         "checked_at": datetime.now(UTC).isoformat(),
         "database": "ok" if db_ok else "failed",
@@ -93,6 +111,7 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
         "latest_backup": latest_backup.isoformat() if latest_backup else None,
         "backup_status": "ok" if backup_fresh else "missing_or_stale",
         "latest_publication": latest_publication.isoformat() if latest_publication else None,
+        "publication_reconciliation": dict(publication_reconciliation),
         "editorial_backlog": {
             "submitted": backlog["submitted"],
             "under_review": backlog["under_review"],
