@@ -64,6 +64,12 @@ to the fixed recipient. Retries preserve the request UUID and deterministic Mess
 bounded attempts, the row stays `dead` and a Telegram-bound superadmin is notified. SMTP remains
 at-least-once across a crash after remote acceptance and before the local `sent` commit.
 
+New-city applications are another isolated flow. `/start new_city` stores a short-lived intent
+before any identity binding. A verified self-contact creates `city_applicant`, not `users`; answers
+never enter editor conversations or agent context. An explicit superadmin decision is followed by
+a dry-run/apply initializer which locks and reserves the slug, creates an inactive city, then grants
+the newly created user only `city_coach` and one city scope.
+
 ## Interfaces
 
 - Configuration: environment only; `.env` is accepted for local development. Canonical secret names are `TG_API_KEY` and the user-provided `ASSEMBLI_AI`; alias `ASSEMBLYAI_API_KEY` is supported.

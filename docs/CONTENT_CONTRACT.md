@@ -11,6 +11,7 @@ Top level: `ok`, `version`, `generatedAt`, `cities`.
 | `cities.slug` | `slug` | lowercase slug, max 80, unique |
 | localized city fields | `nameRu/Kz/En`, `locativeRu/Kz/En`, `descRu/Kz/En`, `historyRu/Kz/En` | RU/KZ source kept in matching field; translations must be reviewer-approved; EN fallback required for new city |
 | city metadata | `region`, `hero`, `geoCoords`, `dataStatus`, `updatedAt` | coordinates optional and never inferred; hero must reference approved derivative |
+| map matching | `regionAliases[]` | reviewer-approved aliases; optional and independent from coordinates |
 | aggregates | `players`, `coaches`, `clubs` | non-negative verified integers or null |
 | approved clubs | `clubs_list` | max 10; contact fields only with public-contact consent |
 | approved schedules | `schedule` | max 20; allowlisted weekday and validated fields |

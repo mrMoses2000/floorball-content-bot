@@ -131,20 +131,20 @@ article route and relevant city page.
 Release objective: `/start new_city` allows an unknown person to submit only their own restricted
 application; a superadmin can verify it and initialize a provisional city.
 
-- [ ] Persist Telegram start intent before contact binding.
-- [ ] Add applicant/application tables separate from normal users and editor roles.
-- [ ] Verify shared contact belongs to the Telegram sender; normalize phone; rate-limit attempts.
-- [ ] Restrict applicants to their own request and expose no city/editor context.
-- [ ] Add `city_proposal.v1` questions grouped as required-to-start, required-for-submit,
+- [x] Persist Telegram start intent before contact binding.
+- [x] Add applicant/application tables separate from normal users and editor roles.
+- [x] Verify shared contact belongs to the Telegram sender; normalize phone; rate-limit attempts.
+- [x] Restrict applicants to their own request and expose no city/editor context.
+- [x] Add `city_proposal.v1` questions grouped as required-to-start, required-for-submit,
       required-for-publish and optional.
-- [ ] Add duplicate-name/slug detection and advisory-lock slug reservation.
-- [ ] Add idempotent `city-initialize --dry-run/--apply`.
-- [ ] Create an inactive city and city content; grant `city_coach` and exactly one city scope only
+- [x] Add duplicate-name/slug detection and advisory-lock slug reservation.
+- [x] Add idempotent `city-initialize --dry-run/--apply`.
+- [x] Create an inactive city and city content; grant `city_coach` and exactly one city scope only
       after explicit superadmin verification.
-- [ ] Refactor map region metadata to be data-driven; coordinates may be absent but then the city
+- [x] Refactor map region metadata to be data-driven; coordinates may be absent but then the city
       must still appear in the directory.
-- [ ] Replace the site CTA with `https://t.me/floorball_site_agent_bot?start=new_city`.
-- [ ] Add applicant isolation, replay, duplicate, rate-limit and full staging E2E tests.
+- [x] Replace the site CTA with `https://t.me/floorball_site_agent_bot?start=new_city`.
+- [x] Add applicant isolation, replay, duplicate, rate-limit and full staging E2E tests.
 
 ## Phase P4: visual preview and revision feedback
 
@@ -316,3 +316,18 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
 - Full bot suite against `floorball_bot_test`: `115 passed`; Ruff, compileall and dependency
   integrity passed.
 - Full site suite: `36 passed`; ESLint, the public news contract and production Vite build passed.
+
+### 2026-09-01 P3: isolated new-city applications
+
+- The `new_city` deep link now persists an expiring start intent before contact binding. The
+  applicant must share their own Telegram contact; contact and answer attempts are bounded.
+- Applicants and applications remain outside `users`, roles, city scopes, conversations and agent
+  context. A submitted applicant can read or change only their own application.
+- Added the versioned `city_proposal.v1` questionnaire, immutable event trail, duplicate detection,
+  explicit superadmin review callbacks and advisory-locked slug reservation.
+- `city-initialize` is dry-run by default. `--apply` works only for an explicitly verified request,
+  creates an inactive city and content, then creates one `city_coach` with exactly one city scope.
+- Map region aliases now come from city data; a city without coordinates still remains in the
+  directory. The public CTA opens `https://t.me/floorball_site_agent_bot?start=new_city`.
+- Full bot suite against `floorball_bot_test`: `122 passed`; Ruff, compileall and dependency
+  integrity passed. Full site suite: `37 passed`; ESLint and production Vite build passed.

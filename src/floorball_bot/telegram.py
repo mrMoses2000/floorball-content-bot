@@ -22,8 +22,19 @@ from floorball_bot.auth import (
     require_roles,
 )
 from floorball_bot.callbacks import consume_callback, create_callback
+from floorball_bot.city_applications import (
+    CityApplicationRejected,
+    application_duplicate_reasons,
+    bind_city_applicant,
+    canonical_city_slug,
+    get_or_create_city_application,
+    load_city_proposal_spec,
+    parse_city_proposal_answer,
+    record_start_intent,
+    verify_city_application,
+)
 from floorball_bot.db import transaction
-from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
+from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository, RequirementLevel
 from floorball_bot.dialogue.evaluator import evaluate_gaps
 from floorball_bot.domain import Actor, DraftStatus, Role
 from floorball_bot.errors import AuthorizationError
@@ -42,6 +53,7 @@ ROLE_COMMANDS: dict[str, tuple[Role, ...]] = {
     "/users": (Role.SUPERADMIN,),
     "/revert": (Role.SUPERADMIN,),
     "/readiness": (Role.SUPERADMIN,),
+    "/city-applications": (Role.SUPERADMIN,),
     "/city": (Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN),
     "/players": (Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN),
     "/gallery": (Role.CITY_COACH, Role.MEDIA_EDITOR, Role.REVIEWER, Role.SUPERADMIN),
@@ -325,6 +337,162 @@ class TelegramIngress:
                             ),
                         )
                     callback_text = "Запрос изменений отправлен автору; прежнее одобрение снято."
+                elif action == "city_application_review":
+                    require_roles(actor, Role.SUPERADMIN)
+                    application = await connection.fetchrow(
+                        """
+                        SELECT a.*, p.telegram_id, p.phone_e164
+                        FROM city_applications a
+                        JOIN city_applicants p ON p.id=a.applicant_id
+                        WHERE a.id=$1 FOR UPDATE OF a
+                        """,
+                        target_id,
+                    )
+                    if not application or application["status"] not in {
+                        "submitted",
+                        "under_review",
+                        "changes_requested",
+                    }:
+                        raise AuthorizationError("city application is no longer reviewable")
+                    if application["status"] == "submitted":
+                        await connection.execute(
+                            """
+                            UPDATE city_applications SET status='under_review', updated_at=now()
+                            WHERE id=$1
+                            """,
+                            target_id,
+                        )
+                        await connection.execute(
+                            """
+                            INSERT INTO city_application_events(application_id, actor_id, action)
+                            VALUES ($1,$2,'review_started')
+                            """,
+                            target_id,
+                            actor.user_id,
+                        )
+                    verify = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="city_application_verify",
+                        target_id=target_id,
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    changes = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="city_application_changes",
+                        target_id=target_id,
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    reject = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="city_application_reject",
+                        target_id=target_id,
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    callback_text = self._city_application_review_summary(application)
+                    callback_markup = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "Проверено", "callback_data": verify.callback_data},
+                                {"text": "Нужны данные", "callback_data": changes.callback_data},
+                            ],
+                            [{"text": "Отклонить", "callback_data": reject.callback_data}],
+                        ]
+                    }
+                elif action == "city_application_verify":
+                    require_roles(actor, Role.SUPERADMIN)
+                    try:
+                        slug = await verify_city_application(
+                            connection, application_id=target_id, actor=actor
+                        )
+                    except CityApplicationRejected as exc:
+                        raise AuthorizationError(str(exc)) from exc
+                    applicant_chat = await connection.fetchval(
+                        """
+                        SELECT p.telegram_id FROM city_applications a
+                        JOIN city_applicants p ON p.id=a.applicant_id WHERE a.id=$1
+                        """,
+                        target_id,
+                    )
+                    if applicant_chat is not None:
+                        await enqueue_outbox(
+                            connection,
+                            event_type="telegram_message",
+                            payload={
+                                "chat_id": applicant_chat,
+                                "text": (
+                                    "Заявка проверена. Город пока не опубликован; superadmin "
+                                    "инициализирует его отдельной безопасной командой."
+                                ),
+                            },
+                            idempotency_key=stable_idempotency_key(
+                                "city-application-verified", target_id
+                            ),
+                        )
+                    callback_text = (
+                        f"Заявка проверена, slug: {slug}. Для dry-run: "
+                        f"floorball-bot city-initialize --application {target_id} "
+                        f"--actor {actor.user_id}"
+                    )
+                elif action in {"city_application_changes", "city_application_reject"}:
+                    require_roles(actor, Role.SUPERADMIN)
+                    target_status = (
+                        "changes_requested"
+                        if action == "city_application_changes"
+                        else "rejected"
+                    )
+                    event_action = (
+                        "changes_requested"
+                        if action == "city_application_changes"
+                        else "rejected"
+                    )
+                    application = await connection.fetchrow(
+                        """
+                        UPDATE city_applications SET status=$2, updated_at=now()
+                        WHERE id=$1 AND status IN ('submitted','under_review','changes_requested')
+                        RETURNING applicant_id
+                        """,
+                        target_id,
+                        target_status,
+                    )
+                    if not application:
+                        raise AuthorizationError("city application is no longer reviewable")
+                    await connection.execute(
+                        """
+                        INSERT INTO city_application_events(application_id, actor_id, action)
+                        VALUES ($1,$2,$3)
+                        """,
+                        target_id,
+                        actor.user_id,
+                        event_action,
+                    )
+                    applicant_chat = await connection.fetchval(
+                        "SELECT telegram_id FROM city_applicants WHERE id=$1",
+                        application["applicant_id"],
+                    )
+                    await enqueue_outbox(
+                        connection,
+                        event_type="telegram_message",
+                        payload={
+                            "chat_id": applicant_chat,
+                            "text": (
+                                "Нужны уточнения. Используйте /resume, дополните заявку и "
+                                "снова отправьте /submit."
+                                if target_status == "changes_requested"
+                                else "Заявка отклонена проверяющим."
+                            ),
+                        },
+                        idempotency_key=stable_idempotency_key(
+                            "city-application-decision", target_id, target_status
+                        ),
+                    )
+                    callback_text = (
+                        "Запрос уточнений отправлен заявителю."
+                        if target_status == "changes_requested"
+                        else "Заявка отклонена."
+                    )
                 elif action == "approve_preview":
                     require_roles(actor, Role.SUPERADMIN)
                     draft = await connection.fetchrow(
@@ -421,6 +589,46 @@ class TelegramIngress:
         sender_id = message.from_user.id
         actor = await get_actor_by_telegram_id(connection, sender_id)
         if message.contact:
+            pending_city_intent = await connection.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM telegram_start_intents
+                    WHERE telegram_id=$1 AND status='pending' AND expires_at>now()
+                )
+                """,
+                sender_id,
+            )
+            if pending_city_intent and actor is None:
+                try:
+                    applicant_id = await bind_city_applicant(
+                        connection,
+                        sender_id=sender_id,
+                        contact_user_id=message.contact.user_id,
+                        raw_phone=message.contact.phone_number,
+                        display_name=" ".join(
+                            part
+                            for part in (
+                                message.contact.first_name,
+                                message.contact.last_name,
+                            )
+                            if part
+                        ),
+                    )
+                    application = await get_or_create_city_application(
+                        connection, applicant_id=applicant_id
+                    )
+                    text = (
+                        "Контакт подтверждён. Заявка отделена от редакторских аккаунтов "
+                        "и видна только вам и проверяющему.\n\n"
+                        + self._city_application_progress(application)
+                    )
+                except (AuthorizationError, ValueError):
+                    text = (
+                        "Не удалось подтвердить контакт. Используйте кнопку и отправьте "
+                        "только собственный номер; доступ ограничен пятью попытками в час."
+                    )
+                await self._reply(connection, update.update_id, message.chat.id, text)
+                return
             try:
                 actor = await bind_self_contact(
                     connection,
@@ -434,6 +642,60 @@ class TelegramIngress:
             await self._reply(connection, update.update_id, message.chat.id, text)
             return
         if message.text and message.text.startswith("/start"):
+            start_parts = message.text.strip().split(maxsplit=1)
+            start_parameter = start_parts[1].strip() if len(start_parts) == 2 else ""
+            if start_parameter == "new_city":
+                await record_start_intent(
+                    connection, telegram_id=sender_id, update_id=update.update_id
+                )
+                if actor and actor.active:
+                    await self._reply(
+                        connection,
+                        update.update_id,
+                        message.chat.id,
+                        "Публичная заявка предназначена для нового заявителя без редакторского "
+                        "аккаунта. Ваш действующий доступ не изменён.",
+                    )
+                    return
+                applicant = await connection.fetchrow(
+                    "SELECT id FROM city_applicants WHERE telegram_id=$1", sender_id
+                )
+                if applicant:
+                    await connection.execute(
+                        """
+                        UPDATE telegram_start_intents
+                        SET status='contact_verified', updated_at=now()
+                        WHERE telegram_id=$1 AND status='pending'
+                        """,
+                        sender_id,
+                    )
+                    application = await get_or_create_city_application(
+                        connection, applicant_id=applicant["id"]
+                    )
+                    await self._reply(
+                        connection,
+                        update.update_id,
+                        message.chat.id,
+                        self._city_application_progress(application),
+                    )
+                    return
+                keyboard = ReplyKeyboardMarkup(
+                    keyboard=[
+                        [KeyboardButton(text="Поделиться своим контактом", request_contact=True)]
+                    ],
+                    resize_keyboard=True,
+                    one_time_keyboard=True,
+                )
+                await self._reply(
+                    connection,
+                    update.update_id,
+                    message.chat.id,
+                    "Заявка на новый город начинается с проверки собственного контакта. "
+                    "Номер не публикуется и не создаёт редакторский аккаунт до решения "
+                    "superadmin.",
+                    reply_markup=keyboard.model_dump(exclude_none=True),
+                )
+                return
             if actor and actor.active:
                 keyboard = self._dialogue_keyboard(actor)
                 await self._reply(
@@ -460,6 +722,15 @@ class TelegramIngress:
                     reply_markup=keyboard.model_dump(exclude_none=True),
                 )
             return
+        if actor is None:
+            applicant = await connection.fetchrow(
+                "SELECT id FROM city_applicants WHERE telegram_id=$1", sender_id
+            )
+            if applicant:
+                await self._handle_city_application(
+                    connection, applicant["id"], update.update_id, message
+                )
+                return
         try:
             actor = require_active(actor)
         except AuthorizationError:
@@ -682,6 +953,286 @@ class TelegramIngress:
                 message.chat.id,
                 "Этот тип сообщения пока нельзя добавить в черновик.",
             )
+
+    @staticmethod
+    def _next_city_application_field(spec, fields: dict, skipped: set[str]):
+        return next(
+            (field for field in spec.fields if field.id not in fields and field.id not in skipped),
+            None,
+        )
+
+    def _city_application_progress(self, application) -> str:
+        loaded = load_city_proposal_spec()
+        fields = dict(application["fields"])
+        skipped = set(application["skipped"])
+        status = application["status"]
+        terminal = {
+            "initialized": "Город и редакторский доступ уже инициализированы.",
+            "verified": "Заявка проверена и ожидает безопасной инициализации города.",
+            "submitted": "Заявка отправлена и ожидает проверки.",
+            "under_review": "Проверка заявки уже началась.",
+            "rejected": "Заявка отклонена проверяющим.",
+        }
+        if status in terminal:
+            return terminal[status]
+        current = self._next_city_application_field(loaded.spec, fields, skipped)
+        if current is None:
+            return f"Заполнено {len(fields)}/{len(loaded.spec.fields)}. Отправьте /submit."
+        optional = current.requirement in {
+            RequirementLevel.REQUIRED_FOR_PUBLISH,
+            RequirementLevel.RECOMMENDED,
+            RequirementLevel.OPTIONAL,
+        }
+        hint = " Можно отправить /skip." if optional else ""
+        return (
+            f"Заполнено {len(fields)}/{len(loaded.spec.fields)}.\n\n"
+            f"{current.question.ru}{hint}\n\n"
+            "Команды: /status, /resume, /submit, /cancel."
+        )
+
+    @staticmethod
+    def _city_application_review_summary(application) -> str:
+        fields = dict(application["fields"])
+        gaps = evaluate_gaps(load_city_proposal_spec().spec, fields)
+        missing = ", ".join(gap.field_id for gap in gaps.required_for_publish) or "нет"
+        return (
+            "Заявка на новый город\n"
+            f"ID: {application['id']}\n"
+            f"Заявитель: {fields.get('applicant_name', '—')} "
+            f"({fields.get('applicant_role', '—')})\n"
+            f"Город: {fields.get('city_name_ru', '—')} / "
+            f"{fields.get('city_name_kz', '—')}\n"
+            f"Регион: {fields.get('region', '—')}\n"
+            f"Статус: {fields.get('current_status', '—')}\n"
+            f"Не хватает для публикации: {missing}\n\n"
+            "Телефон и Telegram ID намеренно не показаны в сводке."
+        )
+
+    async def _handle_city_application(
+        self, connection: asyncpg.Connection, applicant_id, update_id: int, message
+    ) -> None:
+        if not message.text:
+            await self._reply(
+                connection, update_id, message.chat.id,
+                "Заявка на новый город пока принимает только текст.",
+            )
+            return
+        application = await get_or_create_city_application(
+            connection, applicant_id=applicant_id
+        )
+        command = message.text.split()[0].split("@")[0] if message.text.startswith("/") else ""
+        if command == "/status":
+            await self._reply(
+                connection, update_id, message.chat.id,
+                self._city_application_progress(application),
+            )
+            return
+        if command == "/resume":
+            if application["status"] == "under_review":
+                await self._reply(
+                    connection, update_id, message.chat.id,
+                    "Проверка уже началась. Дождитесь решения проверяющего.",
+                )
+                return
+            if application["status"] in {"submitted", "changes_requested"}:
+                application = await connection.fetchrow(
+                    """
+                    UPDATE city_applications SET status='collecting', submitted_at=NULL,
+                        updated_at=now(), revision=revision+1 WHERE id=$1 RETURNING *
+                    """,
+                    application["id"],
+                )
+            await self._reply(
+                connection, update_id, message.chat.id,
+                self._city_application_progress(application),
+            )
+            return
+        if command == "/cancel":
+            if application["status"] not in {"collecting", "changes_requested"}:
+                await self._reply(
+                    connection, update_id, message.chat.id,
+                    "Отправленную или проверенную заявку нельзя отменить этой командой.",
+                )
+                return
+            await connection.execute(
+                "UPDATE city_applications SET status='cancelled', updated_at=now() WHERE id=$1",
+                application["id"],
+            )
+            await connection.execute(
+                """
+                INSERT INTO city_application_events(application_id, applicant_id, action)
+                VALUES ($1,$2,'cancelled')
+                """,
+                application["id"], applicant_id,
+            )
+            await self._reply(connection, update_id, message.chat.id, "Заявка отменена.")
+            return
+        if command == "/submit":
+            await self._submit_city_application(
+                connection, applicant_id, application, update_id, message.chat.id
+            )
+            return
+        if command:
+            await self._reply(
+                connection, update_id, message.chat.id,
+                "Доступны команды /status, /resume, /submit и /cancel.",
+            )
+            return
+        if application["status"] != "collecting":
+            await self._reply(
+                connection, update_id, message.chat.id,
+                self._city_application_progress(application),
+            )
+            return
+        recent_answers = await connection.fetchval(
+            """
+            SELECT count(*) FROM city_application_events
+            WHERE applicant_id=$1 AND action='answer'
+              AND created_at>now()-interval '10 minutes'
+            """,
+            applicant_id,
+        )
+        if recent_answers >= 30:
+            await self._reply(
+                connection, update_id, message.chat.id,
+                "Слишком много ответов за короткое время. Продолжите через 10 минут.",
+            )
+            return
+        loaded = load_city_proposal_spec()
+        fields = dict(application["fields"])
+        skipped = set(application["skipped"])
+        field = self._next_city_application_field(loaded.spec, fields, skipped)
+        if field is None:
+            await self._reply(
+                connection, update_id, message.chat.id,
+                "Все вопросы пройдены. Отправьте /submit.",
+            )
+            return
+        is_skip = message.text.strip().casefold() in {"/skip", "пропустить", "өткізу"}
+        if is_skip:
+            if field.requirement in {
+                RequirementLevel.REQUIRED_TO_START,
+                RequirementLevel.REQUIRED_FOR_SUBMIT,
+            }:
+                await self._reply(
+                    connection, update_id, message.chat.id,
+                    "Этот ответ обязателен для отправки заявки.\n\n"
+                    + self._city_application_progress(application),
+                )
+                return
+            skipped.add(field.id)
+        else:
+            try:
+                fields[field.id] = parse_city_proposal_answer(field, message.text)
+            except CityApplicationRejected as exc:
+                await self._reply(
+                    connection, update_id, message.chat.id,
+                    f"Ответ не принят: {exc}.\n\n{field.question.ru}",
+                )
+                return
+        if field.id == "applicant_name" and field.id in fields:
+            await connection.execute(
+                "UPDATE city_applicants SET display_name=$2, updated_at=now() WHERE id=$1",
+                applicant_id, fields[field.id],
+            )
+        next_field = self._next_city_application_field(loaded.spec, fields, skipped)
+        slug = canonical_city_slug(fields["city_name_ru"]) if fields.get("city_name_ru") else ""
+        application = await connection.fetchrow(
+            """
+            UPDATE city_applications SET fields=$2::jsonb, skipped=$3,
+                current_step=$4, slug_candidate=$5, revision=revision+1, updated_at=now()
+            WHERE id=$1 RETURNING *
+            """,
+            application["id"], fields, sorted(skipped),
+            next_field.id if next_field else "ready_to_submit", slug,
+        )
+        await connection.execute(
+            """
+            INSERT INTO city_application_events(
+                application_id, applicant_id, action, metadata
+            ) VALUES ($1,$2,'answer',$3::jsonb)
+            """,
+            application["id"], applicant_id,
+            {"field_id": field.id, "skipped": is_skip},
+        )
+        await self._reply(
+            connection, update_id, message.chat.id,
+            self._city_application_progress(application),
+        )
+
+    async def _submit_city_application(
+        self, connection, applicant_id, application, update_id: int, chat_id: int
+    ) -> None:
+        if application["status"] != "collecting":
+            await self._reply(
+                connection, update_id, chat_id,
+                self._city_application_progress(application),
+            )
+            return
+        loaded = load_city_proposal_spec()
+        fields = dict(application["fields"])
+        gaps = evaluate_gaps(loaded.spec, fields)
+        if not gaps.can_submit:
+            missing = ", ".join(
+                gap.field_id for gap in (*gaps.required_to_start, *gaps.required_for_submit)
+            )
+            await self._reply(
+                connection, update_id, chat_id,
+                f"Для отправки не хватает: {missing}.\n\n"
+                + self._city_application_progress(application),
+            )
+            return
+        slug = canonical_city_slug(fields["city_name_ru"])
+        duplicates = await application_duplicate_reasons(
+            connection, application_id=application["id"],
+            name_ru=fields["city_name_ru"], name_kz=fields["city_name_kz"], slug=slug,
+        )
+        if duplicates:
+            await self._reply(
+                connection, update_id, chat_id,
+                "Похожий город или заявка уже существует: " + "; ".join(duplicates),
+            )
+            return
+        await connection.execute(
+            """
+            UPDATE city_applications SET status='submitted', slug_candidate=$2,
+                submitted_at=now(), updated_at=now() WHERE id=$1
+            """,
+            application["id"], slug,
+        )
+        await connection.execute(
+            """
+            INSERT INTO city_application_events(application_id, applicant_id, action)
+            VALUES ($1,$2,'submitted')
+            """,
+            application["id"], applicant_id,
+        )
+        recipients = await connection.fetch(
+            """
+            SELECT DISTINCT u.telegram_id FROM users u
+            JOIN user_roles ur ON ur.user_id=u.id
+            WHERE ur.role_name='superadmin' AND ur.revoked_at IS NULL
+              AND u.active=TRUE AND u.telegram_id IS NOT NULL
+            """
+        )
+        for recipient in recipients:
+            await enqueue_outbox(
+                connection, event_type="telegram_message",
+                    payload={
+                        "chat_id": recipient["telegram_id"],
+                        "text": (
+                            f"Новая заявка на город {fields['city_name_ru']}. "
+                            "Откройте /city-applications."
+                        ),
+                },
+                idempotency_key=stable_idempotency_key(
+                    "city-application-submitted", application["id"], recipient["telegram_id"]
+                ),
+            )
+        await self._reply(
+            connection, update_id, chat_id,
+            "Заявка отправлена superadmin. Город и права не создаются автоматически.",
+        )
 
     async def _handle_coach_form(
         self,
@@ -1253,7 +1804,7 @@ class TelegramIngress:
             response = (
                 "Команды: /status /resume /cancel /profile /city /players /gallery "
                 "/submit /history. Проверяющим: /review. Администратору: "
-                "/readiness /publish /users /revert."
+                "/city-applications /readiness /publish /users /revert."
             )
         elif command == "/readiness":
             await enqueue_job(
@@ -1267,6 +1818,44 @@ class TelegramIngress:
             response = (
                 f"Команда {command} принята. Текущий workflow будет загружен из сохранённой сессии."
             )
+        elif command == "/city-applications":
+            rows = await connection.fetch(
+                """
+                SELECT a.*, p.display_name
+                FROM city_applications a
+                JOIN city_applicants p ON p.id=a.applicant_id
+                WHERE a.status IN ('submitted','under_review','changes_requested')
+                ORDER BY a.submitted_at NULLS LAST, a.created_at LIMIT 10
+                """
+            )
+            if not rows:
+                response = "Новых заявок на города нет."
+            else:
+                lines = ["Заявки на новые города:"]
+                keyboard = []
+                for row in rows:
+                    fields = dict(row["fields"])
+                    label = fields.get("city_name_ru") or "город без названия"
+                    lines.append(f"• {label} · {row['status']} · {str(row['id'])[:8]}")
+                    callback = await create_callback(
+                        connection,
+                        actor=actor,
+                        action="city_application_review",
+                        target_id=row["id"],
+                        ttl_seconds=7 * 24 * 60 * 60,
+                    )
+                    keyboard.append([{
+                        "text": f"Проверить: {label[:48]}",
+                        "callback_data": callback.callback_data,
+                    }])
+                await self._reply(
+                    connection,
+                    update_id,
+                    chat_id,
+                    "\n".join(lines),
+                    reply_markup={"inline_keyboard": keyboard},
+                )
+                return
         elif command == "/review":
             rows = await connection.fetch(
                 """

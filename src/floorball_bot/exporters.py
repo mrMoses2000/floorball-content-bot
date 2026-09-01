@@ -250,6 +250,7 @@ async def project_city_payload(
                 "locativeKz": row["locative_kz"],
                 "locativeEn": row["locative_en"],
                 "region": row["region"],
+                "regionAliases": list(row["region_aliases"]),
                 "hero": row["hero_url"],
                 "geoCoords": (
                     [row["longitude"], row["latitude"]]

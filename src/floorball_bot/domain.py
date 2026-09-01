@@ -198,6 +198,7 @@ class PublicCity(BaseModel):
     locativeKz: str = Field(default="", max_length=120)
     locativeEn: str = Field(default="", max_length=120)
     region: str = Field(default="", max_length=180)
+    regionAliases: list[str] = Field(default_factory=list, max_length=30)
     hero: str = Field(default="/assets/heroes/clubs.png", max_length=1000)
     geoCoords: tuple[float, float] | None = None
     players: int | None = Field(default=None, ge=0, le=1_000_000)

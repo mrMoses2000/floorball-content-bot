@@ -12,6 +12,7 @@ from uuid import UUID
 from aiogram import Bot
 from aiohttp import web
 
+from floorball_bot.city_applications import initialize_city_application
 from floorball_bot.config import get_settings
 from floorball_bot.contact_api import create_contact_app
 from floorball_bot.context_gateway import (
@@ -113,6 +114,10 @@ def parser() -> argparse.ArgumentParser:
     scope = commands.add_parser("scope-city")
     scope.add_argument("--user", required=True, type=UUID)
     scope.add_argument("--city", required=True, type=UUID)
+    city_initialize = commands.add_parser("city-initialize")
+    city_initialize.add_argument("--application", required=True, type=UUID)
+    city_initialize.add_argument("--actor", required=True, type=UUID)
+    city_initialize.add_argument("--apply", action="store_true")
     project_trainer = commands.add_parser("project-trainer")
     project_trainer.add_argument("--draft", required=True, type=UUID)
     project_trainer.add_argument("--actor", required=True, type=UUID)
@@ -304,6 +309,18 @@ async def async_main(args: argparse.Namespace) -> None:
                 args.city,
             )
             print("ok")
+        elif args.command == "city-initialize":
+            async with pool.acquire() as connection:
+                actor = await load_context_actor(connection, args.actor)
+            if actor is None or not actor.active:
+                raise RuntimeError("city-initialize requires an active superadmin")
+            result = await initialize_city_application(
+                pool,
+                application_id=args.application,
+                actor=actor,
+                apply=args.apply,
+            )
+            print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
         elif args.command == "project-trainer":
             async with pool.acquire() as connection:
                 actor = await load_context_actor(connection, args.actor)

@@ -53,6 +53,10 @@ cp .env.example .env
 .venv/bin/floorball-bot scope-city --user UUID --city CITY_UUID
 ```
 
+Публичная заявка на новый город начинается по deep link
+`https://t.me/floorball_site_agent_bot?start=new_city`. После проверки superadmin команда
+`city-initialize` сначала выполняется без `--apply` и показывает безопасный dry-run.
+
 Текущие bundles импортируются сначала dry-run, затем явным `--apply`:
 
 ```bash

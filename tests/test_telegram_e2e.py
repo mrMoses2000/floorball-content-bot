@@ -57,6 +57,87 @@ def callback_update(update_id: int, sender_id: int, data: str) -> Update:
     )
 
 
+def contact_update(
+    update_id: int, sender_id: int, *, contact_user_id: int, phone: str
+) -> Update:
+    return Update(
+        update_id=update_id,
+        message=Message(
+            message_id=update_id,
+            date=datetime.now(UTC),
+            chat=Chat(id=sender_id, type="private"),
+            from_user=User(id=sender_id, is_bot=False, first_name="Applicant"),
+            contact=Contact(
+                phone_number=phone,
+                first_name="Applicant",
+                user_id=contact_user_id,
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_city_deep_link_keeps_applicant_isolated_until_superadmin_initialization(pg_pool):
+    sender_id = uuid4().int % 1_000_000_000
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    assert await ingress.accept(message_update(8_000, sender_id, "/start new_city"))
+    assert await pg_pool.fetchval(
+        "SELECT count(*) FROM telegram_start_intents WHERE telegram_id=$1 AND status='pending'",
+        sender_id,
+    ) == 1
+    assert await pg_pool.fetchval("SELECT count(*) FROM users") == 0
+
+    assert await ingress.accept(
+        contact_update(
+            8_001,
+            sender_id,
+            contact_user_id=sender_id,
+            phone="+77012345678",
+        )
+    )
+    answers = [
+        "Новый тренер",
+        "тренер",
+        "Конаев",
+        "Қонаев",
+        "Алматинская область",
+        "Есть инициативная группа",
+        "Начинаем регулярные тренировки.",
+        "да",
+        "да",
+        "Тұрақты жаттығуларды бастаймыз.",
+        "Инициативная группа создана в 2026 году.",
+        "Бастамашыл топ 2026 жылы құрылды.",
+        "https://floorball.kz/contacts",
+        "/skip",
+        "/skip",
+        "/skip",
+    ]
+    for offset, answer in enumerate(answers, start=2):
+        assert await ingress.accept(message_update(8_000 + offset, sender_id, answer))
+    assert await ingress.accept(message_update(8_100, sender_id, "/submit"))
+
+    application = await pg_pool.fetchrow(
+        """
+        SELECT a.status, a.slug_candidate, p.telegram_id
+        FROM city_applications a JOIN city_applicants p ON p.id=a.applicant_id
+        WHERE p.telegram_id=$1
+        """,
+        sender_id,
+    )
+    assert application["status"] == "submitted"
+    assert application["slug_candidate"] == "konaev"
+    assert await pg_pool.fetchval("SELECT count(*) FROM users") == 0
+    assert await pg_pool.fetchval("SELECT count(*) FROM agent_context_snapshots") == 0
+
+    assert await ingress.accept(message_update(8_101, sender_id, "/profile"))
+    last_reply = await pg_pool.fetchval(
+        "SELECT payload->>'text' FROM outbox_events ORDER BY created_at DESC LIMIT 1"
+    )
+    assert "Доступны команды" in last_reply
+
+
 async def _seed_submitted_trainer_draft(pg_pool, *, reviewer_telegram_id: int):
     coach_telegram_id = uuid4().int % 1_000_000_000
     coach_id = await pg_pool.fetchval(
