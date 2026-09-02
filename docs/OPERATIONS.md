@@ -116,17 +116,16 @@ Publisher запускает только собранный Vite preview на �
 Файлы хранятся в `<worktree-root>/_artifacts/<publication-id>` семь дней; очистка не удаляет пути
 вне этого корня.
 
-Версия `@playwright/test` зафиксирована lock-файлом сайта. На Ubuntu 26.04 Playwright 1.58.2 ещё
-не распознаёт платформу официально, поэтому один раз установите его frozen Ubuntu 24.04 build:
+Версия `@playwright/test` зафиксирована lock-файлом сайта. После каждой смены lock-файла
+установите Chromium, соответствующий именно этой версии:
 
 ```bash
 cd /home/moses/floorball.kz/app
-PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npm exec -- playwright install chromium
+npm exec -- playwright install chromium
 ```
 
-Текущая ожидаемая связка — Chromium `145.0.7632.6`, Playwright revision `1208`. После обновления
-lock-файла повторите установку и реальный smoke. Не подменяйте browser executable системным Chrome:
-иначе воспроизводимость preview теряется.
+Текущая ожидаемая связка — `@playwright/test 1.62.1`, Chromium `151.0.7922.34`, revision `1234`.
+Не подменяйте browser executable системным Chrome: иначе воспроизводимость preview теряется.
 
 ## Publisher reconciliation
 

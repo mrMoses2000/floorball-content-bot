@@ -406,3 +406,16 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
   before any derivative is removed.
 - Focused PostgreSQL suite: `4 passed`; full backend suite: `144 passed`; Ruff, compileall and
   dependency integrity passed.
+
+### 2026-09-02 frontend dependency maintenance
+
+- Updated the site toolchain to Vite `8.2.2`, React Router `7.18.3`, ESLint `10.9.1`, Vitest
+  `4.1.11`, Playwright `1.62.1` and compatible supporting packages. The lockfile now resolves
+  without known audit findings (`15` before, `0` after).
+- Converted the Vite chunk policy from the Rollup object form to the Rolldown-compatible function
+  form and replaced config `__dirname` with `import.meta.dirname`.
+- A clean `npm ci` passed `37` tests, ESLint, production build and `npm audit --audit-level=low`.
+  Real Chromium `151.0.7922.34` smoke loaded the homepage and map with no console/page errors.
+- The rebuilt site is committed locally as `373ec32`; push/deployment remains an explicit owner
+  action because that repository uses a different remote account. The backend staging gate now
+  rejects future high-severity npm audit regressions.

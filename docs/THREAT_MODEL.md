@@ -36,8 +36,9 @@ Phones, Telegram identifiers, raw messages/transcripts, voice, original media pa
 
 ## Residual risks before production
 
-- The machine currently has no PostgreSQL installation and no verified off-device backup target.
+- PostgreSQL работает локально, но подтверждённого off-device backup target пока нет.
 - Legal consent text and retention/deletion periods require federation/legal approval.
 - Real RU/KZ AssemblyAI accuracy and billing require explicit external smoke samples.
-- GitHub deploy key and actual push require a separate approved production action.
-- Existing site dependency advisories and lock-file drift require a separate frontend maintenance change.
+- Для production publisher всё ещё нужна отдельная least-privilege deploy key/branch policy.
+- Site lock-file на 2026-09-02 воспроизводим через `npm ci`, а `npm audit` возвращает 0; staging
+  gate должен продолжать проверять high-severity regression.

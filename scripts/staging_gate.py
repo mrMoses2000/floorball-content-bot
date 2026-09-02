@@ -74,6 +74,7 @@ def main() -> None:
     run(["npm", "test", "--", "--run"], cwd=SITE_APP, env=environment)
     run(["npm", "run", "lint"], cwd=SITE_APP, env=environment)
     run(["npm", "run", "build"], cwd=SITE_APP, env=environment)
+    run(["npm", "audit", "--audit-level=high"], cwd=SITE_APP, env=environment)
     print(
         json.dumps(
             {
