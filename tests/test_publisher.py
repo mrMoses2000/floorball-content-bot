@@ -207,10 +207,17 @@ def test_content_and_code_template_change_manifests_use_separate_allowlists(tmp_
     content.write_text("{}\n")
     generated.write_text("<html></html>\n")
     component.write_text("export default null\n")
+    news_asset = tmp_path / f"app/public/assets/news/event/{'a' * 64}.webp"
+    news_asset.parent.mkdir(parents=True)
+    news_asset.write_bytes(b"safe-webp")
 
     content_manifest = build_change_manifest(
         tmp_path,
-        {"app/src/data/generated/city-content.json", "app/dist/index.html"},
+        {
+            "app/src/data/generated/city-content.json",
+            f"app/public/assets/news/event/{'a' * 64}.webp",
+            "app/dist/index.html",
+        },
         change_class="content",
     )
     assert content_manifest["class"] == "content"
@@ -224,6 +231,47 @@ def test_content_and_code_template_change_manifests_use_separate_allowlists(tmp_
         change_class="code_template",
     )
     assert code_manifest["class"] == "code_template"
+
+
+class GalleryPool:
+    def __init__(self, sha256: str, derivative: Path):
+        self.sha256 = sha256
+        self.derivative = derivative
+
+    async def fetch(self, *_args):
+        return [{"sha256": self.sha256, "derivative_path": str(self.derivative)}]
+
+
+@pytest.mark.asyncio
+async def test_news_gallery_materialization_copies_only_managed_approved_derivative(tmp_path):
+    sha256 = "b" * 64
+    media_root = tmp_path / "media"
+    derivative = media_root / "derived" / "bb" / f"{sha256}.webp"
+    derivative.parent.mkdir(parents=True)
+    derivative.write_bytes(b"derived-webp")
+    repository = tmp_path / "repository"
+    worktree = tmp_path / "worktree"
+    worktrees = tmp_path / "worktrees"
+    repository.mkdir()
+    worktree.mkdir()
+    worktrees.mkdir()
+    publisher = GitPublisher(
+        GalleryPool(sha256, derivative),
+        repository,
+        worktrees,
+        media_root=media_root,
+    )
+    payload = {
+        "items": [{
+            "slug": "event",
+            "gallery": [{"src": f"/assets/news/event/{sha256}.webp"}],
+        }]
+    }
+
+    await publisher._materialize_news_assets(worktree, payload)
+
+    target = worktree / f"app/public/assets/news/event/{sha256}.webp"
+    assert target.read_bytes() == b"derived-webp"
 
 
 @pytest.mark.asyncio

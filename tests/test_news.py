@@ -71,3 +71,33 @@ def test_news_public_contract_keeps_body_as_typed_text_not_html():
     encoded = deterministic_json(payload)
     assert "<script>" in encoded
     assert "bodyRu" in encoded
+
+
+def test_news_public_contract_accepts_manifest_bound_gallery():
+    sha256 = "a" * 64
+    payload = build_news_payload(
+        [{
+            "slug": "tournament-gallery",
+            "scope": "national",
+            "citySlug": "",
+            "publishedAt": "2026-09-02T10:00:00Z",
+            "titleRu": "Турнир",
+            "titleKz": "Турнир",
+            "excerptRu": "Фотографии турнира.",
+            "excerptKz": "Турнир фотосуреттері.",
+            "bodyRu": [{"type": "paragraph", "text": "Итоги."}],
+            "bodyKz": [{"type": "paragraph", "text": "Нәтижелер."}],
+            "sources": [],
+            "gallery": [{
+                "src": f"/assets/news/tournament-gallery/{sha256}.webp",
+                "width": 1600,
+                "height": 1067,
+                "altRu": "Участники турнира",
+                "altKz": "Турнир қатысушылары",
+            }],
+        }],
+        generated_at=datetime(2026, 9, 2, tzinfo=UTC),
+    )
+
+    assert payload.items[0].gallery[0].src.endswith(f"{sha256}.webp")
+    assert payload.items[0].gallery[0].altKz == "Турнир қатысушылары"

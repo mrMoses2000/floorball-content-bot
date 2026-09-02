@@ -367,6 +367,40 @@ async def project_news_payload(
         """,
         generated_at,
     )
+    gallery_rows = await connection.fetch(
+        """
+        SELECT n.id AS news_id, n.slug, nmi.media_id, nmi.alt_ru, nmi.alt_kz,
+               nmi.alt_en, nmi.sort_order, ma.sha256, ma.width, ma.height
+        FROM news_items n
+        JOIN news_media_items nmi ON nmi.news_id=n.id
+        JOIN media_assets ma ON ma.id=nmi.media_id
+        JOIN LATERAL (
+            SELECT c.status
+            FROM consents c
+            WHERE c.subject_type='media' AND c.subject_id=ma.id
+              AND c.scope='media_publication'
+            ORDER BY c.updated_at DESC, c.created_at DESC, c.id DESC
+            LIMIT 1
+        ) latest_consent ON latest_consent.status='granted'
+        WHERE n.status='approved' AND n.deleted_at IS NULL
+          AND nmi.selected_for_publication=TRUE
+          AND ma.deleted_at IS NULL AND ma.derivative_path IS NOT NULL
+          AND ma.moderation_status='approved'
+        ORDER BY n.id, nmi.sort_order, nmi.media_id
+        """
+    )
+    galleries: dict[Any, list[dict[str, Any]]] = {}
+    for gallery in gallery_rows:
+        galleries.setdefault(gallery["news_id"], []).append(
+            {
+                "src": f"/assets/news/{gallery['slug']}/{gallery['sha256']}.webp",
+                "width": gallery["width"],
+                "height": gallery["height"],
+                "altRu": gallery["alt_ru"],
+                "altKz": gallery["alt_kz"],
+                "altEn": gallery["alt_en"],
+            }
+        )
     return build_news_payload(
         [
             {
@@ -384,6 +418,7 @@ async def project_news_payload(
                 "bodyKz": list(row["body_kz"]),
                 "bodyEn": list(row["body_en"]),
                 "sources": list(row["sources"]),
+                "gallery": galleries.get(row["id"], []),
                 "image": row["image_url"] if row["media_rights_confirmed"] else "",
                 "imageAltRu": row["image_alt_ru"] if row["media_rights_confirmed"] else "",
                 "imageAltKz": row["image_alt_kz"] if row["media_rights_confirmed"] else "",

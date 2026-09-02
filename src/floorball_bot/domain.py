@@ -387,6 +387,21 @@ class PublicNewsSource(BaseModel):
         return _validate_public_url(value)
 
 
+class PublicNewsGalleryItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    src: str = Field(max_length=240)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    altRu: str = Field(min_length=1, max_length=300)
+    altKz: str = Field(min_length=1, max_length=300)
+    altEn: str = Field(default="", max_length=300)
+
+    @field_validator("src")
+    @classmethod
+    def validate_src(cls, value: str) -> str:
+        return _validate_public_url(value, allow_local=True)
+
+
 class PublicNewsItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
     slug: str = Field(max_length=120, pattern=r"^[a-z0-9-]+$")
@@ -403,6 +418,7 @@ class PublicNewsItem(BaseModel):
     bodyKz: list[PublicNewsBlock] = Field(min_length=1, max_length=30)
     bodyEn: list[PublicNewsBlock] = Field(default_factory=list, max_length=30)
     sources: list[PublicNewsSource] = Field(default_factory=list, max_length=10)
+    gallery: list[PublicNewsGalleryItem] = Field(default_factory=list, max_length=10)
     image: str = Field(default="", max_length=1000)
     imageAltRu: str = Field(default="", max_length=300)
     imageAltKz: str = Field(default="", max_length=300)

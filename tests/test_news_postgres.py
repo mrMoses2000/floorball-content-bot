@@ -144,3 +144,121 @@ async def test_approved_city_news_applies_idempotently_and_exports_public_only(p
     public = payload.model_dump(mode="json")
     assert "created_by" not in str(public)
     assert public["items"][0]["bodyRu"][0]["type"] == "paragraph"
+
+
+@pytest.mark.asyncio
+async def test_approved_news_binds_consented_telegram_gallery_to_public_contract(pg_pool):
+    creator_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164,display_name)
+        VALUES ($1,'News author') RETURNING id
+        """,
+        f"+77{uuid4().int % 10**9:09d}",
+    )
+    reviewer_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164,display_name)
+        VALUES ($1,'News reviewer') RETURNING id
+        """,
+        f"+77{uuid4().int % 10**9:09d}",
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id,role_name) VALUES ($1,'federation_editor'),($2,'reviewer')",
+        creator_id,
+        reviewer_id,
+    )
+    loaded = DialogueSpecRepository().load("news")
+    context_hash = "b" * 64
+    session_id = await pg_pool.fetchval(
+        """
+        INSERT INTO conversation_sessions(
+            user_id,workflow,status,definition_version,definition_hash,context_hash
+        ) VALUES ($1,'news','completed',$2,$3,$4) RETURNING id
+        """,
+        creator_id,
+        loaded.spec.version,
+        loaded.sha256,
+        context_hash,
+    )
+    sha256 = "c" * 64
+    media_id = await pg_pool.fetchval(
+        """
+        INSERT INTO media_assets(
+            sha256,original_filename,detected_mime,byte_size,width,height,
+            uploader_id,original_path,derivative_path,moderation_status
+        ) VALUES ($1,'tournament.jpg','image/jpeg',100,1600,1067,$2,$3,$4,'approved')
+        RETURNING id
+        """,
+        sha256,
+        creator_id,
+        "/private/original",
+        f"/managed/derived/{sha256}.webp",
+    )
+    await pg_pool.execute(
+        """
+        INSERT INTO news_session_media(session_id,media_id,telegram_message_id,caption)
+        VALUES ($1,$2,42,'Финал турнира')
+        """,
+        session_id,
+        media_id,
+    )
+    await pg_pool.execute(
+        """
+        INSERT INTO consents(
+            subject_type,subject_id,scope,status,legal_text_version,granted_by,valid_from
+        ) VALUES ('media',$1,'media_publication','granted','news-media-rights-v1',$2,now())
+        """,
+        media_id,
+        creator_id,
+    )
+    fields = complete_fields()
+    content = {
+        "dialogue_mode": "news",
+        "definition_version": loaded.spec.version,
+        "definition_hash": loaded.sha256,
+        "context_hash": context_hash,
+        "fields": fields,
+        "media_manifest": [{
+            "mediaId": str(media_id),
+            "sha256": sha256,
+            "width": 1600,
+            "height": 1067,
+            "caption": "Финал турнира",
+        }],
+    }
+    draft_id = await pg_pool.fetchval(
+        """
+        INSERT INTO drafts(
+            session_id,entity_type,status,current_revision,approved_revision,created_by,updated_by
+        ) VALUES ($1,'news','approved',1,1,$2,$3) RETURNING id
+        """,
+        session_id,
+        creator_id,
+        reviewer_id,
+    )
+    await pg_pool.execute(
+        """
+        INSERT INTO draft_revisions(draft_id,revision,content,content_hash,created_by)
+        VALUES ($1,1,$2::jsonb,$3,$4)
+        """,
+        draft_id,
+        content,
+        canonical_hash(content),
+        creator_id,
+    )
+    actor = Actor(
+        user_id=reviewer_id,
+        telegram_id=1,
+        roles=frozenset({Role.REVIEWER}),
+        city_scopes=frozenset(),
+    )
+
+    await apply_approved_news_draft(pg_pool, draft_id=draft_id, actor=actor)
+    payload = await project_news_payload(
+        pg_pool, generated_at=datetime(2026, 9, 2, tzinfo=UTC)
+    )
+
+    gallery = payload.items[0].gallery
+    assert len(gallery) == 1
+    assert gallery[0].src == f"/assets/news/kazakhstan-cup-2026/{sha256}.webp"
+    assert gallery[0].altRu == "Кубок Казахстана"

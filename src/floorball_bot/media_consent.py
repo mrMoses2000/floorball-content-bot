@@ -93,6 +93,13 @@ async def reconcile_withdrawn_media(
             )
             await connection.execute(
                 """
+                UPDATE news_media_items SET selected_for_publication=FALSE
+                WHERE media_id=$1 AND selected_for_publication=TRUE
+                """,
+                row["id"],
+            )
+            await connection.execute(
+                """
                 INSERT INTO audit_log(action, entity_type, entity_id, metadata)
                 VALUES ('media_derivative_withdrawn','media',$1,$2::jsonb)
                 """,

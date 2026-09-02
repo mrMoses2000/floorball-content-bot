@@ -907,13 +907,14 @@ class Worker:
             self.media_pipeline.process_image, Path(job.payload["path"]), uploader_id
         )
         async with transaction(self.pool) as connection:
-            await connection.execute(
+            media_id = await connection.fetchval(
                 """
                 INSERT INTO media_assets(
                     sha256, original_filename, detected_mime, byte_size, width, height,
                     uploader_id, original_path, derivative_path, moderation_status
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
-                ON CONFLICT (sha256) DO NOTHING
+                ON CONFLICT (sha256) DO UPDATE SET updated_at=media_assets.updated_at
+                RETURNING id
                 """,
                 result.sha256,
                 str(job.payload.get("filename") or "telegram-image")[:255],
@@ -925,12 +926,82 @@ class Worker:
                 str(result.original_path),
                 str(result.derivative_path),
             )
+            message_id = job.payload.get("message_id")
+            if message_id:
+                await connection.execute(
+                    "UPDATE messages SET media_id=$2 WHERE id=$1",
+                    UUID(str(message_id)),
+                    media_id,
+                )
+            news_photo_count = 0
+            session_id = job.payload.get("session_id")
+            if session_id and job.payload.get("session_workflow") == "news":
+                news_session_id = UUID(str(session_id))
+                session = await connection.fetchrow(
+                    """
+                    SELECT id FROM conversation_sessions
+                    WHERE id=$1 AND user_id=$2 AND workflow='news' AND status='active'
+                    FOR UPDATE
+                    """,
+                    news_session_id,
+                    uploader_id,
+                )
+                if not session:
+                    raise ValidationBlocked("news media session is no longer active")
+                existing = await connection.fetchval(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM news_session_media
+                        WHERE session_id=$1 AND media_id=$2
+                    )
+                    """,
+                    news_session_id,
+                    media_id,
+                )
+                news_photo_count = await connection.fetchval(
+                    "SELECT count(*) FROM news_session_media WHERE session_id=$1",
+                    news_session_id,
+                )
+                if not existing and news_photo_count >= 10:
+                    raise ValidationBlocked("a news gallery is limited to ten photos")
+                await connection.execute(
+                    """
+                    INSERT INTO news_session_media(
+                        session_id, media_id, message_id, telegram_message_id,
+                        telegram_media_group_id, caption
+                    ) VALUES ($1,$2,$3,$4,$5,$6)
+                    ON CONFLICT (session_id, media_id) DO UPDATE SET
+                        message_id=COALESCE(news_session_media.message_id, EXCLUDED.message_id),
+                        telegram_message_id=LEAST(
+                            news_session_media.telegram_message_id,
+                            EXCLUDED.telegram_message_id
+                        ),
+                        caption=CASE WHEN news_session_media.caption=''
+                            THEN EXCLUDED.caption ELSE news_session_media.caption END
+                    """,
+                    news_session_id,
+                    media_id,
+                    UUID(str(message_id)) if message_id else None,
+                    int(job.payload["telegram_message_id"]),
+                    str(job.payload.get("telegram_media_group_id") or "")[:128],
+                    str(job.payload.get("caption") or "")[:600],
+                )
+                news_photo_count = await connection.fetchval(
+                    "SELECT count(*) FROM news_session_media WHERE session_id=$1",
+                    news_session_id,
+                )
             await enqueue_outbox(
                 connection,
                 event_type="telegram_message",
                 payload={
                     "chat_id": int(job.payload["chat_id"]),
-                    "text": "Фото обработано без EXIF и ожидает consent/moderation approval.",
+                    "text": (
+                        f"Фото обработано без EXIF и добавлено в галерею новости "
+                        f"({news_photo_count}/10). Когда закончите загрузку, отправьте "
+                        "/photos-ready."
+                        if news_photo_count
+                        else "Фото обработано без EXIF и ожидает consent/moderation approval."
+                    ),
                 },
                 idempotency_key=stable_idempotency_key("media-result", job.id),
             )

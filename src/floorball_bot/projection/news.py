@@ -92,6 +92,15 @@ class NewsDraftInput(BaseModel):
         return self
 
 
+class NewsGalleryManifestItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    mediaId: UUID
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    caption: str = Field(default="", max_length=600)
+
+
 class NewsApplicationResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     application_id: UUID
@@ -115,7 +124,7 @@ async def apply_approved_news_draft(
             """
             SELECT d.status, d.current_revision, d.approved_revision, d.created_by,
                    r.content, r.content_hash, s.workflow, s.definition_version,
-                   s.definition_hash, s.context_hash
+                   s.definition_hash, s.context_hash, s.id AS session_id
             FROM drafts d
             JOIN draft_revisions r
               ON r.draft_id=d.id AND r.revision=d.approved_revision
@@ -150,6 +159,12 @@ async def apply_approved_news_draft(
         if not evaluate_gaps(loaded.spec, fields).can_publish:
             raise NewsProjectionRejected("news draft is incomplete for publication")
         draft = NewsDraftInput.model_validate(fields)
+        gallery_manifest = [
+            NewsGalleryManifestItem.model_validate(item)
+            for item in content.get("media_manifest", [])
+        ]
+        if len(gallery_manifest) > 10:
+            raise NewsProjectionRejected("news gallery exceeds ten photos")
 
         existing_application = await connection.fetchrow(
             """
@@ -255,6 +270,52 @@ async def apply_approved_news_draft(
             draft.published_at,
             row["created_by"],
         )
+        gallery_rows: list[asyncpg.Record] = []
+        for item in gallery_manifest:
+            media_row = await connection.fetchrow(
+                """
+                SELECT ma.id, ma.sha256, ma.width, ma.height, ma.derivative_path,
+                       ma.moderation_status,
+                       (
+                           SELECT c.status FROM consents c
+                           WHERE c.subject_type='media' AND c.subject_id=ma.id
+                             AND c.scope='media_publication'
+                           ORDER BY c.updated_at DESC, c.created_at DESC, c.id DESC
+                           LIMIT 1
+                       ) AS consent_status
+                FROM news_session_media nsm
+                JOIN media_assets ma ON ma.id=nsm.media_id
+                WHERE nsm.session_id=$1 AND nsm.media_id=$2 AND ma.deleted_at IS NULL
+                """,
+                row["session_id"],
+                item.mediaId,
+            )
+            if (
+                not media_row
+                or media_row["sha256"] != item.sha256
+                or media_row["width"] != item.width
+                or media_row["height"] != item.height
+                or not media_row["derivative_path"]
+                or media_row["moderation_status"] != "approved"
+                or media_row["consent_status"] != "granted"
+            ):
+                raise NewsProjectionRejected("news gallery media changed or lacks permission")
+            gallery_rows.append(media_row)
+        await connection.execute("DELETE FROM news_media_items WHERE news_id=$1", news_id)
+        for sort_order, media_row in enumerate(gallery_rows):
+            await connection.execute(
+                """
+                INSERT INTO news_media_items(
+                    news_id, media_id, alt_ru, alt_kz, alt_en, sort_order
+                ) VALUES ($1,$2,$3,$4,$5,$6)
+                """,
+                news_id,
+                media_row["id"],
+                draft.title_ru,
+                draft.title_kz,
+                draft.title_en,
+                sort_order,
+            )
         application_id = await connection.fetchval(
             """
             INSERT INTO news_projection_applications(

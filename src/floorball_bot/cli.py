@@ -229,6 +229,7 @@ async def async_main(args: argparse.Namespace) -> None:
                     settings.floorball_site_repo,
                     settings.worktree_root,
                     publish_enabled=settings.publish_enabled,
+                    media_root=settings.media_root,
                 ),
                 contact_mailer=(
                     SmtpContactMailer(
@@ -387,6 +388,7 @@ async def async_main(args: argparse.Namespace) -> None:
                 settings.floorball_site_repo,
                 settings.worktree_root,
                 publish_enabled=settings.publish_enabled,
+                media_root=settings.media_root,
             )
             preview_result = await publisher.build_preview(publication_id, row["content"])
             print(
@@ -409,6 +411,7 @@ async def async_main(args: argparse.Namespace) -> None:
                 settings.floorball_site_repo,
                 settings.worktree_root,
                 publish_enabled=settings.publish_enabled,
+                media_root=settings.media_root,
             )
             manifest_hash = await pool.fetchval(
                 "SELECT screenshot_manifest_hash FROM publication_jobs WHERE id=$1",
@@ -426,6 +429,7 @@ async def async_main(args: argparse.Namespace) -> None:
                 settings.floorball_site_repo,
                 settings.worktree_root,
                 publish_enabled=settings.publish_enabled,
+                media_root=settings.media_root,
             )
             main_commit, static_commit = await publisher.reconcile_publication(args.publication)
             print(json.dumps({"main_commit": main_commit, "plesk_static_commit": static_commit}))

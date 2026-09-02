@@ -23,6 +23,7 @@ ALLOWED_SOURCE_CHANGES = {
     "app/src/data/generated/federation-content.json",
     "app/src/data/generated/news-content.json",
 }
+ALLOWED_CONTENT_PREFIXES = ("app/public/assets/news/",)
 CODE_TEMPLATE_PREFIXES = (
     "app/src/components/",
     "app/src/pages/",
@@ -33,7 +34,11 @@ CODE_TEMPLATE_PREFIXES = (
 
 def is_allowed_change(path: str, change_class: str = "content") -> bool:
     if change_class == "content":
-        return path in ALLOWED_SOURCE_CHANGES or path.startswith("app/dist/")
+        return (
+            path in ALLOWED_SOURCE_CHANGES
+            or path.startswith(ALLOWED_CONTENT_PREFIXES)
+            or path.startswith("app/dist/")
+        )
     if change_class == "code_template":
         return path.startswith(CODE_TEMPLATE_PREFIXES) or path.startswith("app/dist/")
     return False
@@ -183,6 +188,7 @@ class GitPublisher:
         *,
         screenshot_capture: ScreenshotCapture | None = None,
         publish_enabled: bool = True,
+        media_root: Path | None = None,
     ) -> None:
         self.pool = pool
         self.repository = repository.resolve()
@@ -190,6 +196,7 @@ class GitPublisher:
         self.artifact_root = (self.worktree_root / "_artifacts").resolve()
         self.screenshot_capture = screenshot_capture or self._capture_screenshots
         self.publish_enabled = publish_enabled
+        self.media_root = media_root.expanduser().resolve() if media_root else None
 
     @staticmethod
     def _bundle_path(payload: dict) -> str:
@@ -298,6 +305,67 @@ class GitPublisher:
                     except ProcessLookupError:
                         pass
                     await process.wait()
+
+    async def _materialize_news_assets(self, worktree: Path, payload: dict) -> None:
+        assets_root = worktree / "app/public/assets/news"
+        if assets_root.exists():
+            shutil.rmtree(assets_root)
+        requested: dict[str, str] = {}
+        for item in payload.get("items", []):
+            slug = str(item.get("slug", ""))
+            if not slug or not slug.replace("-", "").isalnum():
+                raise ValidationBlocked("news gallery has an unsafe slug")
+            for gallery in item.get("gallery", []):
+                source = str(gallery.get("src", ""))
+                prefix = f"/assets/news/{slug}/"
+                filename = source.removeprefix(prefix)
+                if (
+                    not source.startswith(prefix)
+                    or len(filename) != 69
+                    or not filename.endswith(".webp")
+                    or any(character not in "0123456789abcdef" for character in filename[:-5])
+                ):
+                    raise ValidationBlocked("news gallery path is not manifest-bound")
+                requested[source] = filename[:-5]
+        if not requested:
+            return
+        if self.media_root is None:
+            raise ValidationBlocked("news gallery requires a configured media root")
+        rows = await self.pool.fetch(
+            """
+            SELECT ma.sha256, ma.derivative_path
+            FROM media_assets ma
+            JOIN LATERAL (
+                SELECT c.status FROM consents c
+                WHERE c.subject_type='media' AND c.subject_id=ma.id
+                  AND c.scope='media_publication'
+                ORDER BY c.updated_at DESC, c.created_at DESC, c.id DESC
+                LIMIT 1
+            ) latest_consent ON latest_consent.status='granted'
+            WHERE ma.sha256=ANY($1::text[]) AND ma.deleted_at IS NULL
+              AND ma.derivative_path IS NOT NULL AND ma.moderation_status='approved'
+            """,
+            sorted(set(requested.values())),
+        )
+        by_sha = {row["sha256"]: row["derivative_path"] for row in rows}
+        derived_root = (self.media_root / "derived").resolve()
+        for public_path, sha256 in sorted(requested.items()):
+            derivative_value = by_sha.get(sha256)
+            if not derivative_value:
+                raise ValidationBlocked("news gallery asset is unavailable or unapproved")
+            derivative = Path(derivative_value)
+            resolved = derivative.resolve(strict=True)
+            if (
+                derivative.is_symlink()
+                or not resolved.is_file()
+                or not resolved.is_relative_to(derived_root)
+            ):
+                raise ValidationBlocked("news gallery derivative escaped the media root")
+            target = worktree / "app/public" / public_path.lstrip("/")
+            if not target.resolve().is_relative_to(worktree.resolve()):
+                raise ValidationBlocked("news gallery target escaped its worktree")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(resolved, target)
 
     @staticmethod
     def _validate_artifacts(
@@ -479,6 +547,7 @@ class GitPublisher:
                         cwd=worktree,
                     )
                 elif "items" in payload:
+                    await self._materialize_news_assets(worktree, payload)
                     await run_command(
                         "node",
                         "scripts/sync-news-content.mjs",
@@ -497,7 +566,9 @@ class GitPublisher:
                 ).splitlines()
                 if len(line) > 3
             }
-            if not source_changes or not source_changes.issubset(ALLOWED_SOURCE_CHANGES):
+            if not source_changes or any(
+                not is_allowed_change(path, "content") for path in source_changes
+            ):
                 raise ValidationBlocked(
                     f"publication changed unexpected source files: {sorted(source_changes)}"
                 )

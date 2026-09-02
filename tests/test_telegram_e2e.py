@@ -641,3 +641,107 @@ async def test_resubmission_appends_revision_to_same_draft(pg_pool):
     assert await pg_pool.fetchval(
         "SELECT consumed_at IS NOT NULL FROM callback_actions WHERE id=$1", stale_callback_id
     )
+
+
+@pytest.mark.asyncio
+async def test_news_author_confirms_telegram_gallery_before_submitting_bound_revision(pg_pool):
+    sender_id = 556200
+    user_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164,display_name,telegram_id)
+        VALUES ('+77011239991','News author',$1) RETURNING id
+        """,
+        sender_id,
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id,role_name) VALUES ($1,'federation_editor')",
+        user_id,
+    )
+    loaded = DialogueSpecRepository().load("news")
+    session_id = await pg_pool.fetchval(
+        """
+        INSERT INTO conversation_sessions(
+            user_id,workflow,status,definition_version,definition_hash,context_hash
+        ) VALUES ($1,'news','active',$2,$3,$4) RETURNING id
+        """,
+        user_id,
+        loaded.spec.version,
+        loaded.sha256,
+        "d" * 64,
+    )
+    fields = {
+        "scope": "national",
+        "city_slug": "",
+        "slug": "telegram-tournament",
+        "published_at": "2026-09-02T10:00:00Z",
+        "title_ru": "Турнир завершён",
+        "title_kz": "Турнир аяқталды",
+        "title_en": "",
+        "excerpt_ru": "Краткие итоги.",
+        "excerpt_kz": "Қысқаша қорытынды.",
+        "excerpt_en": "",
+        "body_ru": [{"type": "paragraph", "text": "Итоги турнира."}],
+        "body_kz": [{"type": "paragraph", "text": "Турнир қорытындысы."}],
+        "body_en": [],
+        "sources": [],
+        "media": None,
+        "video_url": "",
+        "publication_permission": True,
+    }
+    await pg_pool.execute(
+        """
+        INSERT INTO conversation_memory(session_id,structured_memory)
+        VALUES ($1,$2::jsonb)
+        """,
+        session_id,
+        {"fields": fields, "skipped": []},
+    )
+    sha256 = "e" * 64
+    media_id = await pg_pool.fetchval(
+        """
+        INSERT INTO media_assets(
+            sha256,original_filename,detected_mime,byte_size,width,height,
+            uploader_id,original_path,derivative_path,moderation_status
+        ) VALUES ($1,'photo.jpg','image/jpeg',100,1200,800,$2,'/private/photo',$3,'pending')
+        RETURNING id
+        """,
+        sha256,
+        user_id,
+        f"/managed/derived/{sha256}.webp",
+    )
+    await pg_pool.execute(
+        """
+        INSERT INTO news_session_media(session_id,media_id,telegram_message_id,caption)
+        VALUES ($1,$2,77,'Фото турнира')
+        """,
+        session_id,
+        media_id,
+    )
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    assert await ingress.accept(message_update(9_200, sender_id, "/photos-ready"))
+    confirmation = await pg_pool.fetchval(
+        "SELECT payload FROM outbox_events ORDER BY created_at DESC LIMIT 1"
+    )
+    callback = confirmation["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    assert await ingress.accept(callback_update(9_201, sender_id, callback))
+    assert await pg_pool.fetchval(
+        """
+        SELECT status FROM consents
+        WHERE subject_type='media' AND subject_id=$1 AND scope='media_publication'
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        media_id,
+    ) == "granted"
+
+    assert await ingress.accept(message_update(9_202, sender_id, "/submit"))
+    content = await pg_pool.fetchval(
+        "SELECT content FROM draft_revisions ORDER BY created_at DESC LIMIT 1"
+    )
+    assert content["media_manifest"] == [{
+        "mediaId": str(media_id),
+        "sha256": sha256,
+        "width": 1200,
+        "height": 800,
+        "caption": "Фото турнира",
+    }]

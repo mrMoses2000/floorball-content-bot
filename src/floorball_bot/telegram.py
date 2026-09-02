@@ -226,7 +226,60 @@ class TelegramIngress:
                     actor=actor,
                     callback_data=update.callback_query.data or "",
                 )
-                if action == "review_start":
+                if action == "news_media_consent":
+                    session = await connection.fetchrow(
+                        """
+                        SELECT id FROM conversation_sessions
+                        WHERE id=$1 AND user_id=$2 AND workflow='news' AND status='active'
+                        FOR UPDATE
+                        """,
+                        target_id,
+                        actor.user_id,
+                    )
+                    if not session:
+                        raise AuthorizationError("news media session is no longer active")
+                    media_rows = await connection.fetch(
+                        """
+                        SELECT nsm.media_id
+                        FROM news_session_media nsm
+                        JOIN media_assets ma ON ma.id=nsm.media_id
+                        WHERE nsm.session_id=$1 AND ma.deleted_at IS NULL
+                          AND ma.derivative_path IS NOT NULL
+                        ORDER BY nsm.telegram_message_id, nsm.media_id
+                        LIMIT 10
+                        """,
+                        target_id,
+                    )
+                    if not media_rows:
+                        raise AuthorizationError("news session has no processed photos")
+                    for media_row in media_rows:
+                        await connection.execute(
+                            """
+                            INSERT INTO consents(
+                                subject_type, subject_id, scope, status, evidence_private,
+                                legal_text_version, granted_by, valid_from
+                            ) VALUES (
+                                'media',$1,'media_publication','granted',$2,
+                                'news-media-rights-v1',$3,now()
+                            )
+                            """,
+                            media_row["media_id"],
+                            "Telegram actor confirmed publication rights for active news session",
+                            actor.user_id,
+                        )
+                        await connection.execute(
+                            """
+                            UPDATE media_assets SET moderation_status='approved', updated_at=now()
+                            WHERE id=$1 AND moderation_status='pending'
+                            """,
+                            media_row["media_id"],
+                        )
+                    callback_text = (
+                        f"Право на публикацию подтверждено для {len(media_rows)} фото. "
+                        "Они будут включены в ревизию новости при /submit и отдельно "
+                        "проверены редактором и в визуальном preview."
+                    )
+                elif action == "review_start":
                     require_roles(actor, Role.REVIEWER, Role.SUPERADMIN)
                     draft = await connection.fetchrow(
                         """
@@ -895,13 +948,15 @@ class TelegramIngress:
                 reply_markup=self._dialogue_keyboard(actor),
             )
             return
-        await connection.execute(
+        message_record_id = await connection.fetchval(
             """
             INSERT INTO messages(
                 session_id, user_id, telegram_chat_id, telegram_message_id,
-                telegram_update_id, direction, message_type, original_text
+                telegram_update_id, direction, message_type, original_text,
+                telegram_media_group_id
             )
-            VALUES ($1,$2,$3,$4,$5,'inbound',$6,$7)
+            VALUES ($1,$2,$3,$4,$5,'inbound',$6,$7,$8)
+            RETURNING id
             """,
             dialogue_session["id"] if dialogue_session else None,
             actor.user_id,
@@ -910,6 +965,7 @@ class TelegramIngress:
             update.update_id,
             self._message_type(message),
             message.text or message.caption or "",
+            str(message.media_group_id or ""),
         )
         if message.text and message.text.startswith("/"):
             if dialogue_session and await self._handle_dialogue_command(
@@ -964,14 +1020,42 @@ class TelegramIngress:
                     "chat_id": message.chat.id,
                     "user_id": str(actor.user_id),
                     "filename": getattr(media, "file_name", None) or "telegram-image",
+                    "session_id": str(dialogue_session["id"]) if dialogue_session else None,
+                    "session_workflow": dialogue_session["workflow"]
+                    if dialogue_session
+                    else None,
+                    "message_id": str(message_record_id),
+                    "telegram_message_id": message.message_id,
+                    "telegram_media_group_id": str(message.media_group_id or ""),
+                    "caption": (message.caption or "")[:600],
                 },
                 idempotency_key=stable_idempotency_key("media", update.update_id),
             )
+            if message.caption and dialogue_session:
+                await enqueue_job(
+                    connection,
+                    kind="extract",
+                    payload={
+                        "text": message.caption,
+                        "chat_id": message.chat.id,
+                        "user_id": str(actor.user_id),
+                        "session_id": str(dialogue_session["id"]),
+                        "mode": dialogue_session["workflow"],
+                    },
+                    idempotency_key=stable_idempotency_key(
+                        "extract-photo-caption", update.update_id
+                    ),
+                )
             await self._reply(
                 connection,
                 update.update_id,
                 message.chat.id,
-                "Изображение принято в закрытое хранилище и отправлено на проверку.",
+                (
+                    "Фотография принята для новости. После загрузки всех фотографий "
+                    "отправьте /photos-ready и подтвердите право на публикацию."
+                    if dialogue_session and dialogue_session["workflow"] == "news"
+                    else "Изображение принято в закрытое хранилище и отправлено на проверку."
+                ),
             )
         elif message.text:
             pending_transcript = await connection.fetchrow(
@@ -1651,7 +1735,14 @@ class TelegramIngress:
         text: str,
     ) -> bool:
         command = text.split()[0].split("@")[0]
-        if command not in {"/status", "/resume", "/cancel", "/submit", "/skip"}:
+        if command not in {
+            "/status",
+            "/resume",
+            "/cancel",
+            "/submit",
+            "/skip",
+            "/photos-ready",
+        }:
             return False
         if command == "/cancel":
             await connection.execute(
@@ -1672,6 +1763,57 @@ class TelegramIngress:
                 chat_id,
                 "Определение вопросов обновилось. Сохранённые ответы не потеряны; "
                 "администратор должен перенести сессию на новую версию.",
+            )
+            return True
+        if command == "/photos-ready":
+            if session["workflow"] != "news":
+                await self._reply(
+                    connection,
+                    update_id,
+                    chat_id,
+                    "Команда /photos-ready доступна только в сценарии новости.",
+                )
+                return True
+            count = await connection.fetchval(
+                """
+                SELECT count(*) FROM news_session_media nsm
+                JOIN media_assets ma ON ma.id=nsm.media_id
+                WHERE nsm.session_id=$1 AND ma.deleted_at IS NULL
+                  AND ma.derivative_path IS NOT NULL
+                """,
+                session["id"],
+            )
+            if not count:
+                await self._reply(
+                    connection,
+                    update_id,
+                    chat_id,
+                    "Обработанных фотографий пока нет. Дождитесь сообщения worker и "
+                    "повторите /photos-ready.",
+                )
+                return True
+            callback = await create_callback(
+                connection,
+                actor=actor,
+                action="news_media_consent",
+                target_id=session["id"],
+                ttl_seconds=24 * 60 * 60,
+            )
+            await self._reply(
+                connection,
+                update_id,
+                chat_id,
+                (
+                    f"Подготовлено фотографий: {count}. Подтвердите, что у вас есть "
+                    "право передать их федерации для публикации на сайте. Финальное "
+                    "решение всё равно принимает редактор."
+                ),
+                reply_markup={
+                    "inline_keyboard": [[{
+                        "text": f"Подтверждаю права на {count} фото",
+                        "callback_data": callback.callback_data,
+                    }]]
+                },
             )
             return True
         memory = await connection.fetchval(
@@ -1700,6 +1842,59 @@ class TelegramIngress:
                 + self._dialogue_progress(loaded.spec, fields, language),
             )
             return True
+        media_manifest: list[dict] = []
+        if session["workflow"] == "news":
+            media_rows = await connection.fetch(
+                """
+                SELECT nsm.media_id, ma.sha256, ma.width, ma.height, nsm.caption,
+                       ma.moderation_status,
+                       COALESCE((
+                           SELECT c.status FROM consents c
+                           WHERE c.subject_type='media' AND c.subject_id=ma.id
+                             AND c.scope='media_publication'
+                           ORDER BY c.updated_at DESC, c.created_at DESC, c.id DESC
+                           LIMIT 1
+                       ), 'pending') AS consent_status
+                FROM news_session_media nsm
+                JOIN media_assets ma ON ma.id=nsm.media_id
+                WHERE nsm.session_id=$1 AND ma.deleted_at IS NULL
+                ORDER BY nsm.telegram_message_id, nsm.media_id
+                """,
+                session["id"],
+            )
+            if len(media_rows) > 10:
+                await self._reply(
+                    connection,
+                    update_id,
+                    chat_id,
+                    "Для одной новости разрешено не более 10 фотографий.",
+                )
+                return True
+            pending_media = [
+                row
+                for row in media_rows
+                if row["consent_status"] != "granted"
+                or row["moderation_status"] != "approved"
+            ]
+            if pending_media:
+                await self._reply(
+                    connection,
+                    update_id,
+                    chat_id,
+                    "Есть фотографии без подтверждённого права на публикацию. "
+                    "Отправьте /photos-ready, подтвердите их и повторите /submit.",
+                )
+                return True
+            media_manifest = [
+                {
+                    "mediaId": str(row["media_id"]),
+                    "sha256": row["sha256"],
+                    "width": row["width"],
+                    "height": row["height"],
+                    "caption": row["caption"],
+                }
+                for row in media_rows
+            ]
         content = {
             "dialogue_mode": session["workflow"],
             "definition_version": session["definition_version"],
@@ -1707,6 +1902,8 @@ class TelegramIngress:
             "context_hash": session["context_hash"],
             "fields": fields,
         }
+        if media_manifest:
+            content["media_manifest"] = media_manifest
         canonical = json.dumps(
             content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -1911,7 +2108,7 @@ class TelegramIngress:
         elif command == "/help":
             response = (
                 "Команды: /status /resume /cancel /profile /city /players /gallery "
-                "/submit /history. Проверяющим: /review. Администратору: "
+                "/news /photos-ready /submit /history. Проверяющим: /review. Администратору: "
                 "/city-applications /readiness /publish /users /revert."
             )
         elif command == "/readiness":
@@ -2023,6 +2220,7 @@ class TelegramIngress:
     def _review_summary(content: dict, revision: int, content_hash: str) -> str:
         if content.get("dialogue_mode") == "news":
             fields = content.get("fields", {}) if isinstance(content, dict) else {}
+            gallery = content.get("media_manifest", []) if isinstance(content, dict) else []
             scope = fields.get("scope") or "не указана"
             city = fields.get("city_slug") or "—"
             return (
@@ -2032,6 +2230,7 @@ class TelegramIngress:
                 f"Область: {scope}; город: {city}\n"
                 f"Slug: {fields.get('slug') or 'не заполнен'}\n"
                 f"Дата: {fields.get('published_at') or 'не заполнена'}\n"
+                f"Фотографий в галерее: {len(gallery)}\n"
                 f"Ревизия: {revision}; hash: {content_hash[:12]}"
             )
         return TelegramIngress._trainer_review_summary(content, revision, content_hash)

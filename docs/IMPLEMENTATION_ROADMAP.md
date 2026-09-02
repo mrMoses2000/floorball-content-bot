@@ -125,6 +125,8 @@ article route and relevant city page.
 - [x] Add accessible non-autoplay CSS scroll-snap carousel after Geography on the homepage.
 - [x] Add `/news`, `/news/:slug` and city-scoped news sections.
 - [x] Add contract, localization, filtering, XSS, accessibility and route tests.
+- [x] Attach up to ten consented Telegram photos to an immutable news revision, copy only
+      approved derivatives into the publication worktree and render a non-autoplay gallery.
 
 ## Phase P3: public new-city application
 
@@ -416,6 +418,22 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
   form and replaced config `__dirname` with `import.meta.dirname`.
 - A clean `npm ci` passed `37` tests, ESLint, production build and `npm audit --audit-level=low`.
   Real Chromium `151.0.7922.34` smoke loaded the homepage and map with no console/page errors.
-- The rebuilt site is committed locally as `373ec32`; push/deployment remains an explicit owner
-  action because that repository uses a different remote account. The backend staging gate now
-  rejects future high-severity npm audit regressions.
+- The rebuilt site was committed as `373ec32` and pushed to `origin/main` after explicit owner
+  instruction; Plesk deployment remains manual. The backend staging gate now rejects future
+  high-severity npm audit regressions.
+
+### 2026-09-02 Telegram news galleries
+
+- Telegram photos uploaded during an active news dialogue are now processed without EXIF and
+  attached to that exact session. `/photos-ready` records an actor-bound publication-rights
+  confirmation; `/submit` refuses pending media and pins the ordered SHA-256 manifest into the
+  immutable news revision.
+- The canonical projector revalidates the session, hashes, dimensions, moderation and latest
+  consent before linking up to ten media assets to the approved news item. Withdrawal also removes
+  the gallery derivative from the next public projection.
+- The public bundle exposes only deterministic `/assets/news/<slug>/<sha>.webp` paths and localized
+  alt text. The isolated publisher copies only approved derivatives inside `MEDIA_ROOT/derived`
+  and includes every source/built asset in the persisted change manifest.
+- The site uses the first gallery image on cards and renders a keyboard-focusable, non-autoplay
+  scroll-snap gallery on the article page. Backend full disposable-PostgreSQL suite: `148 passed`;
+  site: `38 passed`, ESLint, production build and zero-finding npm audit passed.
