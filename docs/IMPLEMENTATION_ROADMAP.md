@@ -1,6 +1,6 @@
 # Floorball content platform implementation roadmap
 
-Last updated: 2026-09-01
+Last updated: 2026-09-02
 
 This document is the durable execution plan for the Telegram content bot and
 `/home/moses/floorball.kz`. It is intentionally stored in the bot repository because the bot
@@ -195,7 +195,7 @@ publication or an ambiguous success message.
 - [x] Site `npm ci`, Vitest, ESLint and production build are green from a clean checkout.
 - [x] DB-to-JSON-to-frontend round trips do not expose private fields.
 - [x] RBAC/IDOR and applicant isolation tests are green.
-- [ ] Media consent withdrawal removes the public derivative on the next projection.
+- [x] Media consent withdrawal removes the public derivative on the next projection.
 - [ ] Contact live delivery is verified.
 - [x] Both desktop/mobile screenshot sets exist for visual changes.
 - [x] Old callbacks fail after revision or base commit changes.
@@ -393,3 +393,16 @@ Record focused red/green outcomes here. Do not replace raw test output; keep con
   explicitly deferred to a separate dependency-upgrade change.
 - Permanent `floorball_bot_staging` creation is pending because both `CREATEDB` and passwordless
   sudo are intentionally unavailable. A separate BotFather staging token is also operator-owned.
+
+### 2026-09-02 cross-cutting gate: media consent withdrawal
+
+- The readiness projection now reconciles the latest effective `media_publication` consent before
+  producing public payloads. A withdrawn consent deletes only the managed file under
+  `MEDIA_ROOT/derived`, clears `derivative_path`, disables its publication links and records one
+  audit event; the private original remains unchanged.
+- Reconciliation is idempotent and available as `floorball-bot media-consent-reconcile` for
+  recovery. A later explicit re-grant wins over an older withdrawal.
+- Paths outside the configured derived root, symlink escapes and non-file targets fail closed
+  before any derivative is removed.
+- Focused PostgreSQL suite: `4 passed`; full backend suite: `144 passed`; Ruff, compileall and
+  dependency integrity passed.

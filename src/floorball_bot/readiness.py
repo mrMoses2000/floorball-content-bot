@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from floorball_bot.exporters import (
     project_federation_payload,
     project_news_payload,
 )
+from floorball_bot.media_consent import reconcile_withdrawn_media
 from floorball_bot.queue import enqueue_outbox, stable_idempotency_key
 from floorball_bot.workflow import canonical_hash
 
@@ -165,8 +167,12 @@ async def _ensure_snapshot_draft(
     return draft_id
 
 
-async def scan_readiness(pool: asyncpg.Pool) -> tuple[ReadinessResult, ...]:
+async def scan_readiness(
+    pool: asyncpg.Pool, *, media_root: Path | None = None
+) -> tuple[ReadinessResult, ...]:
     """Create idempotent readiness records and notify bound publishing administrators."""
+    if media_root is not None:
+        await reconcile_withdrawn_media(pool, media_root=media_root)
     async with pool.acquire() as connection, connection.transaction(
         isolation="repeatable_read", readonly=True
     ):

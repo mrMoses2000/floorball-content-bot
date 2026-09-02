@@ -33,6 +33,7 @@ from floorball_bot.importers import (
 )
 from floorball_bot.logging import configure_logging
 from floorball_bot.media import MediaPipeline
+from floorball_bot.media_consent import reconcile_withdrawn_media
 from floorball_bot.projection.apply import (
     apply_approved_trainer_draft,
     inspect_trainer_draft,
@@ -91,6 +92,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("worker")
     commands.add_parser("contact-api")
     commands.add_parser("health")
+    commands.add_parser("media-consent-reconcile")
     context = commands.add_parser("agent-context")
     context.add_argument("--actor", required=True, type=UUID)
     context.add_argument("--mode", required=True, choices=[mode.value for mode in AgentMode])
@@ -157,6 +159,18 @@ async def async_main(args: argparse.Namespace) -> None:
             )
             if not report["ok"]:
                 raise SystemExit(1)
+        elif args.command == "media-consent-reconcile":
+            result = await reconcile_withdrawn_media(pool, media_root=settings.media_root)
+            print(
+                json.dumps(
+                    {
+                        "removed_count": len(result.removed_media_ids),
+                        "removed_media_ids": [
+                            str(media_id) for media_id in result.removed_media_ids
+                        ],
+                    }
+                )
+            )
         elif args.command == "agent-context":
             async with pool.acquire() as connection:
                 actor = await load_context_actor(connection, args.actor)

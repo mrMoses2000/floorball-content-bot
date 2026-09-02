@@ -74,6 +74,12 @@ class Worker:
         self.worker_id = f"worker-{uuid4()}"
         self.stop_event = asyncio.Event()
 
+    async def _scan_readiness(self) -> None:
+        await scan_readiness(
+            self.pool,
+            media_root=self.media_pipeline.root if self.media_pipeline is not None else None,
+        )
+
     async def stop(self) -> None:
         self.stop_event.set()
 
@@ -100,7 +106,7 @@ class Worker:
                 if now - self._last_readiness_scan >= self.readiness_interval_seconds:
                     self._last_readiness_scan = now
                     try:
-                        await scan_readiness(self.pool)
+                        await self._scan_readiness()
                     except Exception:
                         logger.exception("readiness_scan_failed")
                 try:
@@ -119,7 +125,7 @@ class Worker:
             elif job.kind == "media":
                 await self._media(job)
             elif job.kind == "readiness_scan":
-                await scan_readiness(self.pool)
+                await self._scan_readiness()
             elif job.kind == "apply_projection":
                 await self._apply_projection(job)
             elif job.kind == "contact_delivery":

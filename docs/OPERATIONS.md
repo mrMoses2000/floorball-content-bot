@@ -184,3 +184,20 @@ export STAGING_POSTGRES_DSN="$POSTGRES_DSN"
 Gate разрешает только БД с suffix `_staging`/`_test`, принудительно требует
 `PUBLISH_ENABLED=false` и использует local bare Git внутри тестовых каталогов. После зелёного gate
 staging polling можно запускать отдельным unit только с отдельными token, DB, media и worktree.
+
+## Отзыв согласия на медиа
+
+Каждый readiness scan перед публичной проекцией обрабатывает медиа, у которого последнее
+действующее согласие `media_publication` имеет статус `withdrawn`. Worker удаляет только файл под
+`MEDIA_ROOT/derived`, очищает DB-ссылку и снимает media links с публикации. Оригинал под
+`MEDIA_ROOT/originals` сохраняется; история Git не переписывается.
+
+Для ручного восстановления используйте идемпотентную команду:
+
+```bash
+.venv/bin/floorball-bot media-consent-reconcile
+```
+
+Команда выводит только количество и UUID обработанных media assets. Если сохранённый путь выходит
+за `MEDIA_ROOT/derived` или указывает не на обычный файл, reconciliation завершается ошибкой до
+удаления и требует операторской проверки пути.

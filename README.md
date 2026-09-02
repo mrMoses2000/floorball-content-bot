@@ -11,6 +11,7 @@ sanitization, deterministic city exporter/importer, автоматическая
 Telegram-уведомления, RU/KZ/EN desktop/mobile screenshot preview с manifest-bound confirm,
 atomic Git push, durable contact
 requests с асинхронной SMTP-доставкой, approval-gated национальные и городские новости,
+автоматическое удаление публичных media derivatives после отзыва согласия,
 systemd units и backup scripts.
 
 Commit/push выполняется только после двух явных Telegram-кнопок для конкретной ревизии;
