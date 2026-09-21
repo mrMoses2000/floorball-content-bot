@@ -21,7 +21,7 @@ Build one approval-gated content platform where:
 - only an expiring, actor-bound callback for that revision can cause commit and atomic push;
 - contact requests are durably accepted and delivered to `Knff@gmail.com`, with retry and
   operator visibility;
-- Codex extracts structured data but never decides RBAC, completeness, consent, approval or
+- Agy extracts structured data but never decides RBAC, completeness, consent, approval or
   publication and never receives production push credentials.
 
 ## Non-negotiable boundaries

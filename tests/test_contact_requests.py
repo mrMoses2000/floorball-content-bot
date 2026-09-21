@@ -18,7 +18,7 @@ from floorball_bot.contact_requests import (
 )
 from floorball_bot.db import create_pool, run_migrations
 from floorball_bot.domain import ExtractedCityPatch
-from floorball_bot.providers.codex import FakeExtractor
+from floorball_bot.providers.agy import FakeExtractor
 from floorball_bot.providers.transcription import FakeTranscriber
 from floorball_bot.queue import claim_job
 from floorball_bot.smtp_mailer import build_contact_email

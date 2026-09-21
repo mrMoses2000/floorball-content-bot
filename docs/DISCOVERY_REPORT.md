@@ -8,7 +8,7 @@
 - 7.2 GiB RAM, 4 GiB swap; доступно около 3 GiB RAM.
 - SSD 219 GiB, занято 24% (пороги: warning 80%, critical 90%).
 - Python 3.14.4, Node 22.23.1, npm 10.9.8, Git 2.53.0.
-- Codex CLI 0.149.1 и ffmpeg установлены.
+- Agy CLI 1.2.7 и ffmpeg установлены.
 - `psql`/PostgreSQL и `cloudflared` не установлены. Tunnel не нужен для MVP long polling.
 - В текущем процессе `ASSEMBLI_AI` и `TG_API_KEY` не экспортированы. Файл `.env` существует; его содержимое не читалось и не выводилось.
 
@@ -49,4 +49,3 @@
 - Runtime — два процесса: long-polling ingress/outbox и worker; publisher запускается отдельной командой/service.
 - PostgreSQL является единственным state/queue store.
 - Никакой production push, установки systemd units, Plesk deploy или изменения DNS без отдельного подтверждения.
-

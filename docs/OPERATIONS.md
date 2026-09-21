@@ -67,7 +67,7 @@ Health timer запускает эту проверку каждые пять м
 
 ## Incident/recovery
 
-- Telegram outage: незабранные updates остаются на стороне Telegram; fail-fast supervision завершает процесс, а systemd перезапускает polling. AssemblyAI/Codex jobs переходят в bounded retry/dead. После устранения причины повторите только dead jobs после анализа error class.
+- Telegram outage: незабранные updates остаются на стороне Telegram; fail-fast supervision завершает процесс, а systemd перезапускает polling. AssemblyAI/Agy jobs переходят в bounded retry/dead. После устранения причины повторите только dead jobs после анализа error class.
 - Power loss: systemd рестартует процессы; leased `running` job снова доступен после истечения lease. Уникальные update/idempotency keys предотвращают повторные business mutations.
 - Disk 80%: warning, остановить новые media uploads и выгрузить backup. 90%: critical, остановить worker/publisher до освобождения места.
 - DB corruption: остановить bot/worker, сохранить повреждённый data dir read-only, восстановить последний проверенный dump в новую БД, сверить audit/publication IDs.

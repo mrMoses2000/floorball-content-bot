@@ -4,7 +4,7 @@
 
 Система принимает Telegram updates, авторизует заранее заведённых пользователей, сохраняет входные данные и медиа, формирует версионированные черновики, проводит user/reviewer approval и только затем создаёт детерминированный preview публикации для `floorball.kz`.
 
-Внешние зависимости: Telegram Bot API, AssemblyAI, локальный Codex CLI, PostgreSQL,
+Внешние зависимости: Telegram Bot API, AssemblyAI, локальный Agy CLI, PostgreSQL,
 SMTP, ffmpeg/ImageMagick/Pillow, локальный clone `floorball.kz` и GitHub. Plesk остаётся
 ручным последним шагом.
 
@@ -13,12 +13,12 @@ SMTP, ffmpeg/ImageMagick/Pillow, локальный clone `floorball.kz` и GitH
 ```mermaid
 flowchart LR
   TG[Telegram API] -->|long polling| BOT[floorball-bot]
-  SITE[floorball.kz contact form] -->|HTTPS reverse proxy| CONTACT[floorball-contact-api]
+  SITE[floorball.kz contact form] -->|HTTPS tunnel| CONTACT[floorball-contact-api]
   CONTACT -->|durable request + job| PG
   BOT -->|transaction| PG[(PostgreSQL)]
   PG --> WORKER[floorball-worker]
   WORKER --> AAI[AssemblyAI]
-  WORKER --> CODEX[Codex CLI read-only]
+  WORKER --> AGY[Agy CLI sandbox]
   WORKER --> MEDIA[Local private media]
   WORKER -->|fixed-recipient SMTP| MAIL[Knff Gmail]
   PG --> PUB[floorball-publisher]
@@ -96,11 +96,16 @@ the newly created user only `city_coach` and one city scope.
 - News bodies use typed paragraph/heading/quote blocks. The client renders block text through
   React nodes and never executes stored markup as HTML.
 
-## Codex subprocess boundary
+## Agy subprocess boundary
 
-The wrapper invokes `codex exec --ephemeral --sandbox read-only --ignore-user-config --output-schema ... --output-last-message ...` with an argv list, a secret-free allowlisted environment, isolated cwd, one-process semaphore, timeout and stdout/stderr caps. Process group receives TERM then KILL. User text never becomes a shell command.
-
-The official OpenAI non-interactive-mode documentation confirms that `codex exec` is intended for scripts, supports `--ephemeral`, and defaults to read-only; local `codex exec --help` confirms the exact flags installed here.
+The wrapper invokes Agy print mode with `gemini-3.8-flash`, high reasoning effort,
+`--sandbox`, disabled slash-command expansion and a strict JSON Schema. Agy 1.2.7 print mode
+requires the one-turn prompt as an argv value; the wrapper invokes it directly without a shell,
+so user text cannot become a command. Each call uses a secret-free allowlisted environment, an
+isolated temporary cwd, a one-process semaphore, a bounded timeout and stdout/stderr caps. The
+process group receives TERM and then KILL on timeout. Agy is an
+extractor only: Pydantic validation, deterministic gap evaluation, RBAC, consent, approval and
+publication remain in application code.
 
 ## Failure handling and observability
 
@@ -110,9 +115,10 @@ The official OpenAI non-interactive-mode documentation confirms that `codex exec
 - Health command checks DB, polling heartbeat, disk, dead jobs, latest backup and publication.
 - Health also reports active/stuck publication reconciliation and treats a persistent remote-ref
   mismatch as unhealthy until an operator resolves it.
-- The contact API binds only `127.0.0.1`; the existing HTTPS reverse proxy exposes only
-  `/api/contact`. Its `/healthz` checks PostgreSQL readiness and is not public by design.
+- The contact API binds only `127.0.0.1`. A stable Tailscale Funnel or named Cloudflare Tunnel
+  may expose only `/floorball-contact/api/contact/`; the Vite build points
+  `VITE_CONTACT_API_URL` to that public HTTPS endpoint. `/healthz` checks PostgreSQL readiness.
 
 ## Resource model
 
-One Codex subprocess globally, one transcription job by default, small asyncpg pool, no Redis/Kafka/Kubernetes/local LLM. Originals remain outside Git; bounded public derivatives are copied only into an isolated publication worktree.
+One Agy subprocess globally, one transcription job by default, small asyncpg pool, no Redis/Kafka/Kubernetes/local LLM. Originals remain outside Git; bounded public derivatives are copied only into an isolated publication worktree.

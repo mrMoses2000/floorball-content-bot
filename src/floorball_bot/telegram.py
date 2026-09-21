@@ -12,8 +12,9 @@ from uuid import uuid4
 import asyncpg
 from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
-from aiogram.methods import DeleteWebhook, GetUpdates, GetWebhookInfo
+from aiogram.methods import DeleteWebhook, GetUpdates, GetWebhookInfo, SetMyCommands
 from aiogram.types import (
+    BotCommand,
     FSInputFile,
     InputMediaPhoto,
     KeyboardButton,
@@ -51,6 +52,31 @@ from floorball_bot.workflow import add_revision, transition_draft
 logger = logging.getLogger(__name__)
 
 DIALOGUE_WORKFLOWS = tuple(mode.value for mode in DialogueMode)
+
+TELEGRAM_COMMAND_ALIASES = {
+    "/coach_form": "/coach-form",
+    "/photos_ready": "/photos-ready",
+    "/city_applications": "/city-applications",
+}
+
+TELEGRAM_COMMANDS = (
+    BotCommand(command="start", description="Начать или войти по своему контакту"),
+    BotCommand(command="help", description="Показать доступные команды"),
+    BotCommand(command="profile", description="Показать роли и назначенные города"),
+    BotCommand(command="coach_form", description="Заполнить или продолжить анкету тренера"),
+    BotCommand(command="news", description="Предложить новость и фотографии"),
+    BotCommand(command="status", description="Показать прогресс текущего диалога"),
+    BotCommand(command="resume", description="Продолжить сохранённый диалог"),
+    BotCommand(command="submit", description="Отправить заполненный черновик"),
+    BotCommand(command="cancel", description="Отменить текущий диалог"),
+    BotCommand(command="review", description="Открыть очередь проверки"),
+    BotCommand(command="readiness", description="Проверить готовность контента"),
+)
+
+
+def canonical_command(text: str) -> str:
+    command = text.split()[0].split("@")[0].casefold()
+    return TELEGRAM_COMMAND_ALIASES.get(command, command)
 
 
 ROLE_COMMANDS: dict[str, tuple[Role, ...]] = {
@@ -151,6 +177,7 @@ class TelegramIngress:
         if info.url:
             await self.bot(DeleteWebhook(drop_pending_updates=False))
             logger.warning("telegram_webhook_removed_for_long_polling")
+        await self.bot(SetMyCommands(commands=list(TELEGRAM_COMMANDS)))
 
     async def stop(self) -> None:
         self._stop.set()
@@ -1212,7 +1239,7 @@ class TelegramIngress:
         application = await get_or_create_city_application(
             connection, applicant_id=applicant_id
         )
-        command = message.text.split()[0].split("@")[0] if message.text.startswith("/") else ""
+        command = canonical_command(message.text) if message.text.startswith("/") else ""
         if command == "/status":
             await self._reply(
                 connection, update_id, message.chat.id,
@@ -1616,7 +1643,7 @@ class TelegramIngress:
 
     def _selected_dialogue_mode(self, text: str, actor: Actor) -> DialogueMode | None:
         normalized = text.strip().casefold()
-        command = normalized.split("@", 1)[0]
+        command = canonical_command(normalized)
         if command in {"/coach-form", "/news"}:
             requested = (
                 DialogueMode.TRAINER if command == "/coach-form" else DialogueMode.NEWS
@@ -1734,7 +1761,7 @@ class TelegramIngress:
         chat_id: int,
         text: str,
     ) -> bool:
-        command = text.split()[0].split("@")[0]
+        command = canonical_command(text)
         if command not in {
             "/status",
             "/resume",
@@ -2092,7 +2119,7 @@ class TelegramIngress:
         chat_id: int,
         text: str,
     ) -> None:
-        command = text.split()[0].split("@")[0]
+        command = canonical_command(text)
         allowed = ROLE_COMMANDS.get(command)
         if allowed:
             try:
@@ -2108,8 +2135,8 @@ class TelegramIngress:
         elif command == "/help":
             response = (
                 "Команды: /status /resume /cancel /profile /city /players /gallery "
-                "/news /photos-ready /submit /history. Проверяющим: /review. Администратору: "
-                "/city-applications /readiness /publish /users /revert."
+                "/news /photos_ready /submit /history. Проверяющим: /review. Администратору: "
+                "/city_applications /readiness /publish /users /revert."
             )
         elif command == "/readiness":
             await enqueue_job(

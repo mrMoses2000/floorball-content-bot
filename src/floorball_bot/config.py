@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -32,12 +33,16 @@ class Settings(BaseSettings):
     media_root: Path = Field(default=Path("./var/media"), validation_alias="MEDIA_ROOT")
     worktree_root: Path = Field(default=Path("./var/worktrees"), validation_alias="WORKTREE_ROOT")
     backup_root: Path = Field(default=Path("./var/backups"), validation_alias="BACKUP_ROOT")
-    codex_cli: str = Field(default="codex", validation_alias="CODEX_CLI")
+    agy_cli: str = Field(default="agy", validation_alias="AGY_CLI")
+    agy_model: str = Field(default="gemini-3.8-flash", validation_alias="AGY_MODEL")
+    agy_effort: Literal["low", "medium", "high"] = Field(
+        default="high", validation_alias="AGY_EFFORT"
+    )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
     max_download_bytes: int = 20 * 1024 * 1024
     max_image_pixels: int = 40_000_000
     max_derivative_bytes: int = 2 * 1024 * 1024
-    codex_timeout_seconds: int = 120
+    agy_timeout_seconds: int = Field(default=180, validation_alias="AGY_TIMEOUT_SECONDS")
     assemblyai_timeout_seconds: int = 300
     job_lease_seconds: int = 300
     max_job_attempts: int = 5

@@ -13,7 +13,7 @@ from floorball_bot.dialogue.patches import (
 )
 from floorball_bot.dialogue.repository import DialogueSpecRepository
 from floorball_bot.domain import Actor, DraftStatus, ExtractedCityPatch, Role
-from floorball_bot.providers.codex import FakeExtractor
+from floorball_bot.providers.agy import FakeExtractor
 from floorball_bot.providers.transcription import FakeTranscriber
 from floorball_bot.queue import (
     accept_update,

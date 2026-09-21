@@ -16,14 +16,18 @@ Long polling не требует домена, HTTPS, Cloudflare Tunnel, port fo
 2. Укажите `SMTP_USERNAME` и отдельный app password в `SMTP_PASSWORD`; обычный пароль Gmail не
    используйте. Получатель жёстко задан как `Knff@gmail.com` и не принимается из HTTP-запроса.
 3. Запустите `floorball-bot contact-api` на `127.0.0.1:8088` и оставьте worker запущенным.
-4. В Plesk/Nginx проксируйте только `/api/contact/` на loopback-сервис с сохранением `Origin` и
-   `X-Forwarded-For`. Не публикуйте порт 8088 напрямую.
-5. Проверьте `GET http://127.0.0.1:8088/healthz`, затем отправьте одну заявку с уникальным marker,
+4. На домашнем сервере создайте постоянный HTTPS-маршрут, например:
+   `tailscale funnel --bg --yes --set-path=/floorball-contact http://127.0.0.1:8088`.
+   В сборке сайта задайте `VITE_CONTACT_API_URL=https://<stable-host>/floorball-contact/api/contact/v1/requests`.
+   Plesk при этом отдаёт только статику и не должен соединяться с домашним IP напрямую.
+5. Проверьте `GET http://127.0.0.1:8088/healthz` и публичный HTTPS health URL, затем отправьте одну заявку с уникальным marker,
    найдите её UUID в `contact_requests` и подтвердите письмо в `Knff@gmail.com`.
 
 API возвращает только факт долговременного принятия (`202 accepted`), а не обещание доставки.
 Повтор неизменённой формы использует тот же UUID. Временная SMTP-ошибка повторяется не более пяти
 раз; окончательная ошибка остаётся видимой в БД и отправляется superadmin через Telegram outbox.
+Не включайте публичный маршрут до настройки SMTP: иначе заявка сохранится, но delivery job
+завершится как `mailer_not_configured`.
 
 ## AssemblyAI
 
@@ -33,11 +37,13 @@ API возвращает только факт долговременного п
 - Обычные тесты используют `FakeTranscriber` и не расходуют credits.
 - Для external smoke подготовьте короткие аудио с юридически допустимым содержимым и запустите отдельный тестовый сценарий; production-голоса не используйте как тестовые fixtures.
 
-## Codex CLI
+## Agy CLI
 
-Проверьте `codex --version` и авторизацию для отдельного Linux user. Wrapper запускает только `codex exec --ephemeral --sandbox read-only`, передаёт prompt по stdin, включает JSON Schema, ограничивает окружение/вывод/timeouts и не наследует Telegram/AssemblyAI secrets.
-
-Официальная документация: https://learn.chatgpt.com/docs/non-interactive-mode
+Проверьте `agy --version` и авторизацию для того же Linux user, от которого работает worker.
+Production wrapper использует модель `gemini-3.8-flash` с effort `high`, print mode,
+`--sandbox`, отключённые slash-команды и строгую JSON Schema. Процесс запускается прямым argv
+без shell; Telegram/AssemblyAI/SMTP secrets в дочернее окружение не наследуются. Значения можно
+переопределить через `AGY_CLI`, `AGY_MODEL`, `AGY_EFFORT` и `AGY_TIMEOUT_SECONDS`.
 
 ## GitHub deploy key
 

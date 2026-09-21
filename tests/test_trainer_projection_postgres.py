@@ -14,7 +14,7 @@ from floorball_bot.projection.apply import (
     apply_approved_trainer_draft,
     inspect_trainer_draft,
 )
-from floorball_bot.providers.codex import FakeExtractor
+from floorball_bot.providers.agy import FakeExtractor
 from floorball_bot.providers.transcription import FakeTranscriber
 from floorball_bot.queue import claim_job, enqueue_job
 from floorball_bot.worker import Worker

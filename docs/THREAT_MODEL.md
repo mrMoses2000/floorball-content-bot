@@ -2,7 +2,7 @@
 
 ## Активы
 
-- Telegram bot token, AssemblyAI key, Codex authentication and Git deploy key.
+- Telegram bot token, AssemblyAI key, Agy authentication and Git deploy key.
 - Телефоны, Telegram IDs, голоса, private contacts, consent evidence and internal notes.
 - Approved public content, revision hashes, publication confirmations and Git history.
 - Домашний компьютер, PostgreSQL and private media originals.
@@ -15,7 +15,7 @@
 | Forged contact | Require `contact.user_id == message.from.id`, normalize E.164 and bind once; rebind needs superadmin approval. |
 | IDOR/callback tampering | Opaque callback record + random nonce; re-check actor, role, city scope, draft status and expiry at mutation time. |
 | Duplicate/replayed update | Unique `processed_updates.update_id`; idempotency keys on jobs, outbox and publication. |
-| Prompt injection | User content is data-only JSON; read-only Codex sandbox, isolated cwd, secret-free env, schema validation and reviewer approval. |
+| Prompt injection | User content is a data-only JSON envelope passed without a shell; Agy sandbox, isolated cwd, secret-free env, schema validation and reviewer approval. |
 | Command injection | `create_subprocess_exec`/argv arrays only; no `shell=True`; paths resolved and allowlisted. |
 | Malicious media/polyglot/EXIF leak | Size limits, magic-byte decode, Pillow re-encode, decompression-bomb guard, quarantine, GPS/EXIF stripping, immutable original checksum. |
 | Private data in public JSON | Explicit public schemas/allowlist; consent gates; regression test rejects phones, Telegram IDs, raw paths, notes and consent documents. |

@@ -6,7 +6,13 @@ import pytest
 from aiogram.exceptions import TelegramNetworkError
 
 from floorball_bot.cli import supervise_bot_tasks
-from floorball_bot.telegram import TelegramIngress
+from floorball_bot.telegram import TelegramIngress, canonical_command
+
+
+def test_telegram_menu_aliases_use_botfather_compatible_commands():
+    assert canonical_command("/coach_form@floorball_site_agent_bot") == "/coach-form"
+    assert canonical_command("/photos_ready") == "/photos-ready"
+    assert canonical_command("/city_applications extra") == "/city-applications"
 
 
 class WaitingIngress:

@@ -13,10 +13,12 @@
 - Backend remote `github-account2:mrMoses2000/floorball-content-bot.git` настроен и проверен push.
   Для автоматического production publisher всё ещё нужна отдельная минимальная deploy key/branch
   policy вместо общего интерактивного SSH-доступа.
-- Почтовый этап отложен по решению владельца: добавить Gmail app password в `SMTP_PASSWORD`, задать `SMTP_USERNAME` и случайный
-  `CONTACT_API_SECRET`, не сохраняя значения в Git.
-- Установить и включить `floorball-contact-api.service`, проксировать `/api/contact/` в Plesk на
-  `127.0.0.1:8088`, затем проверить уникальную заявку и письмо в `Knff@gmail.com`.
+- Для почтового этапа добавить Gmail app password в `SMTP_PASSWORD`, задать
+  `SMTP_USERNAME=Knff@gmail.com` и случайный `CONTACT_API_SECRET`, не сохраняя значения в Git.
+- После появления SMTP credential включить `floorball-contact-api.service`, создать на домашнем
+  сервере постоянный HTTPS route `/floorball-contact` через Tailscale Funnel (или named
+  Cloudflare Tunnel), задать его полный URL в `VITE_CONTACT_API_URL`, пересобрать и опубликовать
+  `plesk-static`. Затем проверить уникальную заявку и письмо в `Knff@gmail.com`.
 - После подтверждённого production preview явно разрешить main push.
 - После готовности `plesk-static` вручную нажать «Развернуть сейчас» в Plesk.
 - Настроить и проверить off-device encrypted backup.

@@ -28,7 +28,7 @@ from floorball_bot.health import record_heartbeat
 from floorball_bot.media import MediaPipeline
 from floorball_bot.projection.apply import apply_approved_trainer_draft
 from floorball_bot.projection.news import apply_approved_news_draft
-from floorball_bot.providers.codex import StructuredExtractor
+from floorball_bot.providers.agy import StructuredExtractor
 from floorball_bot.providers.transcription import Transcriber
 from floorball_bot.publisher import GitPublisher
 from floorball_bot.queue import (

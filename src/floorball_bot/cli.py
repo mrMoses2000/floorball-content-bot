@@ -38,7 +38,7 @@ from floorball_bot.projection.apply import (
     apply_approved_trainer_draft,
     inspect_trainer_draft,
 )
-from floorball_bot.providers.codex import CodexExtractor
+from floorball_bot.providers.agy import AgyExtractor
 from floorball_bot.providers.transcription import (
     AssemblyAIBatchTranscriber,
     AssemblyAIWhisperStreamingTranscriber,
@@ -216,7 +216,12 @@ async def async_main(args: argparse.Namespace) -> None:
             )
             worker = Worker(
                 pool,
-                extractor=CodexExtractor(settings.codex_cli, settings.codex_timeout_seconds),
+                extractor=AgyExtractor(
+                    settings.agy_cli,
+                    settings.agy_timeout_seconds,
+                    model=settings.agy_model,
+                    effort=settings.agy_effort,
+                ),
                 transcriber=transcriber,
                 media_pipeline=MediaPipeline(
                     settings.media_root,

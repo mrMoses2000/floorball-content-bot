@@ -1,6 +1,6 @@
 # Floorball Content Bot
 
-Локальный approval-gated backend для управления контентом `floorball.kz` через Telegram. Приложение использует long polling, PostgreSQL queue/outbox, AssemblyAI, Codex CLI, строгие Pydantic-схемы и изолированный Git publisher.
+Локальный approval-gated backend для управления контентом `floorball.kz` через Telegram. Приложение использует long polling, PostgreSQL queue/outbox, AssemblyAI, Agy CLI, строгие Pydantic-схемы и изолированный Git publisher.
 
 ## Состояние
 
@@ -28,7 +28,7 @@ PUBLISH_ENABLED=false .venv/bin/python scripts/staging_gate.py
 ```
 
 Проверяется unit/contract и PostgreSQL integration suite, Ruff, `compileall`, `pip check`,
-Telegram Bot API, Codex CLI и AssemblyAI RU/KZ маршруты. Проверка качества распознавания
+Telegram Bot API, Agy CLI и AssemblyAI RU/KZ маршруты. Проверка качества распознавания
 всё ещё требует разрешённых речевых RU/KZ сэмплов.
 
 ## Быстрый старт
@@ -50,8 +50,8 @@ cp .env.example .env
 .venv/bin/floorball-bot worker
 ```
 
-После настройки `CONTACT_API_SECRET` (не менее 32 случайных байт), SMTP и reverse proxy
-`/api/contact` на `127.0.0.1:8088` запустите API формы связи:
+После настройки `CONTACT_API_SECRET` (не менее 32 случайных байт), SMTP и постоянного HTTPS
+туннеля на домашний `127.0.0.1:8088` запустите API формы связи:
 
 ```bash
 .venv/bin/floorball-bot contact-api
