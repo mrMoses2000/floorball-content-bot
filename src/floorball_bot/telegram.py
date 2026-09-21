@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import re
+from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
@@ -47,6 +48,13 @@ from floorball_bot.dialogue.evaluator import evaluate_gaps
 from floorball_bot.domain import Actor, DraftStatus, Role
 from floorball_bot.errors import AuthorizationError
 from floorball_bot.health import record_heartbeat
+from floorball_bot.official_documents import (
+    InvalidOfficialDocument,
+    format_official_document_status,
+    official_document_rows,
+    safe_original_filename,
+    store_official_pdf,
+)
 from floorball_bot.queue import accept_update, enqueue_job, enqueue_outbox, stable_idempotency_key
 from floorball_bot.workflow import add_revision, transition_draft
 
@@ -72,6 +80,9 @@ TELEGRAM_COMMANDS = (
     BotCommand(command="cancel", description="Отменить текущий диалог"),
     BotCommand(command="review", description="Открыть очередь проверки"),
     BotCommand(command="readiness", description="Проверить готовность контента"),
+    BotCommand(command="documents", description="Комплект официальных документов"),
+    BotCommand(command="document", description="Загрузить официальный PDF"),
+    BotCommand(command="document_cancel", description="Отменить загрузку документа"),
 )
 
 
@@ -90,6 +101,9 @@ ROLE_COMMANDS: dict[str, tuple[Role, ...]] = {
     "/city": (Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN),
     "/players": (Role.CITY_COACH, Role.REVIEWER, Role.SUPERADMIN),
     "/gallery": (Role.CITY_COACH, Role.MEDIA_EDITOR, Role.REVIEWER, Role.SUPERADMIN),
+    "/documents": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
+    "/document": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
+    "/document_cancel": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
 }
 
 COACH_CRITICAL_STEPS = (
@@ -1010,7 +1024,19 @@ class TelegramIngress:
             )
             return
 
-        selected_mode = self._selected_dialogue_mode(message.text or "", actor)
+        official_upload_session = await connection.fetchrow(
+            """
+            SELECT requirement_code, document_id, current_step
+            FROM official_document_upload_sessions
+            WHERE user_id=$1 AND status='active'
+            """,
+            actor.user_id,
+        )
+        selected_mode = (
+            None
+            if official_upload_session and not (message.text or "").startswith("/")
+            else self._selected_dialogue_mode(message.text or "", actor)
+        )
         if selected_mode is not None:
             await self._start_dialogue(
                 connection,
@@ -1032,7 +1058,11 @@ class TelegramIngress:
             actor.user_id,
             list(DIALOGUE_WORKFLOWS),
         )
-        if actor.roles == frozenset({Role.COACH_FORM}) and dialogue_session is None:
+        if (
+            actor.roles == frozenset({Role.COACH_FORM})
+            and dialogue_session is None
+            and official_upload_session is None
+        ):
             await self._reply(
                 connection,
                 update.update_id,
@@ -1045,7 +1075,7 @@ class TelegramIngress:
         needs_dialogue = bool(message.voice or message.audio) or bool(
             message.text and not message.text.startswith("/")
         )
-        if dialogue_session is None and needs_dialogue:
+        if dialogue_session is None and needs_dialogue and official_upload_session is None:
             await self._reply(
                 connection,
                 update.update_id,
@@ -1075,6 +1105,14 @@ class TelegramIngress:
             str(message.media_group_id or ""),
         )
         if message.text and message.text.startswith("/"):
+            if official_upload_session is not None and canonical_command(message.text) in {
+                "/skip",
+                "/no_expiry",
+            }:
+                await self._handle_official_document_input(
+                    connection, actor, update.update_id, message
+                )
+                return
             if dialogue_session and await self._handle_dialogue_command(
                 connection,
                 actor,
@@ -1086,6 +1124,10 @@ class TelegramIngress:
                 return
             await self._handle_command(
                 connection, actor, update.update_id, message.chat.id, message.text
+            )
+        elif official_upload_session is not None:
+            await self._handle_official_document_input(
+                connection, actor, update.update_id, message
             )
         elif message.voice or message.audio:
             preferred_language = await connection.fetchval(
@@ -1164,6 +1206,15 @@ class TelegramIngress:
                     else "Изображение принято в закрытое хранилище и отправлено на проверку."
                 ),
             )
+        elif message.document:
+            if actor.roles.intersection({Role.FEDERATION_EDITOR, Role.SUPERADMIN}):
+                response = (
+                    "Сначала выберите тип документа: /documents, затем "
+                    "/document <код>. Принимаются только PDF до 20 МБ."
+                )
+            else:
+                response = "Этот тип файла сейчас не поддерживается для вашей роли."
+            await self._reply(connection, update.update_id, message.chat.id, response)
         elif message.text:
             pending_transcript = await connection.fetchrow(
                 """
@@ -2191,6 +2242,423 @@ class TelegramIngress:
             raise ValueError("Telegram file exceeds maximum size")
         return path
 
+    async def _start_official_document_upload(
+        self,
+        connection: asyncpg.Connection,
+        actor: Actor,
+        update_id: int,
+        chat_id: int,
+        requirement_code: str,
+    ) -> None:
+        requirement = await connection.fetchrow(
+            """
+            SELECT code, title_ru FROM official_document_requirements
+            WHERE code=$1 AND active
+            """,
+            requirement_code,
+        )
+        if requirement is None:
+            await self._reply(
+                connection,
+                update_id,
+                chat_id,
+                "Неизвестный код документа. Откройте список командой /documents.",
+            )
+            return
+        previous = await connection.fetchrow(
+            """
+            SELECT requirement_code, document_id
+            FROM official_document_upload_sessions
+            WHERE user_id=$1 AND status='active'
+            FOR UPDATE
+            """,
+            actor.user_id,
+        )
+        if previous and previous["document_id"]:
+            rejected = await connection.fetchval(
+                """
+                UPDATE official_documents SET status='rejected', updated_at=now()
+                WHERE id=$1 AND status='metadata_pending'
+                RETURNING id
+                """,
+                previous["document_id"],
+            )
+            if rejected:
+                await connection.execute(
+                    """
+                    INSERT INTO official_document_events(
+                        document_id, requirement_code, actor_id, action, details
+                    ) VALUES ($1,$2,$3,'rejected',$4::jsonb)
+                    """,
+                    previous["document_id"],
+                    previous["requirement_code"],
+                    actor.user_id,
+                    {"reason": "upload_restarted"},
+                )
+        await connection.execute(
+            """
+            INSERT INTO official_document_upload_sessions(
+                user_id, requirement_code, document_id, current_step, status
+            ) VALUES ($1,$2,NULL,'awaiting_file','active')
+            ON CONFLICT (user_id) DO UPDATE SET
+                requirement_code=EXCLUDED.requirement_code,
+                document_id=NULL,
+                current_step='awaiting_file', status='active', updated_at=now()
+            """,
+            actor.user_id,
+            requirement_code,
+        )
+        await connection.execute(
+            """
+            INSERT INTO official_document_events(requirement_code, actor_id, action)
+            VALUES ($1,$2,'upload_started')
+            """,
+            requirement_code,
+            actor.user_id,
+        )
+        await self._reply(
+            connection,
+            update_id,
+            chat_id,
+            f"Загрузка: {requirement['title_ru']}. Отправьте PDF до 20 МБ. "
+            "Активное содержимое и вложения внутри PDF запрещены.",
+        )
+
+    async def _cancel_official_document_upload(
+        self,
+        connection: asyncpg.Connection,
+        actor: Actor,
+        update_id: int,
+        chat_id: int,
+    ) -> None:
+        session = await connection.fetchrow(
+            """
+            UPDATE official_document_upload_sessions
+            SET status='cancelled', current_step='cancelled', updated_at=now()
+            WHERE user_id=$1 AND status='active'
+            RETURNING requirement_code, document_id
+            """,
+            actor.user_id,
+        )
+        if session is None:
+            await self._reply(connection, update_id, chat_id, "Активной загрузки нет.")
+            return
+        if session["document_id"]:
+            await connection.execute(
+                """
+                UPDATE official_documents SET status='rejected', updated_at=now()
+                WHERE id=$1 AND status='metadata_pending'
+                """,
+                session["document_id"],
+            )
+            await connection.execute(
+                """
+                INSERT INTO official_document_events(
+                    document_id, requirement_code, actor_id, action,
+                    details
+                ) VALUES ($1,$2,$3,'rejected','{"reason":"upload_cancelled"}'::jsonb)
+                """,
+                session["document_id"],
+                session["requirement_code"],
+                actor.user_id,
+            )
+        await self._reply(connection, update_id, chat_id, "Загрузка документа отменена.")
+
+    async def _handle_official_document_input(
+        self,
+        connection: asyncpg.Connection,
+        actor: Actor,
+        update_id: int,
+        message,
+    ) -> None:
+        try:
+            require_roles(actor, Role.FEDERATION_EDITOR, Role.SUPERADMIN)
+        except AuthorizationError:
+            await self._reply(
+                connection, update_id, message.chat.id, "Недостаточно прав для загрузки."
+            )
+            return
+        session = await connection.fetchrow(
+            """
+            SELECT s.requirement_code, s.document_id, s.current_step,
+                   r.title_ru, r.title_kz
+            FROM official_document_upload_sessions s
+            JOIN official_document_requirements r ON r.code=s.requirement_code
+            WHERE s.user_id=$1 AND s.status='active'
+            FOR UPDATE OF s
+            """,
+            actor.user_id,
+        )
+        if session is None:
+            return
+        step = session["current_step"]
+        if step == "awaiting_file":
+            document = message.document
+            if document is None:
+                await self._reply(
+                    connection, update_id, message.chat.id, "Ожидаю PDF-файл или /document_cancel."
+                )
+                return
+            filename = safe_original_filename(document.file_name)
+            mime = (document.mime_type or "").casefold()
+            if not filename.casefold().endswith(".pdf") or mime not in {
+                "application/pdf",
+                "application/octet-stream",
+                "",
+            }:
+                await self._reply(
+                    connection, update_id, message.chat.id, "Разрешены только PDF-файлы."
+                )
+                return
+            incoming: Path | None = None
+            try:
+                incoming = await self._download_file(document, ".pdf")
+                stored = store_official_pdf(
+                    incoming,
+                    self.download_root.parent,
+                    actor.user_id,
+                    max_bytes=self.max_download_bytes,
+                )
+            except (InvalidOfficialDocument, ValueError) as exc:
+                await self._reply(connection, update_id, message.chat.id, str(exc))
+                return
+            finally:
+                if incoming is not None:
+                    incoming.unlink(missing_ok=True)
+            duplicate = await connection.fetchrow(
+                "SELECT id, original_path, status FROM official_documents WHERE sha256=$1",
+                stored.sha256,
+            )
+            if duplicate is not None:
+                if str(stored.original_path) != duplicate["original_path"]:
+                    stored.original_path.unlink(missing_ok=True)
+                await self._reply(
+                    connection,
+                    update_id,
+                    message.chat.id,
+                    f"Этот PDF уже зарегистрирован (статус: {duplicate['status']}). "
+                    "Отправьте другой файл или /document_cancel.",
+                )
+                return
+            document_id = await connection.fetchval(
+                """
+                INSERT INTO official_documents(
+                    requirement_code, title_ru, title_kz, original_filename,
+                    byte_size, sha256, original_path, uploaded_by
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                RETURNING id
+                """,
+                session["requirement_code"],
+                session["title_ru"],
+                session["title_kz"],
+                filename,
+                stored.byte_size,
+                stored.sha256,
+                str(stored.original_path),
+                actor.user_id,
+            )
+            await connection.execute(
+                """
+                UPDATE official_document_upload_sessions
+                SET document_id=$2, current_step='document_number', updated_at=now()
+                WHERE user_id=$1
+                """,
+                actor.user_id,
+                document_id,
+            )
+            await connection.execute(
+                """
+                INSERT INTO official_document_events(
+                    document_id, requirement_code, actor_id, action,
+                    details
+                ) VALUES ($1,$2,$3,'file_received',$4::jsonb)
+                """,
+                document_id,
+                session["requirement_code"],
+                actor.user_id,
+                {"sha256": stored.sha256, "byte_size": stored.byte_size},
+            )
+            await self._reply(
+                connection,
+                update_id,
+                message.chat.id,
+                "PDF принят. Укажите официальный номер документа или /skip.",
+            )
+            return
+
+        text = (message.text or message.caption or "").strip()
+        if not text:
+            await self._reply(
+                connection, update_id, message.chat.id, "На этом шаге ожидается текстовый ответ."
+            )
+            return
+        document_id = session["document_id"]
+        if step == "document_number":
+            value = "" if text.casefold() == "/skip" else text
+            if len(value) > 180:
+                await self._reply(connection, update_id, message.chat.id, "Номер слишком длинный.")
+                return
+            await connection.execute(
+                "UPDATE official_documents SET document_number=$2, updated_at=now() WHERE id=$1",
+                document_id,
+                value,
+            )
+            next_step = "issued_on"
+            prompt = "Укажите дату принятия в формате ГГГГ-ММ-ДД или /skip."
+        elif step == "issued_on":
+            try:
+                value_date = None if text.casefold() == "/skip" else date.fromisoformat(text)
+            except ValueError:
+                await self._reply(
+                    connection, update_id, message.chat.id, "Нужна дата в формате ГГГГ-ММ-ДД."
+                )
+                return
+            if value_date and value_date > date.today():
+                await self._reply(
+                    connection, update_id, message.chat.id, "Дата принятия не может быть в будущем."
+                )
+                return
+            await connection.execute(
+                "UPDATE official_documents SET issued_on=$2, updated_at=now() WHERE id=$1",
+                document_id,
+                value_date,
+            )
+            next_step = "valid_until"
+            prompt = "Укажите срок действия ГГГГ-ММ-ДД или /no_expiry."
+        elif step == "valid_until":
+            try:
+                value_date = (
+                    None
+                    if text.casefold() in {"/skip", "/no_expiry"}
+                    else date.fromisoformat(text)
+                )
+            except ValueError:
+                await self._reply(
+                    connection, update_id, message.chat.id, "Нужна дата в формате ГГГГ-ММ-ДД."
+                )
+                return
+            issued_on = await connection.fetchval(
+                "SELECT issued_on FROM official_documents WHERE id=$1", document_id
+            )
+            if value_date and issued_on and value_date < issued_on:
+                await self._reply(
+                    connection,
+                    update_id,
+                    message.chat.id,
+                    "Срок действия не может быть раньше даты принятия.",
+                )
+                return
+            await connection.execute(
+                "UPDATE official_documents SET valid_until=$2, updated_at=now() WHERE id=$1",
+                document_id,
+                value_date,
+            )
+            next_step = "publication_permission"
+            prompt = (
+                "Разрешено ли в будущем опубликовать документ на официальном сайте? "
+                "Ответьте «да» или «нет». Даже при «да» публикация не выполняется автоматически."
+            )
+        elif step == "publication_permission":
+            normalized = text.casefold()
+            yes = {"да", "иә", "yes"}
+            no = {"нет", "жоқ", "no"}
+            if normalized not in yes | no:
+                await self._reply(
+                    connection, update_id, message.chat.id, "Ответьте только «да» или «нет»."
+                )
+                return
+            publication_allowed = normalized in yes
+            await connection.execute(
+                """
+                UPDATE official_documents
+                SET publication_allowed=$2, status='received', updated_at=now()
+                WHERE id=$1
+                """,
+                document_id,
+                publication_allowed,
+            )
+            await connection.execute(
+                """
+                UPDATE official_document_upload_sessions
+                SET current_step='completed', status='completed', updated_at=now()
+                WHERE user_id=$1
+                """,
+                actor.user_id,
+            )
+            await connection.execute(
+                """
+                INSERT INTO official_document_events(
+                    document_id, requirement_code, actor_id, action, details
+                ) VALUES ($1,$2,$3,'received',$4::jsonb)
+                """,
+                document_id,
+                session["requirement_code"],
+                actor.user_id,
+                {"publication_allowed": publication_allowed},
+            )
+            recipients = await connection.fetch(
+                """
+                SELECT DISTINCT u.telegram_id
+                FROM users u JOIN user_roles ur ON ur.user_id=u.id
+                WHERE u.active AND u.telegram_id IS NOT NULL AND u.id<>$1
+                  AND ur.revoked_at IS NULL
+                  AND ur.role_name IN ('federation_editor','superadmin')
+                """,
+                actor.user_id,
+            )
+            for recipient in recipients:
+                await enqueue_outbox(
+                    connection,
+                    event_type="telegram_message",
+                    payload={
+                        "chat_id": recipient["telegram_id"],
+                        "text": (
+                            f"Получен официальный документ: {session['title_ru']}. "
+                            "Комплектность: /documents."
+                        ),
+                    },
+                    idempotency_key=stable_idempotency_key(
+                        "official-document-received", document_id, recipient["telegram_id"]
+                    ),
+                )
+            await self._reply(
+                connection,
+                update_id,
+                message.chat.id,
+                "Документ зарегистрирован и сохранён приватно. Он не опубликован на сайте. "
+                "Текущая комплектность: /documents.",
+            )
+            return
+        else:
+            await self._reply(
+                connection,
+                update_id,
+                message.chat.id,
+                "Состояние загрузки устарело. Начните заново.",
+            )
+            return
+        await connection.execute(
+            """
+            UPDATE official_document_upload_sessions
+            SET current_step=$2, updated_at=now() WHERE user_id=$1
+            """,
+            actor.user_id,
+            next_step,
+        )
+        await connection.execute(
+            """
+            INSERT INTO official_document_events(
+                document_id, requirement_code, actor_id, action,
+                details
+            ) VALUES ($1,$2,$3,'metadata_updated',$4::jsonb)
+            """,
+            document_id,
+            session["requirement_code"],
+            actor.user_id,
+            {"step": step},
+        )
+        await self._reply(connection, update_id, message.chat.id, prompt)
+
     async def _handle_command(
         self,
         connection: asyncpg.Connection,
@@ -2216,8 +2684,32 @@ class TelegramIngress:
             response = (
                 "Команды: /status /resume /cancel /profile /city /players /gallery "
                 "/news /photos_ready /submit /history. Проверяющим: /review. Администратору: "
-                "/city_applications /readiness /publish /users /revert."
+                "/city_applications /readiness /documents /document /publish /users /revert."
             )
+        elif command == "/documents":
+            response = format_official_document_status(
+                await official_document_rows(connection)
+            )
+        elif command == "/document":
+            parts = text.strip().split(maxsplit=1)
+            if len(parts) == 1 or not parts[1].strip():
+                response = format_official_document_status(
+                    await official_document_rows(connection)
+                )
+            else:
+                await self._start_official_document_upload(
+                    connection,
+                    actor,
+                    update_id,
+                    chat_id,
+                    parts[1].strip().casefold(),
+                )
+                return
+        elif command == "/document_cancel":
+            await self._cancel_official_document_upload(
+                connection, actor, update_id, chat_id
+            )
+            return
         elif command == "/readiness":
             await enqueue_job(
                 connection,

@@ -26,6 +26,7 @@ from floorball_bot.errors import (
 )
 from floorball_bot.health import record_heartbeat
 from floorball_bot.media import MediaPipeline
+from floorball_bot.official_documents import send_missing_document_reminders
 from floorball_bot.projection.apply import apply_approved_trainer_draft
 from floorball_bot.projection.news import apply_approved_news_draft
 from floorball_bot.providers.agy import StructuredExtractor
@@ -57,6 +58,7 @@ class Worker:
         contact_mailer: ContactMailer | None = None,
         lease_seconds: int = 300,
         readiness_interval_seconds: int = 60,
+        document_reminder_interval_seconds: int = 60 * 60,
     ) -> None:
         self.pool = pool
         self.extractor = extractor
@@ -68,7 +70,9 @@ class Worker:
         self.context_gateway = AgentContextGateway(pool)
         self.lease_seconds = lease_seconds
         self.readiness_interval_seconds = readiness_interval_seconds
+        self.document_reminder_interval_seconds = document_reminder_interval_seconds
         self._last_readiness_scan = 0.0
+        self._last_document_reminder_scan = -float(document_reminder_interval_seconds)
         self._last_publication_reconcile = 0.0
         self._last_heartbeat = 0.0
         self.worker_id = f"worker-{uuid4()}"
@@ -109,6 +113,20 @@ class Worker:
                         await self._scan_readiness()
                     except Exception:
                         logger.exception("readiness_scan_failed")
+                if (
+                    now - self._last_document_reminder_scan
+                    >= self.document_reminder_interval_seconds
+                ):
+                    self._last_document_reminder_scan = now
+                    try:
+                        sent = await send_missing_document_reminders(self.pool)
+                        if sent:
+                            logger.info(
+                                "official_document_reminders_enqueued",
+                                extra={"recipient_count": sent},
+                            )
+                    except Exception:
+                        logger.exception("official_document_reminder_scan_failed")
                 try:
                     await asyncio.wait_for(self.stop_event.wait(), timeout=1)
                 except TimeoutError:

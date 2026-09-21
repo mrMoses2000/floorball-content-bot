@@ -21,6 +21,7 @@ STAGING_TESTS = (
     "tests/test_publication_artifacts_postgres.py",
     "tests/test_publisher.py",
     "tests/test_telegram_e2e.py",
+    "tests/test_official_documents.py",
 )
 
 

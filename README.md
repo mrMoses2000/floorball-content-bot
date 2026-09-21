@@ -12,6 +12,7 @@ Telegram-уведомления, RU/KZ/EN desktop/mobile screenshot preview с m
 atomic Git push, durable contact
 requests с асинхронной SMTP-доставкой, approval-gated национальные и городские новости,
 Telegram-галереи новостей до десяти фотографий с manifest-bound публикацией,
+приватный реестр официальных PDF с контролем комплектности и напоминаниями руководству,
 автоматическое удаление публичных media derivatives после отзыва согласия,
 systemd units и backup scripts.
 
@@ -68,6 +69,12 @@ cp .env.example .env
 .venv/bin/floorball-bot grant-role --user UUID --role superadmin
 .venv/bin/floorball-bot scope-city --user UUID --city CITY_UUID
 ```
+
+Пользователи с ролью `federation_editor` или `superadmin` управляют официальными документами
+через `/documents` и `/document <код>`. Бот принимает PDF до 20 МБ, проверяет тип и опасное
+активное содержимое, фиксирует SHA-256, номер и сроки, хранит оригинал приватно и раз в неделю
+напоминает о недостающих или истекающих документах. Разрешение на публикацию записывается
+отдельно и само по себе никогда не публикует файл на сайте.
 
 Публичная заявка на новый город начинается по deep link
 `https://t.me/floorball_site_agent_bot?start=new_city`. После проверки superadmin команда

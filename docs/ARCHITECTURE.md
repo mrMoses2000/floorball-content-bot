@@ -85,6 +85,13 @@ never enter editor conversations or agent context. An explicit superadmin decisi
 a dry-run/apply initializer which locks and reserves the slug, creates an inactive city, then grants
 the newly created user only `city_coach` and one city scope.
 
+Official-document intake is an isolated management flow. Only `federation_editor` and
+`superadmin` can start it. The bot validates a bounded PDF, rejects active content and embedded
+files, stores a private content-addressed original, and records metadata plus an append-only event
+trail in PostgreSQL. The worker compares required document types with current received/verified
+versions and sends weekly idempotent reminders for missing or soon-expiring items. A recorded
+publication permission is metadata only; it never bypasses the normal publication approval gate.
+
 ## Interfaces
 
 - Configuration: environment only; `.env` is accepted for local development. Canonical secret names are `TG_API_KEY` and the user-provided `ASSEMBLI_AI`; alias `ASSEMBLYAI_API_KEY` is supported.

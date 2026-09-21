@@ -19,6 +19,7 @@
 | Prompt injection | User content is a data-only JSON envelope passed without a shell; Agy sandbox, isolated cwd, secret-free env, schema validation and reviewer approval. |
 | Command injection | `create_subprocess_exec`/argv arrays only; no `shell=True`; paths resolved and allowlisted. |
 | Malicious media/polyglot/EXIF leak | Size limits, magic-byte decode, Pillow re-encode, decompression-bomb guard, quarantine, GPS/EXIF stripping, immutable original checksum. |
+| Malicious or accidentally public official PDF | Management-only flow, 20 MB bound, PDF header/EOF and active-content checks, private mode-0600 content-addressed storage, SHA-256/event audit; publication permission does not publish. |
 | Private data in public JSON | Explicit public schemas/allowlist; consent gates; regression test rejects phones, Telegram IDs, raw paths, notes and consent documents. |
 | Stolen secrets from logs/Git | Secret types, masked logs, env files mode 600, `.env` ignored, secret scan before release. |
 | Queue loss/crash | PostgreSQL transaction, leased claim, attempts/dead-letter, stale-job recovery and outbox. |

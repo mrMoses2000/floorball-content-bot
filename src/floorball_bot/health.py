@@ -64,6 +64,37 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
         FROM drafts
         """
     )
+    documents = await pool.fetchrow(
+        """
+        SELECT
+            count(*) FILTER (WHERE r.active AND r.required)::integer AS required,
+            count(*) FILTER (
+                WHERE r.active AND EXISTS (
+                    SELECT 1 FROM official_documents d
+                    WHERE d.requirement_code=r.code
+                      AND d.status IN ('received','verified')
+                      AND (d.valid_until IS NULL OR d.valid_until >= CURRENT_DATE)
+                )
+            )::integer AS current,
+            count(*) FILTER (
+                WHERE r.active AND r.required AND NOT EXISTS (
+                    SELECT 1 FROM official_documents d
+                    WHERE d.requirement_code=r.code
+                      AND d.status IN ('received','verified')
+                      AND (d.valid_until IS NULL OR d.valid_until >= CURRENT_DATE)
+                )
+            )::integer AS missing,
+            count(*) FILTER (
+                WHERE r.active AND EXISTS (
+                    SELECT 1 FROM official_documents d
+                    WHERE d.requirement_code=r.code
+                      AND d.status IN ('received','verified')
+                      AND d.valid_until BETWEEN CURRENT_DATE AND CURRENT_DATE + 30
+                )
+            )::integer AS expiring_30d
+        FROM official_document_requirements r
+        """
+    )
     heartbeat_rows = await pool.fetch(
         """
         SELECT component, observed_at,
@@ -122,4 +153,5 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
                 else None
             ),
         },
+        "official_documents": dict(documents),
     }

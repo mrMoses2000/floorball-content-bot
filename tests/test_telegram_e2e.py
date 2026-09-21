@@ -1,12 +1,13 @@
 import asyncio
 import os
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from aiogram.types import CallbackQuery, Chat, Contact, Message, Update, User
+from aiogram.types import CallbackQuery, Chat, Contact, Document, Message, Update, User
 
 from floorball_bot.db import create_pool, run_migrations
 from floorball_bot.dialogue.repository import DialogueSpecRepository
@@ -19,6 +20,17 @@ pytestmark = pytest.mark.postgres
 
 class FakeBot:
     pass
+
+
+class DocumentDownloadBot:
+    def __init__(self, source: Path):
+        self.source = source
+
+    async def get_file(self, file_id):
+        return SimpleNamespace(file_path=file_id)
+
+    async def download_file(self, file_path, *, destination):
+        shutil.copyfile(self.source, destination)
 
 
 class MediaGroupBot:
@@ -137,6 +149,25 @@ def contact_update(
                 phone_number=phone,
                 first_name="Applicant",
                 user_id=contact_user_id,
+            ),
+        ),
+    )
+
+
+def document_update(update_id: int, sender_id: int, *, filename: str = "rules.pdf") -> Update:
+    return Update(
+        update_id=update_id,
+        message=Message(
+            message_id=update_id,
+            date=datetime.now(UTC),
+            chat=Chat(id=sender_id, type="private"),
+            from_user=User(id=sender_id, is_bot=False, first_name="Management"),
+            document=Document(
+                file_id=f"document-{update_id}",
+                file_unique_id=f"unique-{update_id}",
+                file_name=filename,
+                mime_type="application/pdf",
+                file_size=64,
             ),
         ),
     )
@@ -396,6 +427,46 @@ async def test_foreign_contact_is_rejected(pg_pool):
     assert "не совпал" in payload["text"]
     bound_id = await pg_pool.fetchval("SELECT telegram_id FROM users WHERE phone_e164=$1", phone)
     assert bound_id is None
+
+
+@pytest.mark.asyncio
+async def test_bound_telegram_identity_cannot_claim_another_account(pg_pool):
+    sender_id = 555022
+    current_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164,display_name,telegram_id,telegram_bound_at)
+        VALUES ('+77011234561','Current account',$1,now()) RETURNING id
+        """,
+        sender_id,
+    )
+    target_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164,display_name)
+        VALUES ('+77011234562','Other account') RETURNING id
+        """
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id,role_name) VALUES ($1,'city_coach')", current_id
+    )
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    assert await ingress.accept(
+        contact_update(
+            1_022,
+            sender_id,
+            contact_user_id=sender_id,
+            phone="+77011234562",
+        )
+    )
+    assert (
+        await pg_pool.fetchval("SELECT telegram_id FROM users WHERE id=$1", current_id)
+        == sender_id
+    )
+    assert await pg_pool.fetchval("SELECT telegram_id FROM users WHERE id=$1", target_id) is None
+    response = await pg_pool.fetchval(
+        "SELECT payload->>'text' FROM outbox_events ORDER BY created_at DESC LIMIT 1"
+    )
+    assert "не совпал" in response
 
 
 @pytest.mark.asyncio
@@ -806,3 +877,81 @@ async def test_news_author_confirms_telegram_gallery_before_submitting_bound_rev
         "height": 800,
         "caption": "Фото турнира",
     }]
+
+
+@pytest.mark.asyncio
+async def test_management_uploads_official_pdf_through_guided_flow(pg_pool, tmp_path):
+    sender_id = 900041
+    user_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164,display_name,telegram_id,telegram_bound_at)
+        VALUES ('+77010000041','Management',$1,now()) RETURNING id
+        """,
+        sender_id,
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id,role_name) VALUES ($1,'federation_editor')",
+        user_id,
+    )
+    source = tmp_path / "charter.pdf"
+    source.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n")
+    ingress = TelegramIngress(
+        DocumentDownloadBot(source),
+        pg_pool,
+        download_root=tmp_path / "media" / "incoming",
+    )
+
+    assert await ingress.accept(message_update(9_300, sender_id, "/documents"))
+    status_text = await pg_pool.fetchval(
+        "SELECT payload->>'text' FROM outbox_events ORDER BY created_at DESC LIMIT 1"
+    )
+    assert "Устав федерации" in status_text
+    assert "нет, обязательный" in status_text
+
+    assert await ingress.accept(
+        message_update(9_301, sender_id, "/document federation_charter")
+    )
+    assert await ingress.accept(document_update(9_302, sender_id, filename="charter.pdf"))
+    assert await ingress.accept(message_update(9_303, sender_id, "/skip"))
+    assert await ingress.accept(message_update(9_304, sender_id, "2026-01-15"))
+    assert await ingress.accept(message_update(9_305, sender_id, "/no_expiry"))
+    assert await ingress.accept(message_update(9_306, sender_id, "да"))
+
+    document = await pg_pool.fetchrow(
+        """
+        SELECT status, publication_allowed, issued_on, original_path, sha256
+        FROM official_documents WHERE requirement_code='federation_charter'
+        """
+    )
+    assert document["status"] == "received"
+    assert document["publication_allowed"] is True
+    assert document["issued_on"].isoformat() == "2026-01-15"
+    assert Path(document["original_path"]).exists()
+    assert len(document["sha256"]) == 64
+    assert await pg_pool.fetchval(
+        "SELECT status FROM official_document_upload_sessions WHERE user_id=$1", user_id
+    ) == "completed"
+    assert await pg_pool.fetchval(
+        "SELECT count(*) FROM official_document_events WHERE document_id IS NOT NULL"
+    ) == 5
+
+
+@pytest.mark.asyncio
+async def test_official_document_commands_reject_unprivileged_user(pg_pool):
+    sender_id = 900042
+    user_id = await pg_pool.fetchval(
+        """
+        INSERT INTO users(phone_e164,display_name,telegram_id,telegram_bound_at)
+        VALUES ('+77010000042','Coach',$1,now()) RETURNING id
+        """,
+        sender_id,
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id,role_name) VALUES ($1,'city_coach')", user_id
+    )
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    assert await ingress.accept(message_update(9_310, sender_id, "/documents"))
+    assert await pg_pool.fetchval(
+        "SELECT payload->>'text' FROM outbox_events ORDER BY created_at DESC LIMIT 1"
+    ) == "Недостаточно прав для этой команды."
