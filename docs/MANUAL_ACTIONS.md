@@ -8,6 +8,8 @@
 - Утвердить юридический consent text и retention policy.
 - Перенести секреты из локального `.env` в защищённый production EnvironmentFile.
 - Telegram `getMe/getWebhookInfo` read-only smoke выполнен: бот доступен, webhook не настроен, очередь updates пуста. Перед запуском production polling повторить проверку.
+- Для рассылки тренерам использовать `https://t.me/floorball_site_agent_bot?start=coach`;
+  self-contact onboarding выдаёт только анкетную роль `coach_form`.
 - AssemblyAI RU batch и KZ streaming connectivity smoke выполнен на синтетическом аудио.
   Для проверки качества распознавания всё ещё нужны короткие законные RU/KZ речевые сэмплы.
 - Backend remote `github-account2:mrMoses2000/floorball-content-bot.git` настроен и проверен push.

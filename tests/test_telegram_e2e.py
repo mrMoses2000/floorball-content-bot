@@ -89,6 +89,7 @@ async def pg_pool():
         """
         TRUNCATE users, cities, jobs, outbox_events, processed_updates,
             telegram_start_intents, city_applicant_contact_attempts,
+            coach_onboarding_contact_attempts,
             city_applications, city_applicants
         RESTART IDENTITY CASCADE
         """
@@ -139,6 +140,66 @@ def contact_update(
             ),
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_public_coach_deep_link_self_enrols_questionnaire_only_role(pg_pool):
+    sender_id = uuid4().int % 1_000_000_000
+    ingress = TelegramIngress(FakeBot(), pg_pool)
+
+    assert await ingress.accept(message_update(7_900, sender_id, "/start coach"))
+    intent = await pg_pool.fetchrow(
+        """
+        SELECT start_parameter, status FROM telegram_start_intents
+        WHERE telegram_id=$1
+        """,
+        sender_id,
+    )
+    assert dict(intent) == {"start_parameter": "coach", "status": "pending"}
+    assert await pg_pool.fetchval("SELECT count(*) FROM users") == 0
+
+    assert await ingress.accept(
+        contact_update(
+            7_901,
+            sender_id,
+            contact_user_id=sender_id + 1,
+            phone="+77012345679",
+        )
+    )
+    assert await pg_pool.fetchval("SELECT count(*) FROM users") == 0
+
+    assert await ingress.accept(
+        contact_update(
+            7_902,
+            sender_id,
+            contact_user_id=sender_id,
+            phone="+77012345679",
+        )
+    )
+    user = await pg_pool.fetchrow(
+        "SELECT id, telegram_id, active FROM users WHERE telegram_id=$1", sender_id
+    )
+    assert user["active"] is True
+    roles = await pg_pool.fetch(
+        "SELECT role_name FROM user_roles WHERE user_id=$1 AND revoked_at IS NULL",
+        user["id"],
+    )
+    assert [row["role_name"] for row in roles] == ["coach_form"]
+    assert await pg_pool.fetchval(
+        "SELECT count(*) FROM user_city_scopes WHERE user_id=$1", user["id"]
+    ) == 0
+    session = await pg_pool.fetchrow(
+        "SELECT workflow, status FROM conversation_sessions WHERE user_id=$1",
+        user["id"],
+    )
+    assert dict(session) == {"workflow": "trainer", "status": "active"}
+    assert await pg_pool.fetchval(
+        """
+        SELECT status FROM telegram_start_intents
+        WHERE telegram_id=$1 AND start_parameter='coach'
+        """,
+        sender_id,
+    ) == "contact_verified"
 
 
 @pytest.mark.asyncio

@@ -116,15 +116,22 @@ def parse_city_proposal_answer(field: FieldSpec, raw: str) -> Any:
 
 
 async def record_start_intent(
-    connection: asyncpg.Connection, *, telegram_id: int, update_id: int
+    connection: asyncpg.Connection,
+    *,
+    telegram_id: int,
+    update_id: int,
+    start_parameter: str = "new_city",
 ) -> None:
+    if start_parameter not in {"new_city", "coach"}:
+        raise ValueError("unsupported Telegram start parameter")
     await connection.execute(
         """
         INSERT INTO telegram_start_intents(telegram_id, update_id, start_parameter)
-        VALUES ($1,$2,'new_city') ON CONFLICT (update_id) DO NOTHING
+        VALUES ($1,$2,$3) ON CONFLICT (update_id) DO NOTHING
         """,
         telegram_id,
         update_id,
+        start_parameter,
     )
 
 
@@ -139,7 +146,8 @@ async def bind_city_applicant(
     intent = await connection.fetchrow(
         """
         SELECT id FROM telegram_start_intents
-        WHERE telegram_id=$1 AND status='pending' AND expires_at>now()
+        WHERE telegram_id=$1 AND start_parameter='new_city'
+          AND status='pending' AND expires_at>now()
         ORDER BY created_at DESC LIMIT 1 FOR UPDATE
         """,
         sender_id,

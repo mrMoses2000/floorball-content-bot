@@ -11,7 +11,8 @@
 
 | Boundary/threat | Control |
 |---|---|
-| Unknown Telegram user | Pre-provisioned active account; verified self-contact; role cannot be self-selected. |
+| Unknown Telegram user | Privileged roles require a pre-provisioned active account and verified self-contact. The coach deep link can grant only `coach_form`; role cannot be selected by request data. |
+| Public trainer onboarding | Deep link plus Telegram self-contact; rate-limited attempts; no city scope, review or publish permission. |
 | Forged contact | Require `contact.user_id == message.from.id`, normalize E.164 and bind once; rebind needs superadmin approval. |
 | IDOR/callback tampering | Opaque callback record + random nonce; re-check actor, role, city scope, draft status and expiry at mutation time. |
 | Duplicate/replayed update | Unique `processed_updates.update_id`; idempotency keys on jobs, outbox and publication. |

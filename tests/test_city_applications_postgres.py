@@ -51,7 +51,8 @@ async def pg_pool():
         await pool.close()
         raise RuntimeError(f"refusing destructive fixture database: {database}")
     await pool.execute(
-        "TRUNCATE city_applicant_contact_attempts, telegram_start_intents, "
+        "TRUNCATE coach_onboarding_contact_attempts, city_applicant_contact_attempts, "
+        "telegram_start_intents, "
         "city_applications, city_applicants, users, cities RESTART IDENTITY CASCADE"
     )
     yield pool

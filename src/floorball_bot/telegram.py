@@ -25,6 +25,7 @@ from aiogram.types import (
 from floorball_bot.auth import (
     bind_self_contact,
     get_actor_by_telegram_id,
+    onboard_public_coach,
     require_active,
     require_roles,
 )
@@ -777,16 +778,15 @@ class TelegramIngress:
         sender_id = message.from_user.id
         actor = await get_actor_by_telegram_id(connection, sender_id)
         if message.contact:
-            pending_city_intent = await connection.fetchval(
+            pending_intent = await connection.fetchrow(
                 """
-                SELECT EXISTS(
-                    SELECT 1 FROM telegram_start_intents
-                    WHERE telegram_id=$1 AND status='pending' AND expires_at>now()
-                )
+                SELECT id, start_parameter FROM telegram_start_intents
+                WHERE telegram_id=$1 AND status='pending' AND expires_at>now()
+                ORDER BY created_at DESC LIMIT 1 FOR UPDATE
                 """,
                 sender_id,
             )
-            if pending_city_intent and actor is None:
+            if pending_intent and pending_intent["start_parameter"] == "new_city" and actor is None:
                 try:
                     applicant_id = await bind_city_applicant(
                         connection,
@@ -817,6 +817,54 @@ class TelegramIngress:
                     )
                 await self._reply(connection, update.update_id, message.chat.id, text)
                 return
+            if pending_intent and pending_intent["start_parameter"] == "coach" and actor is None:
+                try:
+                    actor = await onboard_public_coach(
+                        connection,
+                        sender_id=sender_id,
+                        contact_user_id=message.contact.user_id,
+                        raw_phone=message.contact.phone_number,
+                        display_name=" ".join(
+                            part
+                            for part in (
+                                message.contact.first_name,
+                                message.contact.last_name,
+                            )
+                            if part
+                        ),
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE telegram_start_intents
+                        SET status='contact_verified', updated_at=now()
+                        WHERE id=$1
+                        """,
+                        pending_intent["id"],
+                    )
+                except (AuthorizationError, ValueError):
+                    await self._reply(
+                        connection,
+                        update.update_id,
+                        message.chat.id,
+                        "Не удалось подтвердить контакт тренера. Отправьте только собственный "
+                        "номер кнопкой; доступ ограничен пятью попытками в час.",
+                    )
+                    return
+                await self._reply(
+                    connection,
+                    update.update_id,
+                    message.chat.id,
+                    "Контакт подтверждён. Создан доступ только к анкете тренера; "
+                    "редактирование и публикация сайта недоступны.",
+                )
+                await self._start_dialogue(
+                    connection,
+                    actor,
+                    DialogueMode.TRAINER,
+                    update.update_id,
+                    message.chat.id,
+                )
+                return
             try:
                 actor = await bind_self_contact(
                     connection,
@@ -832,6 +880,38 @@ class TelegramIngress:
         if message.text and message.text.startswith("/start"):
             start_parts = message.text.strip().split(maxsplit=1)
             start_parameter = start_parts[1].strip() if len(start_parts) == 2 else ""
+            if start_parameter in {"coach", "trainer"}:
+                if actor and actor.active:
+                    await self._start_dialogue(
+                        connection,
+                        actor,
+                        DialogueMode.TRAINER,
+                        update.update_id,
+                        message.chat.id,
+                    )
+                    return
+                await record_start_intent(
+                    connection,
+                    telegram_id=sender_id,
+                    update_id=update.update_id,
+                    start_parameter="coach",
+                )
+                keyboard = ReplyKeyboardMarkup(
+                    keyboard=[
+                        [KeyboardButton(text="Поделиться своим контактом", request_contact=True)]
+                    ],
+                    resize_keyboard=True,
+                    one_time_keyboard=True,
+                )
+                await self._reply(
+                    connection,
+                    update.update_id,
+                    message.chat.id,
+                    "Чтобы открыть анкету тренера, подтвердите собственный номер кнопкой. "
+                    "Будет создан только доступ к анкете — без прав редактирования сайта.",
+                    reply_markup=keyboard.model_dump(exclude_none=True),
+                )
+                return
             if start_parameter == "new_city":
                 await record_start_intent(
                     connection, telegram_id=sender_id, update_id=update.update_id

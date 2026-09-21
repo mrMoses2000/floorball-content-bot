@@ -5,7 +5,10 @@
 1. Создайте отдельного бота через BotFather и отключите privacy mode только если это действительно нужно для групп.
 2. Поместите токен в защищённый `TG_API_KEY`.
 3. Запустите `floorball-bot bot`. Процесс вызывает `getWebhookInfo`; webhook удаляется только у этого токена и с `drop_pending_updates=false`.
-4. Пользователь должен быть заранее создан CLI-командой. `/start` выдаёт кнопку `request_contact`; текстовый телефон не авторизует.
+4. Привилегированный пользователь должен быть заранее создан CLI-командой. `/start` выдаёт
+   кнопку `request_contact`; текстовый телефон не авторизует.
+5. Публичная ссылка `https://t.me/floorball_site_agent_bot?start=coach` разрешает self-contact
+   onboarding только в роль `coach_form`. Она не выдаёт city scope, review или publish права.
 
 Long polling не требует домена, HTTPS, Cloudflare Tunnel, port forwarding или публичного входящего порта.
 
