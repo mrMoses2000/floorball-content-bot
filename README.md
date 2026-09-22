@@ -13,6 +13,8 @@ atomic Git push, durable contact
 requests с асинхронной SMTP-доставкой, approval-gated национальные и городские новости,
 Telegram-галереи новостей до десяти фотографий с manifest-bound публикацией,
 приватный реестр официальных PDF с контролем комплектности и напоминаниями руководству,
+Telegram Mini App с проверкой подписи `initData`, статусами доступа, прогрессом анкет и
+безопасным редактированием простых полей,
 автоматическое удаление публичных media derivatives после отзыва согласия,
 systemd units и backup scripts.
 
@@ -42,6 +44,7 @@ cp .env.example .env
 .venv/bin/floorball-bot migrate
 .venv/bin/pytest -q
 .venv/bin/ruff check src tests
+cd miniapp && npm ci && npm run lint && npm test && npm run build
 ```
 
 Запуск основных процессов в отдельных терминалах:
@@ -49,7 +52,14 @@ cp .env.example .env
 ```bash
 .venv/bin/floorball-bot bot
 .venv/bin/floorball-bot worker
+.venv/bin/floorball-bot miniapp-api
 ```
+
+Для Mini App задайте стабильный `MINI_APP_PUBLIC_URL` с HTTPS и завершающим `/`. Сервис слушает
+только loopback `MINI_APP_HOST:MINI_APP_PORT`; внешний доступ публикуется reverse proxy или
+туннелем. После перезапуска `bot` адрес автоматически устанавливается как Telegram menu button.
+Чат и Mini App используют одну память диалогов: сложные списки, файлы и согласия бот намеренно
+оставляет в чате, а отправленные анкеты в кабинете доступны только для чтения.
 
 После настройки `CONTACT_API_SECRET` (не менее 32 случайных байт), SMTP и постоянного HTTPS
 туннеля на домашний `127.0.0.1:8088` запустите API формы связи:

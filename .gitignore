@@ -1,6 +1,7 @@
 .env
 .env.staging
 .venv/
+node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,6 +10,9 @@ __pycache__/
 htmlcov/
 build/
 dist/
+*.tsbuildinfo
+miniapp/vite.config.js
+miniapp/vite.config.d.ts
 *.egg-info/
 var/
 publication-previews/

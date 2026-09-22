@@ -19,6 +19,7 @@ from floorball_bot.dialogue.patches import (
     apply_dialogue_patch,
     canonical_context,
 )
+from floorball_bot.dialogue.presentation import friendly_question, hidden_from_user
 from floorball_bot.errors import (
     PermanentProviderError,
     RetryableProviderError,
@@ -26,6 +27,7 @@ from floorball_bot.errors import (
 )
 from floorball_bot.health import record_heartbeat
 from floorball_bot.media import MediaPipeline
+from floorball_bot.news_defaults import apply_news_defaults
 from floorball_bot.official_documents import send_missing_document_reminders
 from floorball_bot.projection.apply import apply_approved_trainer_draft
 from floorball_bot.projection.news import apply_approved_news_draft
@@ -732,11 +734,12 @@ class Worker:
                 """,
                 chat_id,
             )
+            transcript = result.text.strip()
             if message_id:
                 await connection.execute(
                     """
                     UPDATE messages SET normalized_text=$2, source_language=$3,
-                        provider_metadata=$4::jsonb, transcript_confirmed=FALSE
+                        provider_metadata=$4::jsonb, transcript_confirmed=$5
                     WHERE id=$1
                     """,
                     message_id,
@@ -749,19 +752,47 @@ class Worker:
                         "duration_seconds": result.duration_seconds,
                         "billing": result.billing_metadata or {},
                     },
+                    bool(transcript),
                 )
-            await enqueue_outbox(
+            if not transcript:
+                await enqueue_outbox(
+                    connection,
+                    event_type="telegram_message",
+                    payload={
+                        "chat_id": chat_id,
+                        "text": (
+                            "Не удалось разобрать голосовое сообщение. "
+                            "Запишите ещё раз или напишите текстом."
+                        ),
+                    },
+                    idempotency_key=stable_idempotency_key("transcript-empty", job.id),
+                )
+                return
+            if not job.payload.get("session_id") or not job.payload.get("mode"):
+                await enqueue_outbox(
+                    connection,
+                    event_type="telegram_message",
+                    payload={
+                        "chat_id": chat_id,
+                        "text": (
+                            "Сначала выберите анкету, к которой нужно добавить "
+                            "голосовое сообщение."
+                        ),
+                    },
+                    idempotency_key=stable_idempotency_key("transcript-no-session", job.id),
+                )
+                return
+            await enqueue_job(
                 connection,
-                event_type="telegram_message",
+                kind="extract",
                 payload={
+                    "text": transcript,
                     "chat_id": chat_id,
-                    "text": (
-                        f"Распознанный текст:\n\n{result.text}\n\n"
-                        "Подтвердите текст или пришлите исправление. "
-                        "До подтверждения он не попадёт в extractor."
-                    ),
+                    "user_id": job.payload.get("user_id"),
+                    "session_id": job.payload["session_id"],
+                    "mode": job.payload["mode"],
                 },
-                idempotency_key=stable_idempotency_key("transcript-preview", job.id),
+                idempotency_key=stable_idempotency_key("voice-extract", job.id),
             )
 
     async def _extract(self, job: ClaimedJob) -> None:
@@ -859,25 +890,39 @@ class Worker:
             expected_spec_sha256=loaded.sha256,
             expected_context_sha256=context_sha256,
         )
+        if mode == DialogueMode.NEWS:
+            merged = apply_news_defaults(merged)
         gaps = evaluate_gaps(loaded.spec, merged)
-        critical = len(gaps.required_to_start) + len(gaps.required_for_submit)
-        later = len(gaps.required_for_publish) + len(gaps.recommended)
-        lines = [
-            f"Заполнено разделов: {len(merged)}.",
-            "Критично до отправки: " + (str(critical) if critical else "всё заполнено"),
-            "Можно дозаполнить позже: " + (str(later) if later else "нет"),
-        ]
+        changed = merged != fields
+        lines = ["Сохранил изменения." if changed else "Мне нужно небольшое уточнение."]
         ordered = (
             *gaps.required_to_start,
             *gaps.required_for_submit,
             *gaps.required_for_publish,
             *gaps.recommended,
         )
-        if ordered:
-            question = ordered[0].question.kz if language == "kz" else ordered[0].question.ru
+        suggested = next((item.strip() for item in result.next_questions if item.strip()), "")
+        if suggested and mode != DialogueMode.NEWS:
+            question = suggested
             lines.append(question)
+        elif ordered:
+            visible_gap = next(
+                (gap for gap in ordered if not hidden_from_user(mode, gap.field_id)), None
+            )
+            question = (
+                friendly_question(mode, visible_gap.field_id, visible_gap.question, language)
+                if visible_gap
+                else ""
+            )
+            if question:
+                lines.append(question)
+        elif suggested:
+            lines.append(suggested)
         if gaps.can_submit:
-            lines.append("Черновик можно отправить командой /submit.")
+            lines = [
+                "Всё обязательное заполнено. Проверьте данные в личном кабинете "
+                "или отправьте анкету командой /submit."
+            ]
         async with transaction(self.pool) as connection:
             await connection.execute(
                 """

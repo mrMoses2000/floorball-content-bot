@@ -1,0 +1,23 @@
+[Unit]
+Description=Floorball Telegram Mini App
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/moses/tg_bot_floorball_site
+EnvironmentFile=/home/moses/tg_bot_floorball_site/.env
+ExecStart=/home/moses/tg_bot_floorball_site/.venv/bin/floorball-bot miniapp-api
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=default.target

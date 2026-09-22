@@ -13,17 +13,18 @@
 
 После всех тестов оператор создаёт непривилегированного user/group, каталоги с минимальными
 правами, копирует units из `deploy/systemd`, выполняет `systemd-analyze verify`, затем
-`daemon-reload` и включает bot/worker/contact-api/backup timer. Эти действия не выполнены
+`daemon-reload` и включает bot/worker/contact-api/miniapp/backup timer. Эти действия не выполнены
 автоматически.
 
 Проверки:
 
 ```bash
-systemctl status floorball-bot floorball-worker floorball-contact-api
+systemctl status floorball-bot floorball-worker floorball-contact-api floorball-miniapp
 systemctl list-timers floorball-backup.timer
 journalctl -u floorball-bot -u floorball-worker --since today
 sudo -u floorballbot /opt/floorball-content-bot/.venv/bin/floorball-bot health
 curl --fail --silent http://127.0.0.1:8088/healthz
+curl --fail --silent http://127.0.0.1:8092/healthz
 ```
 
 ## Текущий локальный запуск
@@ -32,9 +33,11 @@ curl --fail --silent http://127.0.0.1:8088/healthz
 
 ```bash
 systemctl --user status floorball-content-bot.service floorball-content-worker.service \
-  floorball-content-backup.timer floorball-content-health.timer
-systemctl --user restart floorball-content-bot.service floorball-content-worker.service
-journalctl --user -u floorball-content-bot.service -u floorball-content-worker.service --since today
+  floorball-content-miniapp.service floorball-content-backup.timer floorball-content-health.timer
+systemctl --user restart floorball-content-bot.service floorball-content-worker.service \
+  floorball-content-miniapp.service
+journalctl --user -u floorball-content-bot.service -u floorball-content-worker.service \
+  -u floorball-content-miniapp.service --since today
 ```
 
 Для пользователя `moses` включён linger, поэтому units запускаются после перезагрузки без
@@ -51,6 +54,17 @@ cd /home/moses/tg_bot_floorball_site
 Polling и worker записывают heartbeat в PostgreSQL. Health считается успешным только при
 свежих heartbeat, свежем backup, отсутствии dead jobs/outbox и заполненном диске менее 90%.
 Health timer запускает эту проверку каждые пять минут.
+
+Mini App публикуется по стабильному HTTPS URL с завершающим `/`. Для текущего домашнего сервера:
+
+```bash
+tailscale funnel --bg --set-path /floorball-miniapp http://127.0.0.1:8092
+tailscale funnel status
+```
+
+После изменения URL перезапустите `floorball-content-bot.service`: он синхронизирует Telegram
+menu button. API принимает только подписанный Telegram `initData`; прямой запрос к
+`/api/miniapp/v1/bootstrap` без заголовка `Authorization: tma ...` должен вернуть `401`.
 
 ## Backup/restore
 

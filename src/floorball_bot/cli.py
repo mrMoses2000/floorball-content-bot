@@ -34,6 +34,7 @@ from floorball_bot.importers import (
 from floorball_bot.logging import configure_logging
 from floorball_bot.media import MediaPipeline
 from floorball_bot.media_consent import reconcile_withdrawn_media
+from floorball_bot.miniapp_api import create_miniapp_app
 from floorball_bot.projection.apply import (
     apply_approved_trainer_draft,
     inspect_trainer_draft,
@@ -91,6 +92,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("bot")
     commands.add_parser("worker")
     commands.add_parser("contact-api")
+    commands.add_parser("miniapp-api")
     commands.add_parser("health")
     commands.add_parser("media-consent-reconcile")
     context = commands.add_parser("agent-context")
@@ -195,6 +197,7 @@ async def async_main(args: argparse.Namespace) -> None:
                 poll_timeout=settings.poll_timeout_seconds,
                 download_root=settings.media_root / "incoming",
                 max_download_bytes=settings.max_download_bytes,
+                mini_app_url=settings.mini_app_public_url,
             )
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -266,6 +269,25 @@ async def async_main(args: argparse.Namespace) -> None:
                 host=settings.contact_api_host,
                 port=settings.contact_api_port,
             )
+            await site.start()
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop.set)
+            try:
+                await stop.wait()
+            finally:
+                await runner.cleanup()
+        elif args.command == "miniapp-api":
+            app = create_miniapp_app(
+                pool,
+                bot_token=settings.require_telegram_token(),
+                dist_root=settings.mini_app_dist_root,
+                auth_max_age_seconds=settings.mini_app_auth_max_age_seconds,
+            )
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, host=settings.mini_app_host, port=settings.mini_app_port)
             await site.start()
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()

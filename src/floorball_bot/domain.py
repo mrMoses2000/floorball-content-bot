@@ -28,6 +28,7 @@ class Role(StrEnum):
     CITY_COACH = "city_coach"
     COACH_FORM = "coach_form"
     MEDIA_EDITOR = "media_editor"
+    PLAYER = "player"
 
 
 class DraftStatus(StrEnum):

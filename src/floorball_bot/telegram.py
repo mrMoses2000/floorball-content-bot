@@ -13,14 +13,22 @@ from uuid import uuid4
 import asyncpg
 from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
-from aiogram.methods import DeleteWebhook, GetUpdates, GetWebhookInfo, SetMyCommands
+from aiogram.methods import (
+    DeleteWebhook,
+    GetUpdates,
+    GetWebhookInfo,
+    SetChatMenuButton,
+    SetMyCommands,
+)
 from aiogram.types import (
     BotCommand,
     FSInputFile,
     InputMediaPhoto,
     KeyboardButton,
+    MenuButtonWebApp,
     ReplyKeyboardMarkup,
     Update,
+    WebAppInfo,
 )
 
 from floorball_bot.auth import (
@@ -45,9 +53,11 @@ from floorball_bot.city_applications import (
 from floorball_bot.db import transaction
 from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository, RequirementLevel
 from floorball_bot.dialogue.evaluator import evaluate_gaps
+from floorball_bot.dialogue.presentation import friendly_question, hidden_from_user
 from floorball_bot.domain import Actor, DraftStatus, Role
 from floorball_bot.errors import AuthorizationError
 from floorball_bot.health import record_heartbeat
+from floorball_bot.news_defaults import apply_news_defaults
 from floorball_bot.official_documents import (
     InvalidOfficialDocument,
     format_official_document_status,
@@ -177,12 +187,14 @@ class TelegramIngress:
         poll_timeout: int = 30,
         download_root: Path = Path("./var/media/incoming"),
         max_download_bytes: int = 20 * 1024 * 1024,
+        mini_app_url: str = "",
     ) -> None:
         self.bot = bot
         self.pool = pool
         self.poll_timeout = poll_timeout
         self.download_root = download_root.resolve()
         self.max_download_bytes = max_download_bytes
+        self.mini_app_url = mini_app_url.strip()
         self.dialogues = DialogueSpecRepository()
         self.offset: int | None = None
         self._stop = asyncio.Event()
@@ -193,6 +205,14 @@ class TelegramIngress:
             await self.bot(DeleteWebhook(drop_pending_updates=False))
             logger.warning("telegram_webhook_removed_for_long_polling")
         await self.bot(SetMyCommands(commands=list(TELEGRAM_COMMANDS)))
+        if self.mini_app_url:
+            await self.bot(
+                SetChatMenuButton(
+                    menu_button=MenuButtonWebApp(
+                        text="Личный кабинет", web_app=WebAppInfo(url=self.mini_app_url)
+                    )
+                )
+            )
 
     async def stop(self) -> None:
         self._stop.set()
@@ -1146,15 +1166,9 @@ class TelegramIngress:
                     "language": preferred_language or "ru",
                     "session_id": str(dialogue_session["id"]) if dialogue_session else None,
                     "mode": dialogue_session["workflow"] if dialogue_session else None,
+                    "user_id": str(actor.user_id),
                 },
                 idempotency_key=stable_idempotency_key("transcribe", update.update_id),
-            )
-            await self._reply(
-                connection,
-                update.update_id,
-                message.chat.id,
-                "Голосовое сообщение принято. После распознавания "
-                "я покажу текст для подтверждения.",
             )
         elif message.photo or (
             message.document and (message.document.mime_type or "").startswith("image/")
@@ -1292,9 +1306,6 @@ class TelegramIngress:
                     "mode": dialogue_session["workflow"] if dialogue_session else None,
                 },
                 idempotency_key=stable_idempotency_key("extract", update.update_id),
-            )
-            await self._reply(
-                connection, update.update_id, message.chat.id, "Сообщение добавлено в черновик."
             )
         else:
             await self._reply(
@@ -1762,12 +1773,21 @@ class TelegramIngress:
 
     def _dialogue_keyboard(self, actor: Actor) -> dict | None:
         available = self._available_dialogues(actor)
-        if not available:
+        if not available and not self.mini_app_url:
             return None
+        rows = []
+        if self.mini_app_url:
+            rows.append(
+                [
+                    KeyboardButton(
+                        text="Открыть личный кабинет",
+                        web_app=WebAppInfo(url=self.mini_app_url),
+                    )
+                ]
+            )
+        rows.extend([KeyboardButton(text=loaded.spec.ui_label.ru)] for loaded in available)
         keyboard = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text=loaded.spec.ui_label.ru)] for loaded in available
-            ],
+            keyboard=rows,
             resize_keyboard=True,
         )
         return keyboard.model_dump(exclude_none=True)
@@ -1832,14 +1852,15 @@ class TelegramIngress:
                 loaded.sha256,
                 evaluate_gaps(loaded.spec, {}).next_field_id or "ready_to_submit",
             )
+            fields = apply_news_defaults({}) if mode == DialogueMode.NEWS else {}
             await connection.execute(
                 """
                 INSERT INTO conversation_memory(session_id, structured_memory)
-                VALUES ($1, '{"fields":{},"skipped":[]}'::jsonb)
+                VALUES ($1, $2::jsonb)
                 """,
                 session_id,
+                {"fields": fields, "skipped": []},
             )
-            fields: dict = {}
             intro = f"Начинаем: {loaded.spec.ui_label.ru.lower()}.\n\n"
         else:
             memory = await connection.fetchval(
@@ -1862,26 +1883,31 @@ class TelegramIngress:
     @staticmethod
     def _dialogue_progress(spec, fields: dict, language: str) -> str:
         gaps = evaluate_gaps(spec, fields)
-        critical = len(gaps.required_to_start) + len(gaps.required_for_submit)
-        later = len(gaps.required_for_publish) + len(gaps.recommended)
-        lines = [
-            f"Заполнено разделов: {len(fields)}.",
-            "Критично до отправки: " + (str(critical) if critical else "всё заполнено"),
-            "Можно дозаполнить позже: " + (str(later) if later else "нет"),
-        ]
         ordered = (
             *gaps.required_to_start,
             *gaps.required_for_submit,
             *gaps.required_for_publish,
             *gaps.recommended,
         )
-        if ordered:
-            question = ordered[0].question.kz if language == "kz" else ordered[0].question.ru
-            prefix = "Важно до отправки. " if critical else "Можно добавить сейчас. "
-            lines.append(prefix + question)
+        visible_gap = next(
+            (gap for gap in ordered if not hidden_from_user(spec.mode, gap.field_id)), None
+        )
+        if visible_gap:
+            question = friendly_question(
+                spec.mode, visible_gap.field_id, visible_gap.question, language
+            )
+            return ("Келесі қадам:\n" if language == "kz" else "Следующий шаг:\n") + question
         if gaps.can_submit:
-            lines.append("Черновик уже можно отправить командой /submit.")
-        return "\n\n".join(lines)
+            return (
+                "Міндетті деректер толтырылды. /submit пәрменімен жіберуге болады."
+                if language == "kz"
+                else "Всё обязательное заполнено. Анкету можно отправить командой /submit."
+            )
+        return (
+            "Деректер сақталды. Қажет болса, ақпаратты еркін мәтінмен толықтырыңыз."
+            if language == "kz"
+            else "Данные сохранены. Если нужно, дополните их обычным сообщением."
+        )
 
     async def _handle_dialogue_command(
         self,

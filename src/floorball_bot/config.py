@@ -63,8 +63,19 @@ class Settings(BaseSettings):
         default="https://floorball.kz,https://www.floorball.kz",
         validation_alias="CONTACT_ALLOWED_ORIGINS",
     )
+    mini_app_public_url: str = Field(default="", validation_alias="MINI_APP_PUBLIC_URL")
+    mini_app_host: str = Field(default="127.0.0.1", validation_alias="MINI_APP_HOST")
+    mini_app_port: int = Field(default=8092, validation_alias="MINI_APP_PORT")
+    mini_app_auth_max_age_seconds: int = Field(
+        default=86_400, validation_alias="MINI_APP_AUTH_MAX_AGE_SECONDS"
+    )
+    mini_app_dist_root: Path = Field(
+        default=Path("./miniapp/dist"), validation_alias="MINI_APP_DIST_ROOT"
+    )
 
-    @field_validator("media_root", "worktree_root", "backup_root", mode="after")
+    @field_validator(
+        "media_root", "worktree_root", "backup_root", "mini_app_dist_root", mode="after"
+    )
     @classmethod
     def absolute_runtime_path(cls, value: Path) -> Path:
         return value.expanduser().resolve()
@@ -96,6 +107,14 @@ class Settings(BaseSettings):
             for origin in self.contact_allowed_origins.split(",")
             if origin.strip()
         )
+
+    @field_validator("mini_app_public_url", mode="after")
+    @classmethod
+    def valid_mini_app_url(cls, value: str) -> str:
+        value = value.strip()
+        if value and not value.startswith("https://"):
+            raise ValueError("MINI_APP_PUBLIC_URL must use HTTPS")
+        return value
 
 
 @lru_cache
