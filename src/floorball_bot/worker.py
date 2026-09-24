@@ -646,7 +646,10 @@ class Worker:
                         "text": (
                             "Commit и push завершены и проверены.\n\n"
                             f"main: {main_commit}\nplesk-static: {static_commit}\n\n"
-                            "Заходите в панель сайта/Plesk и запускайте развёртывание репозитория."
+                            "В Plesk откройте floorball-build.git (ветка plesk-static, "
+                            "каталог /httpdocs). Нажмите «Получить сейчас», затем "
+                            "«Развернуть сейчас», если сборка не развернулась автоматически. "
+                            "После обновления проверьте сайт floorball.kz."
                         ),
                     },
                     idempotency_key=stable_idempotency_key(

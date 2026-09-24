@@ -100,6 +100,29 @@ NEWS_COPY: dict[str, dict[str, Any]] = {
     },
 }
 
+SECTION_KZ = {
+    "Агрегированные цифры": "Жиынтық сандар",
+    "Город": "Қала",
+    "Игроки": "Ойыншылар",
+    "Клубы": "Клубтар",
+    "Медиа": "Медиа",
+    "Ответственный": "Жауапты тұлға",
+    "Ответственный представитель": "Жауапты өкіл",
+    "Подтверждение": "Растау",
+    "Расписание": "Кесте",
+    "События": "Оқиғалар",
+    "Миссия и видение": "Миссия және көзқарас",
+    "Направления развития": "Даму бағыттары",
+    "Стратегические цели": "Стратегиялық мақсаттар",
+    "Ценности": "Құндылықтар",
+    "Язык": "Тіл",
+    "Дорожная карта": "Жол картасы",
+    "Достижения": "Жетістіктер",
+    "История": "Тарих",
+    "Права на изображения": "Суреттерге құқықтар",
+    "Профили руководства": "Басшылық туралы мәліметтер",
+}
+
 
 def field_copy(mode: DialogueMode, field: FieldSpec, language: str) -> dict[str, Any]:
     override = NEWS_COPY.get(field.id, {}) if mode == DialogueMode.NEWS else {}
@@ -114,7 +137,9 @@ def field_copy(mode: DialogueMode, field: FieldSpec, language: str) -> dict[str,
         for value in field.options
     ]
     return {
-        "section": override.get(f"section_{suffix}") or field.section,
+        "section": override.get(f"section_{suffix}") or (
+            SECTION_KZ.get(field.section, field.section) if language == "kz" else field.section
+        ),
         "label": label,
         "question": question,
         "options": options,

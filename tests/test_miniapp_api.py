@@ -9,7 +9,12 @@ from urllib.parse import urlencode
 import pytest
 
 from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
-from floorball_bot.miniapp_api import MiniAppError, _serialize_session, validate_init_data
+from floorball_bot.miniapp_api import (
+    MiniAppError,
+    _find_editable_field,
+    _serialize_session,
+    validate_init_data,
+)
 from floorball_bot.news_defaults import apply_news_defaults, news_slug
 
 
@@ -85,3 +90,12 @@ def test_news_miniapp_uses_plain_language_and_hides_technical_fields() -> None:
     assert city["display_value"] == "Алматы"
     assert "ISO" not in json.dumps(payload, ensure_ascii=False)
     assert "url-slug" not in json.dumps(payload, ensure_ascii=False).casefold()
+
+
+def test_news_miniapp_hides_national_scope_from_city_editor() -> None:
+    loaded = DialogueSpecRepository().load(DialogueMode.NEWS)
+    payload = _serialize_session(loaded, None, {}, "ru", [], can_create_national=False)
+    fields = [field for section in payload["sections"] for field in section["fields"]]
+    scope = next(field for field in fields if field["id"] == "scope")
+    assert [option["value"] for option in scope["options"]] == ["city"]
+    assert _find_editable_field(loaded.spec, "slug") == (None, None)

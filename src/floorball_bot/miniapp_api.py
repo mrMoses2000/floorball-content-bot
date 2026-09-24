@@ -5,6 +5,7 @@ import hmac
 import json
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl
@@ -21,6 +22,7 @@ from floorball_bot.dialogue.evaluator import evaluate_gaps
 from floorball_bot.dialogue.models import FieldType
 from floorball_bot.dialogue.patches import validate_field_value
 from floorball_bot.dialogue.presentation import field_copy, friendly_question, hidden_from_user
+from floorball_bot.domain import Role
 from floorball_bot.news_defaults import apply_news_defaults
 
 POOL = web.AppKey("pool", asyncpg.Pool)
@@ -95,7 +97,7 @@ async def error_middleware(request: web.Request, handler):
         response = web.json_response(
             {"error": {"code": exc.code, "message": exc.message}}, status=exc.status
         )
-    except (json.JSONDecodeError, ValidationError):
+    except (json.JSONDecodeError, ValidationError, web.HTTPBadRequest):
         response = web.json_response(
             {"error": {"code": "invalid_request", "message": "Проверьте введённые данные."}},
             status=400,
@@ -153,6 +155,7 @@ def _serialize_session(
     memory: dict[str, Any],
     language: str,
     city_options: list[dict[str, str]],
+    can_create_national: bool = True,
 ) -> dict[str, Any]:
     fields = dict(memory.get("fields") or {})
     gaps = evaluate_gaps(loaded.spec, fields)
@@ -182,15 +185,35 @@ def _serialize_session(
             if loaded.spec.mode == DialogueMode.NEWS and field.id == "city_slug"
             else presentation["options"]
         )
+        if (
+            loaded.spec.mode == DialogueMode.NEWS
+            and field.id == "scope"
+            and not can_create_national
+        ):
+            options = [option for option in options if option["value"] == "city"]
         option_label = next(
             (option["label"] for option in options if option["value"] == current), None
         )
+        no_city_options = (
+            loaded.spec.mode == DialogueMode.NEWS
+            and field.id == "city_slug"
+            and not options
+        )
+        question = presentation["question"]
+        if no_city_options:
+            question = (
+                "Сначала попросите администратора назначить вам город."
+                if language == "ru"
+                else "Алдымен әкімшіден сізге қала тағайындауды сұраңыз."
+            )
         sections[presentation["section"]].append(
             {
                 "id": field.id,
                 "label": presentation["label"],
-                "question": presentation["question"],
-                "type": "choice" if options else field.type.value,
+                "question": question,
+                "type": "choice" if options or (
+                    loaded.spec.mode == DialogueMode.NEWS and field.id == "city_slug"
+                ) else field.type.value,
                 "requirement": field.requirement.value,
                 "value": current,
                 "display_value": option_label,
@@ -201,9 +224,12 @@ def _serialize_session(
                 "editable": session is not None
                 and session["status"] == "active"
                 and _editable(field)
-                and field.type != FieldType.RECORD,
+                and field.type != FieldType.RECORD
+                and not no_city_options,
                 "options": options,
                 "max_length": field.max_length,
+                "minimum": field.minimum,
+                "maximum": field.maximum,
             }
         )
     completed = sum(item["filled"] for items in sections.values() for item in items)
@@ -236,11 +262,20 @@ def _serialize_session(
     }
 
 
-async def _bootstrap_payload(request: web.Request) -> dict[str, Any]:
+@asynccontextmanager
+async def _bootstrap_connection(request: web.Request, connection=None):
+    if connection is not None:
+        yield connection
+    else:
+        async with request.app[POOL].acquire() as acquired:
+            yield acquired
+
+
+async def _bootstrap_payload(request: web.Request, connection=None) -> dict[str, Any]:
     actor = request["actor"]
     dialogues = request.app[DIALOGUES]
     roles = {role.value for role in actor.roles}
-    async with request.app[POOL].acquire() as connection:
+    async with _bootstrap_connection(request, connection) as connection:
         user = await connection.fetchrow(
             "SELECT display_name, preferred_language FROM users WHERE id=$1", actor.user_id
         )
@@ -306,6 +341,7 @@ async def _bootstrap_payload(request: web.Request) -> dict[str, Any]:
                 dict(row["memory"]) if row else {},
                 language,
                 city_options,
+                bool(roles.intersection({"superadmin", "federation_editor"})),
             )
         )
     city_names = [city["name_kz"] if language == "kz" else city["name_ru"] for city in cities]
@@ -313,31 +349,38 @@ async def _bootstrap_payload(request: web.Request) -> dict[str, Any]:
     representative = bool(roles.intersection({"city_coach", "reviewer", "superadmin"}))
     access = [
         {
+            "id": "admin",
+            "label": "Әкімші" if language == "kz" else "Администратор",
+            "granted": "superadmin" in roles,
+        },
+        {
             "id": "coach",
-            "label": "Тренер",
+            "label": "Жаттықтырушы сауалнамасы" if language == "kz" else "Анкета тренера",
             "granted": bool(is_coach or roles & {"coach_form", "city_coach", "superadmin"}),
         },
         {
             "id": "player",
-            "label": "Игрок",
+            "label": "Ойыншы" if language == "kz" else "Игрок",
             "granted": bool(is_player or "player" in roles),
         },
         {
             "id": "city",
-            "label": "Представитель города",
+            "label": "Қала бөлімдері" if language == "kz" else "Разделы города",
             "granted": representative,
             "details": ", ".join(city_names),
         },
         {
             "id": "federation",
-            "label": "Представитель федерации",
+            "label": "Федерация бөлімдері" if language == "kz" else "Разделы федерации",
             "granted": federation,
         },
         {
             "id": "media",
-            "label": "Редактор новостей",
+            "label": "Медиа",
             "granted": bool(
-                roles & {"media_editor", "city_coach", "reviewer", "superadmin"}
+                roles & {
+                    "media_editor", "federation_editor", "city_coach", "reviewer", "superadmin"
+                }
             ),
         },
     ]
@@ -403,6 +446,8 @@ async def start_session(request: web.Request) -> web.Response:
 
 
 def _find_editable_field(spec, field_path: str):
+    if hidden_from_user(spec.mode, field_path):
+        return None, None
     if "." in field_path:
         parent_id, child_id = field_path.split(".", 1)
         parent = next((item for item in spec.fields if item.id == parent_id), None)
@@ -418,7 +463,10 @@ def _find_editable_field(spec, field_path: str):
 
 async def update_field(request: web.Request) -> web.Response:
     actor = request["actor"]
-    session_id = UUID(request.match_info["session_id"])
+    try:
+        session_id = UUID(request.match_info["session_id"])
+    except ValueError as exc:
+        raise MiniAppError(404, "not_found", "Анкета не найдена.") from exc
     field_path = request.match_info["field_path"]
     mutation = FieldMutation.model_validate(await request.json())
     payload_hash = hashlib.sha256(
@@ -431,7 +479,7 @@ async def update_field(request: web.Request) -> web.Response:
         if duplicate:
             if duplicate["payload_hash"] != payload_hash:
                 raise MiniAppError(409, "request_conflict", "Изменение уже было отправлено иначе.")
-            return web.json_response(await _bootstrap_payload(request))
+            return web.json_response(await _bootstrap_payload(request, connection))
         session = await connection.fetchrow(
             """
             SELECT s.workflow, s.status, s.definition_hash, m.structured_memory, m.revision
@@ -448,27 +496,58 @@ async def update_field(request: web.Request) -> web.Response:
         if session["revision"] != mutation.revision:
             raise MiniAppError(409, "stale", "Данные изменились. Обновите экран и повторите.")
         loaded = request.app[DIALOGUES].load(session["workflow"])
+        if not {role.value for role in actor.roles}.intersection(loaded.spec.allowed_roles):
+            raise MiniAppError(403, "forbidden", "Этот раздел пока недоступен.")
         if loaded.sha256 != session["definition_hash"]:
             raise MiniAppError(409, "version_changed", "Анкета обновилась. Откройте её заново.")
         parent, child = _find_editable_field(loaded.spec, field_path)
         if parent is None:
             raise MiniAppError(403, "chat_required", "Это поле можно изменить в чате с ботом.")
         fields = dict((session["structured_memory"] or {}).get("fields") or {})
-        if child is None:
-            if mutation.clear:
-                fields.pop(parent.id, None)
+        try:
+            if child is None:
+                if mutation.clear:
+                    fields.pop(parent.id, None)
+                else:
+                    fields[parent.id] = validate_field_value(parent, mutation.value)
             else:
-                fields[parent.id] = validate_field_value(parent, mutation.value)
-        else:
-            record = dict(fields.get(parent.id) or {})
-            if mutation.clear:
-                record.pop(child.id, None)
-            else:
-                record[child.id] = validate_field_value(child, mutation.value)
-            if record:
-                fields[parent.id] = record
-            else:
-                fields.pop(parent.id, None)
+                record = dict(fields.get(parent.id) or {})
+                if mutation.clear:
+                    record.pop(child.id, None)
+                else:
+                    record[child.id] = validate_field_value(child, mutation.value)
+                if record:
+                    fields[parent.id] = record
+                else:
+                    fields.pop(parent.id, None)
+        except ValueError as exc:
+            raise MiniAppError(
+                400, "invalid_value", "Проверьте значение поля и попробуйте снова."
+            ) from exc
+        if loaded.spec.mode == DialogueMode.NEWS:
+            if fields.get("scope") == "national" and not actor.has_any_role(
+                Role.SUPERADMIN, Role.FEDERATION_EDITOR
+            ):
+                raise MiniAppError(403, "forbidden", "Национальная новость вам недоступна.")
+            if fields.get("scope") != "city":
+                fields.pop("city_slug", None)
+            elif fields.get("city_slug"):
+                if actor.has_any_role(Role.SUPERADMIN, Role.FEDERATION_EDITOR):
+                    allowed_city = await connection.fetchval(
+                        """SELECT EXISTS(SELECT 1 FROM cities
+                           WHERE slug=$1 AND active=TRUE AND deleted_at IS NULL)""",
+                        fields["city_slug"],
+                    )
+                else:
+                    allowed_city = await connection.fetchval(
+                        """SELECT EXISTS(SELECT 1 FROM user_city_scopes s
+                           JOIN cities c ON c.id=s.city_id
+                           WHERE s.user_id=$1 AND s.revoked_at IS NULL
+                             AND c.slug=$2 AND c.active=TRUE AND c.deleted_at IS NULL)""",
+                        actor.user_id, fields["city_slug"],
+                    )
+                if not allowed_city:
+                    raise MiniAppError(403, "city_forbidden", "Этот город вам недоступен.")
         if loaded.spec.mode == DialogueMode.NEWS:
             fields = apply_news_defaults(fields)
         gaps = evaluate_gaps(loaded.spec, fields)

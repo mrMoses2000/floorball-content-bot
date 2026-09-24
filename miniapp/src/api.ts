@@ -3,6 +3,10 @@ import { demo } from './demo'
 
 const initData = () => window.Telegram?.WebApp.initData ?? ''
 
+export class ApiError extends Error {
+  constructor(message: string, readonly code: string) { super(message) }
+}
+
 async function request(path: string, options: RequestInit = {}): Promise<Bootstrap> {
   const response = await fetch(path, {
     ...options,
@@ -13,7 +17,7 @@ async function request(path: string, options: RequestInit = {}): Promise<Bootstr
     },
   })
   const body = await response.json()
-  if (!response.ok) throw new Error(body?.error?.message || 'Не удалось загрузить данные.')
+  if (!response.ok) throw new ApiError(body?.error?.message || 'Не удалось загрузить данные.', body?.error?.code || 'unknown')
   return body
 }
 

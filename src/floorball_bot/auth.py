@@ -50,7 +50,17 @@ async def bind_self_contact(
         phone,
     )
     if not row:
-        raise AuthorizationError("phone is not pre-authorized")
+        row = await connection.fetchrow(
+            """
+            SELECT id, telegram_id FROM users
+            WHERE telegram_id=$1 AND phone_e164 IS NULL
+              AND active=TRUE AND deleted_at IS NULL
+            FOR UPDATE
+            """,
+            sender_id,
+        )
+        if not row:
+            raise AuthorizationError("phone is not pre-authorized")
     existing_identity = await connection.fetchval(
         "SELECT id FROM users WHERE telegram_id=$1 AND deleted_at IS NULL",
         sender_id,
@@ -63,12 +73,14 @@ async def bind_self_contact(
         raise AuthorizationError("account is already bound; superadmin approval is required")
     await connection.execute(
         """
-        UPDATE users SET telegram_id=$2, telegram_bound_at=COALESCE(telegram_bound_at, now()),
+        UPDATE users SET telegram_id=$2, phone_e164=COALESCE(phone_e164, $3),
+                         telegram_bound_at=COALESCE(telegram_bound_at, now()),
                          updated_at=now(), revision=revision+1
         WHERE id=$1
         """,
         row["id"],
         sender_id,
+        phone,
     )
     actor = await get_actor_by_telegram_id(connection, sender_id)
     if actor is None:

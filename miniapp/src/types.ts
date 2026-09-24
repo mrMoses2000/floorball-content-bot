@@ -18,6 +18,8 @@ export type Field = {
   editable: boolean
   options: { value: string; label: string }[]
   max_length?: number
+  minimum?: number | null
+  maximum?: number | null
 }
 
 export type Workflow = {

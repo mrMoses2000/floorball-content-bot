@@ -90,7 +90,7 @@ menu button. API принимает только подписанный Telegram
 
 ## Plesk handoff
 
-После успешного main push и проверки remote `plesk-static` бот сообщает commit IDs. Оператор открывает Plesk repository `floorball-build.git`, проверяет ветку `plesk-static` и нажимает «Получить сейчас»/«Развернуть сейчас». Автоматический click не выполняется.
+После успешного push и проверки обеих удалённых веток бот сообщает commit IDs. Публичный сайт берёт готовую сборку из Plesk repository `floorball-build.git`: ветка `plesk-static`, каталог `/httpdocs`. Оператор на этой карточке нажимает «Получить сейчас», сверяет полученный commit с сообщением бота и, если автоматическое развёртывание не произошло, нажимает «Развернуть сейчас». Карточка `floorball.kz.git` с веткой `main` обновляет только исходники в `/app-src` и не меняет публичный сайт. Автоматический click не выполняется.
 
 Проверить `https://floorball.kz`, прямой reload `/clubs/almaty`, RU/KZ/EN, hero, gallery и игрока без фото.
 
