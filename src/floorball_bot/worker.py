@@ -93,11 +93,34 @@ class Worker:
         while not self.stop_event.is_set():
             now = time.monotonic()
             if now - self._last_heartbeat >= 30:
-                await record_heartbeat(self.pool, "worker", {"state": "running"})
-                self._last_heartbeat = now
-            job = await claim_job(
-                self.pool, worker_id=self.worker_id, lease_seconds=self.lease_seconds
-            )
+                try:
+                    await record_heartbeat(self.pool, "worker", {"state": "running"})
+                    self._last_heartbeat = now
+                except Exception:
+                    logger.warning("worker_heartbeat_failed", exc_info=True)
+            try:
+                job = await claim_job(
+                    self.pool, worker_id=self.worker_id, lease_seconds=self.lease_seconds
+                )
+            except (asyncpg.PostgresError, TimeoutError, OSError, ConnectionError) as exc:
+                logger.warning(
+                    "worker_claim_job_db_error",
+                    extra={"error": type(exc).__name__, "detail": str(exc)},
+                )
+                try:
+                    await asyncio.wait_for(self.stop_event.wait(), timeout=5)
+                except TimeoutError:
+                    pass
+                continue
+            except Exception as exc:
+                logger.exception(
+                    "worker_claim_job_unexpected_error", extra={"error": type(exc).__name__}
+                )
+                try:
+                    await asyncio.wait_for(self.stop_event.wait(), timeout=5)
+                except TimeoutError:
+                    pass
+                continue
             if job is None:
                 now = time.monotonic()
                 if (

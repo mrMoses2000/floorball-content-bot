@@ -1,6 +1,6 @@
 [Unit]
-Description=Floorball Telegram Mini App
-After=network-online.target
+Description=Floorball content Telegram bot
+After=network-online.target postgresql.service
 Wants=network-online.target
 StartLimitIntervalSec=0
 
@@ -8,15 +8,15 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory=/home/moses/tg_bot_floorball_site
 EnvironmentFile=/home/moses/tg_bot_floorball_site/.env
-ExecStart=/home/moses/tg_bot_floorball_site/.venv/bin/floorball-bot miniapp-api
+ExecStart=/home/moses/tg_bot_floorball_site/.venv/bin/floorball-bot bot
 Restart=always
 RestartSec=5s
-TimeoutStopSec=30
+TimeoutStopSec=40
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-MemoryMax=256M
-TasksMax=32
+MemoryMax=768M
+TasksMax=64
 
 [Install]
 WantedBy=default.target

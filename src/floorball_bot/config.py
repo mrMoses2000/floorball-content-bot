@@ -27,6 +27,14 @@ class Settings(BaseSettings):
         default=SecretStr("postgresql://floorballbot@127.0.0.1:5432/floorball_bot"),
         validation_alias="POSTGRES_DSN",
     )
+    db_command_timeout_seconds: int = Field(
+        default=60, validation_alias="DB_COMMAND_TIMEOUT_SECONDS"
+    )
+    db_acquire_timeout_seconds: int = Field(
+        default=30, validation_alias="DB_ACQUIRE_TIMEOUT_SECONDS"
+    )
+    db_pool_min_size: int = Field(default=1, validation_alias="DB_POOL_MIN_SIZE")
+    db_pool_max_size: int = Field(default=5, validation_alias="DB_POOL_MAX_SIZE")
     floorball_site_repo: Path = Field(
         default=Path("/home/moses/floorball.kz"), validation_alias="FLOORBALL_SITE_REPO"
     )

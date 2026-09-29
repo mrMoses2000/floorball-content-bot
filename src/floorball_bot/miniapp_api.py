@@ -649,6 +649,7 @@ def create_miniapp_app(
     app[DIST_ROOT] = dist_root.resolve()
     app[DIALOGUES] = DialogueSpecRepository()
     app.router.add_get("/healthz", health)
+    app.router.add_get("/api/health", health)
     app.router.add_get("/api/miniapp/v1/bootstrap", bootstrap)
     app.router.add_post("/api/miniapp/v1/sessions/{mode}", start_session)
     app.router.add_patch(

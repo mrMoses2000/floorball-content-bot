@@ -67,7 +67,10 @@ async def supervise_bot_tasks(
         done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         if stop_task in done:
             await ingress.stop()
-            await asyncio.gather(*critical)
+            for task in critical:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*critical, return_exceptions=True)
             return
         failed = next(task for task in done if task in critical)
         if failed.cancelled():
@@ -149,7 +152,13 @@ async def async_main(args: argparse.Namespace) -> None:
         )
         return
     settings = get_settings()
-    pool = await create_pool(settings.postgres_dsn.get_secret_value())
+    pool = await create_pool(
+        settings.postgres_dsn.get_secret_value(),
+        min_size=settings.db_pool_min_size,
+        max_size=settings.db_pool_max_size,
+        command_timeout=settings.db_command_timeout_seconds,
+        timeout=settings.db_acquire_timeout_seconds,
+    )
     try:
         if args.command == "migrate":
             applied = await run_migrations(pool, Path(__file__).resolve().parents[2] / "migrations")

@@ -10,9 +10,15 @@ from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
+import aiohttp
 import asyncpg
 from aiogram import Bot
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.methods import (
     DeleteWebhook,
     GetUpdates,
@@ -200,26 +206,54 @@ class TelegramIngress:
         self._stop = asyncio.Event()
 
     async def prepare_long_polling(self) -> None:
-        info = await self.bot(GetWebhookInfo())
-        if info.url:
-            await self.bot(DeleteWebhook(drop_pending_updates=False))
-            logger.warning("telegram_webhook_removed_for_long_polling")
-        await self.bot(SetMyCommands(commands=list(TELEGRAM_COMMANDS)))
-        if self.mini_app_url:
-            await self.bot(
-                SetChatMenuButton(
-                    menu_button=MenuButtonWebApp(
-                        text="Личный кабинет", web_app=WebAppInfo(url=self.mini_app_url)
+        retry_delay = 1.0
+        while not self._stop.is_set():
+            try:
+                info = await self.bot(GetWebhookInfo())
+                if info.url:
+                    await self.bot(DeleteWebhook(drop_pending_updates=False))
+                    logger.warning("telegram_webhook_removed_for_long_polling")
+                await self.bot(SetMyCommands(commands=list(TELEGRAM_COMMANDS)))
+                if self.mini_app_url:
+                    await self.bot(
+                        SetChatMenuButton(
+                            menu_button=MenuButtonWebApp(
+                                text="Личный кабинет", web_app=WebAppInfo(url=self.mini_app_url)
+                            )
+                        )
                     )
+                return
+            except (
+                TelegramNetworkError,
+                TelegramServerError,
+                TelegramAPIError,
+                aiohttp.ClientError,
+                TimeoutError,
+                OSError,
+            ) as exc:
+                logger.warning(
+                    "telegram_prepare_polling_retry",
+                    extra={
+                        "error": type(exc).__name__,
+                        "detail": str(exc),
+                        "retry_delay": retry_delay,
+                    },
                 )
-            )
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=retry_delay)
+                except TimeoutError:
+                    pass
+                retry_delay = min(30.0, retry_delay * 2)
 
     async def stop(self) -> None:
         self._stop.set()
 
     async def run(self) -> None:
         await self.prepare_long_polling()
-        await record_heartbeat(self.pool, "telegram_ingress", {"state": "started"})
+        try:
+            await record_heartbeat(self.pool, "telegram_ingress", {"state": "started"})
+        except Exception:
+            logger.warning("initial_heartbeat_failed", exc_info=True)
         retry_attempt = 0
         while not self._stop.is_set():
             try:
@@ -235,19 +269,57 @@ class TelegramIngress:
                 retry_attempt += 1
                 await self._wait_polling_retry(float(exc.retry_after), type(exc).__name__)
                 continue
-            except (TelegramNetworkError, TelegramServerError) as exc:
+            except (
+                TelegramNetworkError,
+                TelegramServerError,
+                TelegramAPIError,
+                aiohttp.ClientError,
+                TimeoutError,
+                OSError,
+            ) as exc:
                 retry_attempt += 1
                 delay = min(30.0, 2 ** min(retry_attempt, 5))
                 delay += random.uniform(0, 1)  # noqa: S311 - retry jitter, not security
                 await self._wait_polling_retry(delay, type(exc).__name__)
                 continue
-            await record_heartbeat(
-                self.pool,
-                "telegram_ingress",
-                {"state": "polling", "updates_received": len(updates)},
-            )
+            except Exception as exc:
+                retry_attempt += 1
+                logger.exception(
+                    "telegram_polling_unexpected_error", extra={"error": type(exc).__name__}
+                )
+                delay = min(30.0, 2 ** min(retry_attempt, 5))
+                await self._wait_polling_retry(delay, type(exc).__name__)
+                continue
+
+            try:
+                await record_heartbeat(
+                    self.pool,
+                    "telegram_ingress",
+                    {"state": "polling", "updates_received": len(updates)},
+                )
+            except Exception:
+                logger.warning("heartbeat_failed", exc_info=True)
+
             for update in updates:
-                await self.accept(update)
+                try:
+                    await self.accept(update)
+                except Exception as exc:
+                    logger.exception(
+                        "telegram_update_processing_failed",
+                        extra={"update_id": update.update_id, "error": type(exc).__name__},
+                    )
+                    try:
+                        await self.pool.execute(
+                            """
+                            INSERT INTO processed_updates(update_id, status, completed_at, error_class)
+                            VALUES ($1, 'failed', now(), $2)
+                            ON CONFLICT (update_id) DO UPDATE SET status='failed', completed_at=now(), error_class=$2
+                            """,
+                            update.update_id,
+                            type(exc).__name__,
+                        )
+                    except Exception:
+                        pass
                 self.offset = update.update_id + 1
 
     async def _wait_polling_retry(self, delay: float, error_class: str) -> None:
@@ -2909,24 +2981,55 @@ class TelegramIngress:
 
 
 async def run_outbox(bot: Bot, pool: asyncpg.Pool, worker_id: str, stop: asyncio.Event) -> None:
+    db_retry_delay = 1.0
     while not stop.is_set():
         event = None
-        async with transaction(pool) as connection:
-            event = await connection.fetchrow(
-                """
-                WITH candidate AS (
-                    SELECT id FROM outbox_events
-                    WHERE (status IN ('pending','retry') AND available_at <= now())
-                       OR (status='sending' AND locked_at < now()-interval '5 minutes')
-                    ORDER BY available_at, created_at
-                    FOR UPDATE SKIP LOCKED LIMIT 1
+        try:
+            async with transaction(pool) as connection:
+                event = await connection.fetchrow(
+                    """
+                    WITH candidate AS (
+                        SELECT id FROM outbox_events
+                        WHERE (status IN ('pending','retry') AND available_at <= now())
+                           OR (status='sending' AND locked_at < now()-interval '5 minutes')
+                        ORDER BY available_at, created_at
+                        FOR UPDATE SKIP LOCKED LIMIT 1
+                    )
+                    UPDATE outbox_events o SET status='sending', locked_at=now(), locked_by=$1,
+                        attempts=attempts+1
+                    FROM candidate WHERE o.id=candidate.id RETURNING o.*
+                    """,
+                    worker_id,
                 )
-                UPDATE outbox_events o SET status='sending', locked_at=now(), locked_by=$1,
-                    attempts=attempts+1
-                FROM candidate WHERE o.id=candidate.id RETURNING o.*
-                """,
-                worker_id,
+            db_retry_delay = 1.0
+        except (asyncpg.PostgresError, TimeoutError, OSError, ConnectionError) as exc:
+            logger.warning(
+                "outbox_db_transient_error",
+                extra={
+                    "error": type(exc).__name__,
+                    "detail": str(exc),
+                    "retry_delay": db_retry_delay,
+                },
             )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=db_retry_delay)
+            except TimeoutError:
+                pass
+            db_retry_delay = min(30.0, db_retry_delay * 2)
+            continue
+        except Exception as exc:
+            logger.error(
+                "outbox_unexpected_poll_error",
+                extra={"error": type(exc).__name__, "detail": str(exc)},
+                exc_info=True,
+            )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=db_retry_delay)
+            except TimeoutError:
+                pass
+            db_retry_delay = min(30.0, db_retry_delay * 2)
+            continue
+
         if not event:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1)
@@ -2957,22 +3060,79 @@ async def run_outbox(bot: Bot, pool: asyncpg.Pool, worker_id: str, stop: asyncio
                     reply_markup=payload.get("reply_markup"),
                 )
                 external_id = str(sent.message_id)
-            await pool.execute(
-                """
-                UPDATE outbox_events SET status='sent', sent_at=now(), external_id=$2,
-                    locked_at=NULL, locked_by=NULL WHERE id=$1
-                """,
-                event["id"],
-                external_id,
+            try:
+                await pool.execute(
+                    """
+                    UPDATE outbox_events SET status='sent', sent_at=now(), external_id=$2,
+                        locked_at=NULL, locked_by=NULL WHERE id=$1
+                    """,
+                    event["id"],
+                    external_id,
+                )
+            except Exception as db_exc:
+                logger.error(
+                    "outbox_mark_sent_failed",
+                    extra={"event_id": str(event["id"]), "error": str(db_exc)},
+                )
+        except TelegramRetryAfter as exc:
+            delay = float(exc.retry_after)
+            logger.warning(
+                "outbox_rate_limited",
+                extra={"event_id": str(event["id"]), "retry_after": delay},
             )
+            try:
+                await pool.execute(
+                    """
+                    UPDATE outbox_events SET status='retry', available_at=now() + make_interval(secs => $2),
+                        locked_at=NULL, locked_by=NULL, last_error=$3 WHERE id=$1
+                    """,
+                    event["id"],
+                    delay,
+                    f"TelegramRetryAfter: {delay}s",
+                )
+            except Exception as db_exc:
+                logger.error(
+                    "outbox_status_update_failed",
+                    extra={"event_id": str(event["id"]), "error": str(db_exc)},
+                )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=min(delay, 30.0))
+            except TimeoutError:
+                pass
         except Exception as exc:
-            terminal = event["attempts"] >= 5
-            await pool.execute(
-                """
-                UPDATE outbox_events SET status=$2, available_at=now() + interval '30 seconds',
-                    locked_at=NULL, locked_by=NULL, last_error=$3 WHERE id=$1
-                """,
-                event["id"],
-                "dead" if terminal else "retry",
-                str(exc)[-2000:],
+            is_transient = isinstance(
+                exc,
+                (
+                    TelegramNetworkError,
+                    TelegramServerError,
+                    aiohttp.ClientError,
+                    TimeoutError,
+                    OSError,
+                    ConnectionError,
+                ),
             )
+            terminal = (not is_transient) and (event["attempts"] >= 5)
+            logger.warning(
+                "outbox_delivery_failed",
+                extra={
+                    "event_id": str(event["id"]),
+                    "error": str(exc),
+                    "terminal": terminal,
+                    "attempts": event["attempts"],
+                },
+            )
+            try:
+                await pool.execute(
+                    """
+                    UPDATE outbox_events SET status=$2, available_at=now() + interval '30 seconds',
+                        locked_at=NULL, locked_by=NULL, last_error=$3 WHERE id=$1
+                    """,
+                    event["id"],
+                    "dead" if terminal else "retry",
+                    str(exc)[-2000:],
+                )
+            except Exception as db_exc:
+                logger.error(
+                    "outbox_status_update_failed",
+                    extra={"event_id": str(event["id"]), "error": str(db_exc)},
+                )

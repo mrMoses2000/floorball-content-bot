@@ -1,0 +1,13 @@
+[Unit]
+Description=Floorball content health check
+After=floorball-content-bot.service floorball-content-worker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/moses/tg_bot_floorball_site
+EnvironmentFile=/home/moses/tg_bot_floorball_site/.env
+ExecStart=/home/moses/tg_bot_floorball_site/.venv/bin/floorball-bot health
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only

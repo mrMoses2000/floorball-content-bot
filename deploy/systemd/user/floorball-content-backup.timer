@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Floorball content backup timer
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 Asia/Almaty
+RandomizedDelaySec=15m
+Persistent=true
+Unit=floorball-content-backup.service
+
+[Install]
+WantedBy=timers.target

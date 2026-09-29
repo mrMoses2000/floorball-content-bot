@@ -20,13 +20,20 @@ async def _init_connection(connection: asyncpg.Connection) -> None:
         )
 
 
-async def create_pool(dsn: str, *, min_size: int = 1, max_size: int = 5) -> asyncpg.Pool:
+async def create_pool(
+    dsn: str,
+    *,
+    min_size: int = 1,
+    max_size: int = 5,
+    command_timeout: float | None = 60,
+    timeout: float | None = 30,
+) -> asyncpg.Pool:
     return await asyncpg.create_pool(
         dsn=dsn,
         min_size=min_size,
         max_size=max_size,
-        command_timeout=30,
-        timeout=15,
+        command_timeout=command_timeout,
+        timeout=timeout,
         init=_init_connection,
     )
 

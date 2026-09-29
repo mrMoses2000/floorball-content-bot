@@ -1,0 +1,23 @@
+[Unit]
+Description=Floorball content extraction worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/moses/tg_bot_floorball_site
+EnvironmentFile=/home/moses/tg_bot_floorball_site/.env
+Environment=PATH=/home/moses/.local/bin:/home/moses/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/moses/tg_bot_floorball_site/.venv/bin/floorball-bot worker
+Restart=always
+RestartSec=10s
+TimeoutStopSec=40
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=3G
+TasksMax=128
+
+[Install]
+WantedBy=default.target
