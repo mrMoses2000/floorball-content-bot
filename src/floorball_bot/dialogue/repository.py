@@ -46,10 +46,20 @@ class DialogueSpecRepository:
             (self.root / "index.json").read_text(encoding="utf-8")
         )
 
-    def load(self, mode: DialogueMode | str) -> LoadedDialogueSpec:
+    def load(self, mode: DialogueMode | str, *, sha256: str | None = None) -> LoadedDialogueSpec:
+        if sha256 is not None:
+            for path in sorted(self.root.glob(f"{DialogueMode(mode).value}.v*.json")):
+                loaded = self._load_path(DialogueMode(mode), path)
+                if loaded.sha256 == sha256:
+                    return loaded
+            raise ValueError("pinned dialogue specification is unavailable")
         parsed_mode = DialogueMode(mode)
         entry = self.index.modes[parsed_mode]
         path = (self.root / entry.file).resolve()
+        return self._load_path(parsed_mode, path)
+
+    def _load_path(self, parsed_mode: DialogueMode, path: Path) -> LoadedDialogueSpec:
+        path = path.resolve()
         if path.parent != self.root:
             raise ValueError("dialogue spec path escapes spec root")
         spec = DialogueSpec.model_validate_json(path.read_text(encoding="utf-8"))

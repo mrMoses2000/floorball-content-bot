@@ -535,13 +535,39 @@ async def test_kazakh_transcript_confirmation_queues_extraction(pg_pool):
         """
         INSERT INTO messages(
             session_id, user_id, telegram_chat_id, direction, message_type,
-            original_text, normalized_text, source_language, transcript_confirmed
-        ) VALUES ($1,$2,$3,'inbound','voice','','Қазақша мәтін','kz',FALSE)
+            original_text, normalized_text, source_language, transcript_confirmed,
+            provider_metadata
+        ) VALUES ($1,$2,$3,'inbound','voice','','Қазақша мәтін','kz',FALSE,
+                  '{"transcribed_at":"2026-09-30T12:01:00+00:00"}'::jsonb)
         RETURNING id
         """,
         session_id,
         user_id,
         sender_id,
+    )
+    # A later message finished earlier; the last displayed transcript wins.
+    other_transcript = await pg_pool.fetchval(
+        """
+        INSERT INTO messages(session_id,user_id,telegram_chat_id,direction,message_type,
+                             normalized_text,provider_metadata,created_at)
+        VALUES ($1,$2,$3,'inbound','voice','Earlier completed transcript',
+                '{"transcribed_at":"2026-09-30T12:00:00+00:00"}'::jsonb,
+                now()+interval '1 second') RETURNING id
+        """,
+        session_id, user_id, sender_id,
+    )
+    paused = await pg_pool.fetchval(
+        "INSERT INTO conversation_sessions(user_id,workflow,status) "
+        "VALUES ($1,'strategy','paused') RETURNING id", user_id,
+    )
+    await pg_pool.execute(
+        """
+        INSERT INTO messages(session_id,user_id,telegram_chat_id,direction,message_type,
+                             normalized_text,provider_metadata)
+        VALUES ($1,$2,$3,'inbound','voice','Different questionnaire',
+                '{"transcribed_at":"2026-09-30T12:02:00+00:00"}'::jsonb)
+        """,
+        paused, user_id, sender_id,
     )
     ingress = TelegramIngress(FakeBot(), pg_pool)
 
@@ -557,6 +583,9 @@ async def test_kazakh_transcript_confirmation_queues_extraction(pg_pool):
     assert job["payload"]["text"] == "Қазақша мәтін"
     assert job["payload"]["mode"] == "trainer"
     assert job["payload"]["session_id"] == str(session_id)
+    assert await pg_pool.fetchval(
+        "SELECT transcript_confirmed FROM messages WHERE id=$1", other_transcript
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -591,7 +620,7 @@ async def test_coach_form_role_starts_only_pinned_trainer_dialogue(pg_pool):
     )
     assert session["workflow"] == "trainer"
     assert session["status"] == "active"
-    assert session["definition_version"] == "2026-08-25"
+    assert session["definition_version"] == DialogueSpecRepository().load("trainer").spec.version
     assert len(session["definition_hash"]) == 64
     denied = await pg_pool.fetchval(
         "SELECT payload FROM outbox_events ORDER BY created_at LIMIT 1"

@@ -71,6 +71,7 @@ async def test_batch_transcriber_uploads_async_compatible_bytes(tmp_path, monkey
     path = tmp_path / "voice.wav"
     path.write_bytes(b"test-audio")
     uploads: list[bytes] = []
+    requests: list[dict] = []
 
     class FakeClient:
         async def __aenter__(self):
@@ -84,6 +85,7 @@ async def test_batch_transcriber_uploads_async_compatible_bytes(tmp_path, monkey
             if url.endswith("/upload"):
                 uploads.append(content)
                 return httpx.Response(200, request=request, json={"upload_url": "https://audio"})
+            requests.append(json)
             return httpx.Response(200, request=request, json={"id": "transcript-1"})
 
         async def get(self, url, *, headers):
@@ -95,7 +97,7 @@ async def test_batch_transcriber_uploads_async_compatible_bytes(tmp_path, monkey
                     "text": "Тестовый текст",
                     "language_code": "ru",
                     "audio_duration": 1.0,
-                    "speech_model": "universal-3-pro",
+                    "speech_model_used": "universal-2",
                 },
             )
 
@@ -105,6 +107,9 @@ async def test_batch_transcriber_uploads_async_compatible_bytes(tmp_path, monkey
     assert uploads == [b"test-audio"]
     assert result.provider_id == "transcript-1"
     assert result.text == "Тестовый текст"
+    assert requests[0]["speech_models"] == ["universal-2"]
+    assert requests[0]["language_code"] == "ru"
+    assert result.billing_metadata == {"speech_model": "universal-2"}
 
 
 @pytest.mark.asyncio

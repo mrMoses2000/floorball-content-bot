@@ -26,7 +26,7 @@ async def create_pool(
     min_size: int = 1,
     max_size: int = 5,
     command_timeout: float | None = 60,
-    timeout: float | None = 30,
+    timeout: float | None = 30,  # noqa: ASYNC109 - asyncpg connection timeout, public API
 ) -> asyncpg.Pool:
     return await asyncpg.create_pool(
         dsn=dsn,

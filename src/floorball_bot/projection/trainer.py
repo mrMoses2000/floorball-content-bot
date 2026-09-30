@@ -43,9 +43,7 @@ class ClubProjection(BaseModel):
 class ScheduleProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    day: Literal[
-        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
-    ]
+    day: Literal["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
     time: str = Field(min_length=1, max_length=80)
     venue: str = Field(min_length=1, max_length=240)
     address: str = Field(default="", max_length=300)
@@ -98,8 +96,7 @@ class TrainerProjectionPlan(BaseModel):
         return value
 
 
-def _validated_fields(fields: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    spec = DialogueSpecRepository().load("trainer").spec
+def _validated_fields(fields: Mapping[str, Any], spec) -> tuple[dict[str, Any], list[str]]:
     definitions = {field.id: field for field in spec.fields}
     validated: dict[str, Any] = {}
     blockers: list[str] = []
@@ -152,6 +149,7 @@ def plan_trainer_projection(
     *,
     preferred_language: str,
     city_directory: Sequence[CityDirectoryEntry],
+    spec=None,
 ) -> TrainerProjectionPlan:
     """Build a deterministic, non-mutating canonical projection plan.
 
@@ -159,20 +157,16 @@ def plan_trainer_projection(
     public preview redacts contacts without explicit per-club publication permission.
     """
     language = preferred_language if preferred_language in {"ru", "kz"} else "ru"
-    validated, blockers = _validated_fields(fields)
-    spec = DialogueSpecRepository().load("trainer").spec
+    spec = spec or DialogueSpecRepository().load("trainer").spec
+    validated, blockers = _validated_fields(fields, spec)
     gaps = evaluate_gaps(spec, validated)
-    blockers.extend(
-        gap.field_id for gap in (*gaps.required_to_start, *gaps.required_for_submit)
-    )
+    blockers.extend(gap.field_id for gap in (*gaps.required_to_start, *gaps.required_for_submit))
 
     city_value = validated.get("city")
     city_slug: str | None = None
     proposed_city_name = ""
     if isinstance(city_value, Mapping):
-        city_slug, proposed_city_name, city_blocker = _resolve_city(
-            city_value, city_directory
-        )
+        city_slug, proposed_city_name, city_blocker = _resolve_city(city_value, city_directory)
         if city_blocker:
             blockers.append(city_blocker)
     else:
@@ -205,6 +199,9 @@ def plan_trainer_projection(
         if schedule.get("public_permission") != "да":
             warnings.append(f"schedule[{index}].not_public")
             continue
+        if any(not schedule.get(key) for key in ("day", "time", "venue")):
+            blockers.append(f"schedule[{index}].incomplete")
+            continue
         schedules.append(
             ScheduleProjection(
                 day=schedule["day"],
@@ -214,11 +211,26 @@ def plan_trainer_projection(
                 group=str(schedule.get("group") or ""),
             )
         )
-    if validated.get("players"):
-        warnings.append("players.require_separate_consent_projection")
-    media = validated.get("media")
-    if isinstance(media, Mapping) and (media.get("hero") or media.get("gallery")):
-        warnings.append("media.require_moderation_projection")
+    keys = set()
+    for index, profile in enumerate(validated.get("players", [])):
+        key = profile.get("profile_key")
+        if spec.version == "2026-09-30" and (
+            not isinstance(key, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", key)
+            or key in keys
+        ):
+            blockers.append(f"players[{index}].invalid_profile_key")
+        if spec.version == "2026-09-30" and not isinstance(profile.get("minor"), bool):
+            blockers.append(f"players[{index}].minor_status_missing")
+        keys.add(key)
+        if profile.get("publish_permission") == "да" and (
+            not profile.get("name") or not profile.get("bio")
+        ):
+            blockers.append(f"players[{index}].incomplete")
+    if validated.get("players") and any(
+        item.get("publish_permission") != "да" for item in validated["players"]
+    ):
+        warnings.append("players.without_consent_remain_private")
 
     return TrainerProjectionPlan(
         city_slug=city_slug,

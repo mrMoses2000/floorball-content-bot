@@ -241,13 +241,18 @@ async def test_dialogue_worker_uses_pinned_spec_and_safe_db_snapshot(pg_pool):
         loaded.spec.version,
         loaded.sha256,
     )
-    await pg_pool.execute(
-        "INSERT INTO conversation_memory(session_id) VALUES ($1)", session_id
-    )
+    await pg_pool.execute("INSERT INTO conversation_memory(session_id) VALUES ($1)", session_id)
 
     class EchoExtractor:
         async def extract(
-            self, text, output_model, *, mode=None, context=None, known_fields=None
+            self,
+            text,
+            output_model,
+            *,
+            mode=None,
+            context=None,
+            known_fields=None,
+            spec_sha256=None,
         ):
             _, context_hash = canonical_context(context)
             return ExtractedDialoguePatch(
@@ -291,9 +296,12 @@ async def test_dialogue_worker_uses_pinned_spec_and_safe_db_snapshot(pg_pool):
         "SELECT structured_memory FROM conversation_memory WHERE session_id=$1", session_id
     )
     assert memory["fields"]["respondent"]["name"] == "Тестовый тренер"
-    assert await pg_pool.fetchval(
-        "SELECT count(*) FROM agent_context_snapshots WHERE session_id=$1", session_id
-    ) == 1
+    assert (
+        await pg_pool.fetchval(
+            "SELECT count(*) FROM agent_context_snapshots WHERE session_id=$1", session_id
+        )
+        == 1
+    )
     stored = await pg_pool.fetchval(
         "SELECT context FROM agent_context_snapshots WHERE session_id=$1", session_id
     )

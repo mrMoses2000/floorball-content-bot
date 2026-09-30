@@ -1,5 +1,5 @@
 [Unit]
-Description=Cloudflare Quick Tunnel for Floorball Mini App
+Description=HTTPS tunnel for Floorball Mini App
 After=network-online.target floorball-content-miniapp.service
 Wants=network-online.target floorball-content-miniapp.service
 StartLimitIntervalSec=0
@@ -7,6 +7,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 WorkingDirectory=/home/moses/tg_bot_floorball_site
+EnvironmentFile=/home/moses/tg_bot_floorball_site/.env
 ExecStart=/home/moses/tg_bot_floorball_site/.venv/bin/python /home/moses/tg_bot_floorball_site/scripts/run_tunnel.py
 Restart=always
 RestartSec=8s

@@ -8,7 +8,7 @@ import random
 import re
 from datetime import date
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import aiohttp
 import asyncpg
@@ -61,13 +61,15 @@ from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository, Require
 from floorball_bot.dialogue.evaluator import evaluate_gaps
 from floorball_bot.dialogue.presentation import friendly_question, hidden_from_user
 from floorball_bot.domain import Actor, DraftStatus, Role
-from floorball_bot.errors import AuthorizationError
+from floorball_bot.errors import AuthorizationError, ValidationBlocked
 from floorball_bot.health import record_heartbeat
 from floorball_bot.news_defaults import apply_news_defaults
 from floorball_bot.official_documents import (
     InvalidOfficialDocument,
+    checked_official_pdf,
     format_official_document_status,
     official_document_rows,
+    review_official_document,
     safe_original_filename,
     store_official_pdf,
 )
@@ -96,8 +98,12 @@ TELEGRAM_COMMANDS = (
     BotCommand(command="cancel", description="Отменить текущий диалог"),
     BotCommand(command="review", description="Открыть очередь проверки"),
     BotCommand(command="readiness", description="Проверить готовность контента"),
+    BotCommand(command="media", description="Поля для фотографий анкеты"),
     BotCommand(command="documents", description="Комплект официальных документов"),
     BotCommand(command="document", description="Загрузить официальный PDF"),
+    BotCommand(command="document_view", description="Просмотреть приватный PDF для проверки"),
+    BotCommand(command="document_verify", description="Утвердить публичный PDF"),
+    BotCommand(command="document_reject", description="Отклонить или отозвать PDF"),
     BotCommand(command="document_cancel", description="Отменить загрузку документа"),
 )
 
@@ -120,6 +126,9 @@ ROLE_COMMANDS: dict[str, tuple[Role, ...]] = {
     "/documents": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
     "/document": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
     "/document_cancel": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
+    "/document_view": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
+    "/document_verify": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
+    "/document_reject": (Role.FEDERATION_EDITOR, Role.SUPERADMIN),
 }
 
 COACH_CRITICAL_STEPS = (
@@ -303,6 +312,11 @@ class TelegramIngress:
             for update in updates:
                 try:
                     await self.accept(update)
+                except (asyncpg.PostgresError, TimeoutError, OSError, ConnectionError) as exc:
+                    # Telegram acknowledges every update below the next offset. Keep
+                    # this update and the rest of the batch pending until DB commit.
+                    await self._wait_polling_retry(5.0, type(exc).__name__)
+                    break
                 except Exception as exc:
                     logger.exception(
                         "telegram_update_processing_failed",
@@ -311,15 +325,20 @@ class TelegramIngress:
                     try:
                         await self.pool.execute(
                             """
-                            INSERT INTO processed_updates(update_id, status, completed_at, error_class)
+                            INSERT INTO processed_updates(
+                                update_id, status, completed_at, error_class
+                            )
                             VALUES ($1, 'failed', now(), $2)
-                            ON CONFLICT (update_id) DO UPDATE SET status='failed', completed_at=now(), error_class=$2
+                            ON CONFLICT (update_id) DO UPDATE
+                            SET status='failed', completed_at=now(), error_class=$2
                             """,
                             update.update_id,
                             type(exc).__name__,
                         )
                     except Exception:
-                        pass
+                        logger.exception("telegram_failed_update_not_persisted")
+                        await self._wait_polling_retry(5.0, "failed_update_persistence")
+                        break
                 self.offset = update.update_id + 1
 
     async def _wait_polling_retry(self, delay: float, error_class: str) -> None:
@@ -452,16 +471,18 @@ class TelegramIngress:
                         draft["content"], draft["current_revision"], draft["content_hash"]
                     )
                     callback_markup = {
-                        "inline_keyboard": [[
-                            {
-                                "text": "Одобрить данные",
-                                "callback_data": approve.callback_data,
-                            },
-                            {
-                                "text": "Нужны изменения",
-                                "callback_data": changes.callback_data,
-                            },
-                        ]]
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "Одобрить данные",
+                                    "callback_data": approve.callback_data,
+                                },
+                                {
+                                    "text": "Нужны изменения",
+                                    "callback_data": changes.callback_data,
+                                },
+                            ]
+                        ]
                     }
                 elif action == "review_approve":
                     require_roles(actor, Role.REVIEWER, Role.SUPERADMIN)
@@ -632,14 +653,10 @@ class TelegramIngress:
                 elif action in {"city_application_changes", "city_application_reject"}:
                     require_roles(actor, Role.SUPERADMIN)
                     target_status = (
-                        "changes_requested"
-                        if action == "city_application_changes"
-                        else "rejected"
+                        "changes_requested" if action == "city_application_changes" else "rejected"
                     )
                     event_action = (
-                        "changes_requested"
-                        if action == "city_application_changes"
-                        else "rejected"
+                        "changes_requested" if action == "city_application_changes" else "rejected"
                     )
                     application = await connection.fetchrow(
                         """
@@ -1218,9 +1235,7 @@ class TelegramIngress:
                 connection, actor, update.update_id, message.chat.id, message.text
             )
         elif official_upload_session is not None:
-            await self._handle_official_document_input(
-                connection, actor, update.update_id, message
-            )
+            await self._handle_official_document_input(connection, actor, update.update_id, message)
         elif message.voice or message.audio:
             preferred_language = await connection.fetchval(
                 "SELECT preferred_language FROM users WHERE id=$1", actor.user_id
@@ -1234,6 +1249,7 @@ class TelegramIngress:
                 kind="transcribe",
                 payload={
                     "path": str(media_path),
+                    "message_id": str(message_record_id),
                     "chat_id": message.chat.id,
                     "language": preferred_language or "ru",
                     "session_id": str(dialogue_session["id"]) if dialogue_session else None,
@@ -1245,6 +1261,52 @@ class TelegramIngress:
         elif message.photo or (
             message.document and (message.document.mime_type or "").startswith("image/")
         ):
+            field_path = None
+            expected_record = None
+            if not dialogue_session:
+                await self._reply(
+                    connection,
+                    update.update_id,
+                    message.chat.id,
+                    "Сначала откройте анкету или создайте новость.",
+                )
+                return
+            if dialogue_session["workflow"] != "news":
+                from floorball_bot.attachments import attachment_field, record_identity
+                from floorball_bot.dialogue.models import FieldType
+
+                parts = (message.caption or "").split()
+                if len(parts) != 2 or parts[0] != "/attach":
+                    await self._reply(
+                        connection,
+                        update.update_id,
+                        message.chat.id,
+                        "Укажите поле в подписи к фотографии: /attach media.hero. "
+                        "Список доступных полей: /media.",
+                    )
+                    return
+                field_path = parts[1]
+                loaded = self.dialogues.load(
+                    dialogue_session["workflow"], sha256=dialogue_session["definition_hash"]
+                )
+                memory = await connection.fetchval(
+                    "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
+                    dialogue_session["id"],
+                )
+                try:
+                    parent, record, _ = attachment_field(
+                        loaded.spec, (memory or {}).get("fields") or {}, field_path
+                    )
+                except ValidationBlocked:
+                    await self._reply(
+                        connection,
+                        update.update_id,
+                        message.chat.id,
+                        "Такого поля нет. Сначала заполните профиль; список полей: /media.",
+                    )
+                    return
+                if parent.type == FieldType.RECORD_LIST:
+                    expected_record = record_identity(record)
             media = message.photo[-1] if message.photo else message.document
             media_path = await self._download_file(media, ".image")
             await enqueue_job(
@@ -1256,17 +1318,17 @@ class TelegramIngress:
                     "user_id": str(actor.user_id),
                     "filename": getattr(media, "file_name", None) or "telegram-image",
                     "session_id": str(dialogue_session["id"]) if dialogue_session else None,
-                    "session_workflow": dialogue_session["workflow"]
-                    if dialogue_session
-                    else None,
+                    "session_workflow": dialogue_session["workflow"] if dialogue_session else None,
                     "message_id": str(message_record_id),
                     "telegram_message_id": message.message_id,
                     "telegram_media_group_id": str(message.media_group_id or ""),
                     "caption": (message.caption or "")[:600],
+                    "field_path": field_path,
+                    "expected_record": expected_record,
                 },
                 idempotency_key=stable_idempotency_key("media", update.update_id),
             )
-            if message.caption and dialogue_session:
+            if message.caption and dialogue_session["workflow"] == "news":
                 await enqueue_job(
                     connection,
                     kind="extract",
@@ -1312,14 +1374,29 @@ class TelegramIngress:
                   AND m.message_type IN ('voice','audio')
                   AND m.transcript_confirmed=FALSE
                   AND m.normalized_text <> ''
-                ORDER BY m.created_at DESC
+                  AND (m.session_id=$3 OR (m.session_id IS NULL AND $3::uuid IS NULL))
+                ORDER BY m.provider_metadata->>'transcribed_at' DESC NULLS LAST,
+                         m.created_at DESC
                 LIMIT 1
                 FOR UPDATE OF m
                 """,
                 actor.user_id,
                 message.chat.id,
+                dialogue_session["id"] if dialogue_session else None,
             )
             if pending_transcript:
+                if pending_transcript["session_id"] is None:
+                    await connection.execute(
+                        "UPDATE messages SET transcript_confirmed=TRUE WHERE id=$1",
+                        pending_transcript["id"],
+                    )
+                    await self._reply(
+                        connection,
+                        update.update_id,
+                        message.chat.id,
+                        "Выберите анкету и отправьте сообщение в ней, чтобы сохранить ответ.",
+                    )
+                    return
                 confirmations = {
                     "подтверждаю",
                     "подтвердить",
@@ -1446,24 +1523,28 @@ class TelegramIngress:
     ) -> None:
         if not message.text:
             await self._reply(
-                connection, update_id, message.chat.id,
+                connection,
+                update_id,
+                message.chat.id,
                 "Заявка на новый город пока принимает только текст.",
             )
             return
-        application = await get_or_create_city_application(
-            connection, applicant_id=applicant_id
-        )
+        application = await get_or_create_city_application(connection, applicant_id=applicant_id)
         command = canonical_command(message.text) if message.text.startswith("/") else ""
         if command == "/status":
             await self._reply(
-                connection, update_id, message.chat.id,
+                connection,
+                update_id,
+                message.chat.id,
                 self._city_application_progress(application),
             )
             return
         if command == "/resume":
             if application["status"] == "under_review":
                 await self._reply(
-                    connection, update_id, message.chat.id,
+                    connection,
+                    update_id,
+                    message.chat.id,
                     "Проверка уже началась. Дождитесь решения проверяющего.",
                 )
                 return
@@ -1476,14 +1557,18 @@ class TelegramIngress:
                     application["id"],
                 )
             await self._reply(
-                connection, update_id, message.chat.id,
+                connection,
+                update_id,
+                message.chat.id,
                 self._city_application_progress(application),
             )
             return
         if command == "/cancel":
             if application["status"] not in {"collecting", "changes_requested"}:
                 await self._reply(
-                    connection, update_id, message.chat.id,
+                    connection,
+                    update_id,
+                    message.chat.id,
                     "Отправленную или проверенную заявку нельзя отменить этой командой.",
                 )
                 return
@@ -1496,7 +1581,8 @@ class TelegramIngress:
                 INSERT INTO city_application_events(application_id, applicant_id, action)
                 VALUES ($1,$2,'cancelled')
                 """,
-                application["id"], applicant_id,
+                application["id"],
+                applicant_id,
             )
             await self._reply(connection, update_id, message.chat.id, "Заявка отменена.")
             return
@@ -1507,13 +1593,17 @@ class TelegramIngress:
             return
         if command:
             await self._reply(
-                connection, update_id, message.chat.id,
+                connection,
+                update_id,
+                message.chat.id,
                 "Доступны команды /status, /resume, /submit и /cancel.",
             )
             return
         if application["status"] != "collecting":
             await self._reply(
-                connection, update_id, message.chat.id,
+                connection,
+                update_id,
+                message.chat.id,
                 self._city_application_progress(application),
             )
             return
@@ -1527,7 +1617,9 @@ class TelegramIngress:
         )
         if recent_answers >= 30:
             await self._reply(
-                connection, update_id, message.chat.id,
+                connection,
+                update_id,
+                message.chat.id,
                 "Слишком много ответов за короткое время. Продолжите через 10 минут.",
             )
             return
@@ -1537,7 +1629,9 @@ class TelegramIngress:
         field = self._next_city_application_field(loaded.spec, fields, skipped)
         if field is None:
             await self._reply(
-                connection, update_id, message.chat.id,
+                connection,
+                update_id,
+                message.chat.id,
                 "Все вопросы пройдены. Отправьте /submit.",
             )
             return
@@ -1548,7 +1642,9 @@ class TelegramIngress:
                 RequirementLevel.REQUIRED_FOR_SUBMIT,
             }:
                 await self._reply(
-                    connection, update_id, message.chat.id,
+                    connection,
+                    update_id,
+                    message.chat.id,
                     "Этот ответ обязателен для отправки заявки.\n\n"
                     + self._city_application_progress(application),
                 )
@@ -1559,14 +1655,17 @@ class TelegramIngress:
                 fields[field.id] = parse_city_proposal_answer(field, message.text)
             except CityApplicationRejected as exc:
                 await self._reply(
-                    connection, update_id, message.chat.id,
+                    connection,
+                    update_id,
+                    message.chat.id,
                     f"Ответ не принят: {exc}.\n\n{field.question.ru}",
                 )
                 return
         if field.id == "applicant_name" and field.id in fields:
             await connection.execute(
                 "UPDATE city_applicants SET display_name=$2, updated_at=now() WHERE id=$1",
-                applicant_id, fields[field.id],
+                applicant_id,
+                fields[field.id],
             )
         next_field = self._next_city_application_field(loaded.spec, fields, skipped)
         slug = canonical_city_slug(fields["city_name_ru"]) if fields.get("city_name_ru") else ""
@@ -1576,8 +1675,11 @@ class TelegramIngress:
                 current_step=$4, slug_candidate=$5, revision=revision+1, updated_at=now()
             WHERE id=$1 RETURNING *
             """,
-            application["id"], fields, sorted(skipped),
-            next_field.id if next_field else "ready_to_submit", slug,
+            application["id"],
+            fields,
+            sorted(skipped),
+            next_field.id if next_field else "ready_to_submit",
+            slug,
         )
         await connection.execute(
             """
@@ -1585,11 +1687,14 @@ class TelegramIngress:
                 application_id, applicant_id, action, metadata
             ) VALUES ($1,$2,'answer',$3::jsonb)
             """,
-            application["id"], applicant_id,
+            application["id"],
+            applicant_id,
             {"field_id": field.id, "skipped": is_skip},
         )
         await self._reply(
-            connection, update_id, message.chat.id,
+            connection,
+            update_id,
+            message.chat.id,
             self._city_application_progress(application),
         )
 
@@ -1598,7 +1703,9 @@ class TelegramIngress:
     ) -> None:
         if application["status"] != "collecting":
             await self._reply(
-                connection, update_id, chat_id,
+                connection,
+                update_id,
+                chat_id,
                 self._city_application_progress(application),
             )
             return
@@ -1610,19 +1717,26 @@ class TelegramIngress:
                 gap.field_id for gap in (*gaps.required_to_start, *gaps.required_for_submit)
             )
             await self._reply(
-                connection, update_id, chat_id,
+                connection,
+                update_id,
+                chat_id,
                 f"Для отправки не хватает: {missing}.\n\n"
                 + self._city_application_progress(application),
             )
             return
         slug = canonical_city_slug(fields["city_name_ru"])
         duplicates = await application_duplicate_reasons(
-            connection, application_id=application["id"],
-            name_ru=fields["city_name_ru"], name_kz=fields["city_name_kz"], slug=slug,
+            connection,
+            application_id=application["id"],
+            name_ru=fields["city_name_ru"],
+            name_kz=fields["city_name_kz"],
+            slug=slug,
         )
         if duplicates:
             await self._reply(
-                connection, update_id, chat_id,
+                connection,
+                update_id,
+                chat_id,
                 "Похожий город или заявка уже существует: " + "; ".join(duplicates),
             )
             return
@@ -1631,14 +1745,16 @@ class TelegramIngress:
             UPDATE city_applications SET status='submitted', slug_candidate=$2,
                 submitted_at=now(), updated_at=now() WHERE id=$1
             """,
-            application["id"], slug,
+            application["id"],
+            slug,
         )
         await connection.execute(
             """
             INSERT INTO city_application_events(application_id, applicant_id, action)
             VALUES ($1,$2,'submitted')
             """,
-            application["id"], applicant_id,
+            application["id"],
+            applicant_id,
         )
         recipients = await connection.fetch(
             """
@@ -1650,20 +1766,23 @@ class TelegramIngress:
         )
         for recipient in recipients:
             await enqueue_outbox(
-                connection, event_type="telegram_message",
-                    payload={
-                        "chat_id": recipient["telegram_id"],
-                        "text": (
-                            f"Новая заявка на город {fields['city_name_ru']}. "
-                            "Откройте /city-applications."
-                        ),
+                connection,
+                event_type="telegram_message",
+                payload={
+                    "chat_id": recipient["telegram_id"],
+                    "text": (
+                        f"Новая заявка на город {fields['city_name_ru']}. "
+                        "Откройте /city-applications."
+                    ),
                 },
                 idempotency_key=stable_idempotency_key(
                     "city-application-submitted", application["id"], recipient["telegram_id"]
                 ),
             )
         await self._reply(
-            connection, update_id, chat_id,
+            connection,
+            update_id,
+            chat_id,
             "Заявка отправлена superadmin. Город и права не создаются автоматически.",
         )
 
@@ -1868,12 +1987,12 @@ class TelegramIngress:
         normalized = text.strip().casefold()
         command = canonical_command(normalized)
         if command in {"/coach-form", "/news"}:
-            requested = (
-                DialogueMode.TRAINER if command == "/coach-form" else DialogueMode.NEWS
+            requested = DialogueMode.TRAINER if command == "/coach-form" else DialogueMode.NEWS
+            return (
+                requested
+                if any(loaded.spec.mode == requested for loaded in self._available_dialogues(actor))
+                else None
             )
-            return requested if any(
-                loaded.spec.mode == requested for loaded in self._available_dialogues(actor)
-            ) else None
         for loaded in self._available_dialogues(actor):
             if normalized in {
                 loaded.spec.ui_label.ru.casefold(),
@@ -1894,14 +2013,25 @@ class TelegramIngress:
         if not {role.value for role in actor.roles}.intersection(loaded.spec.allowed_roles):
             await self._reply(connection, update_id, chat_id, "Этот вариант вам недоступен.")
             return
+        await connection.execute("SELECT id FROM users WHERE id=$1 FOR UPDATE", actor.user_id)
+        await connection.execute(
+            """
+            UPDATE conversation_sessions SET status='paused', updated_at=now()
+            WHERE user_id=$1 AND workflow<>$2 AND status='active'
+            """,
+            actor.user_id,
+            mode.value,
+        )
         session = await connection.fetchrow(
             """
             SELECT id FROM conversation_sessions
-            WHERE user_id=$1 AND workflow=$2 AND status='active'
+            WHERE user_id=$1 AND workflow=$2 AND status IN ('active','paused')
+              AND definition_hash=$3
             ORDER BY last_activity_at DESC LIMIT 1 FOR UPDATE
             """,
             actor.user_id,
             mode.value,
+            loaded.sha256,
         )
         if session is None:
             await connection.execute(
@@ -1935,10 +2065,18 @@ class TelegramIngress:
             )
             intro = f"Начинаем: {loaded.spec.ui_label.ru.lower()}.\n\n"
         else:
-            memory = await connection.fetchval(
-                "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
+            await connection.execute(
+                "UPDATE conversation_sessions SET status='active', last_activity_at=now() "
+                "WHERE id=$1",
                 session["id"],
-            ) or {}
+            )
+            memory = (
+                await connection.fetchval(
+                    "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
+                    session["id"],
+                )
+                or {}
+            )
             fields = dict(memory.get("fields", {}))
             intro = "Продолжаем с сохранённого места.\n\n"
         language = await connection.fetchval(
@@ -1998,6 +2136,7 @@ class TelegramIngress:
             "/submit",
             "/skip",
             "/photos-ready",
+            "/media",
         }:
             return False
         if command == "/cancel":
@@ -2011,7 +2150,27 @@ class TelegramIngress:
             )
             await self._reply(connection, update_id, chat_id, "Разговор отменён.")
             return True
-        loaded = self.dialogues.load(session["workflow"])
+        loaded = self.dialogues.load(session["workflow"], sha256=session["definition_hash"])
+        if command == "/media":
+            from floorball_bot.attachments import upload_targets
+
+            memory = await connection.fetchval(
+                "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
+                session["id"],
+            )
+            targets = upload_targets(loaded.spec, (memory or {}).get("fields") or {}, "ru")
+            text = "Отправьте фотографию с одной из этих подписей:\n" + "\n".join(
+                f"/attach {item['path']} — {item['label']}" for item in targets
+            )
+            if session["workflow"] == "news":
+                text = "Отправляйте фотографии без команды в подписи, затем /photos-ready."
+            elif not targets:
+                text = (
+                    "Здесь нет полей для фотографий. Сначала добавьте профиль, "
+                    "если он предусмотрен анкетой."
+                )
+            await self._reply(connection, update_id, chat_id, text[:4000])
+            return True
         if loaded.sha256 != session["definition_hash"]:
             await self._reply(
                 connection,
@@ -2065,21 +2224,31 @@ class TelegramIngress:
                     "решение всё равно принимает редактор."
                 ),
                 reply_markup={
-                    "inline_keyboard": [[{
-                        "text": f"Подтверждаю права на {count} фото",
-                        "callback_data": callback.callback_data,
-                    }]]
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": f"Подтверждаю права на {count} фото",
+                                "callback_data": callback.callback_data,
+                            }
+                        ]
+                    ]
                 },
             )
             return True
-        memory = await connection.fetchval(
-            "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
-            session["id"],
-        ) or {}
+        memory = (
+            await connection.fetchval(
+                "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
+                session["id"],
+            )
+            or {}
+        )
         fields = dict(memory.get("fields", {}))
-        language = await connection.fetchval(
-            "SELECT preferred_language FROM users WHERE id=$1", actor.user_id
-        ) or "ru"
+        language = (
+            await connection.fetchval(
+                "SELECT preferred_language FROM users WHERE id=$1", actor.user_id
+            )
+            or "ru"
+        )
         if command in {"/status", "/resume", "/skip"}:
             await self._reply(
                 connection,
@@ -2129,8 +2298,7 @@ class TelegramIngress:
             pending_media = [
                 row
                 for row in media_rows
-                if row["consent_status"] != "granted"
-                or row["moderation_status"] != "approved"
+                if row["consent_status"] != "granted" or row["moderation_status"] != "approved"
             ]
             if pending_media:
                 await self._reply(
@@ -2160,9 +2328,7 @@ class TelegramIngress:
         }
         if media_manifest:
             content["media_manifest"] = media_manifest
-        canonical = json.dumps(
-            content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
+        canonical = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         entity_type = (
             "city"
             if session["workflow"] == DialogueMode.TRAINER
@@ -2271,9 +2437,12 @@ class TelegramIngress:
     async def _coach_memory(
         self, connection: asyncpg.Connection, session_id
     ) -> tuple[dict[str, str], set[str]]:
-        memory = await connection.fetchval(
-            "SELECT structured_memory FROM conversation_memory WHERE session_id=$1", session_id
-        ) or {}
+        memory = (
+            await connection.fetchval(
+                "SELECT structured_memory FROM conversation_memory WHERE session_id=$1", session_id
+            )
+            or {}
+        )
         fields = {
             field: str(value)
             for field, value in dict(memory.get("fields", {})).items()
@@ -2626,9 +2795,7 @@ class TelegramIngress:
         elif step == "valid_until":
             try:
                 value_date = (
-                    None
-                    if text.casefold() in {"/skip", "/no_expiry"}
-                    else date.fromisoformat(text)
+                    None if text.casefold() in {"/skip", "/no_expiry"} else date.fromisoformat(text)
                 )
             except ValueError:
                 await self._reply(
@@ -2785,15 +2952,23 @@ class TelegramIngress:
                 "/city_applications /readiness /documents /document /publish /users /revert."
             )
         elif command == "/documents":
-            response = format_official_document_status(
-                await official_document_rows(connection)
+            response = format_official_document_status(await official_document_rows(connection))
+            pending = await connection.fetch(
+                "SELECT id,title_ru,sha256 FROM official_documents "
+                "WHERE status IN ('received','verified') ORDER BY created_at DESC LIMIT 3"
             )
+            for document in pending:
+                response += (
+                    f"\n\n{document['title_ru']}\n"
+                    f"Просмотр: /document_view {document['id']}\n"
+                    f"Одобрение после проверки: /document_verify "
+                    f"{document['id']} {document['sha256']}\n"
+                    f"Отзыв: /document_reject {document['id']} {document['sha256']}"
+                )
         elif command == "/document":
             parts = text.strip().split(maxsplit=1)
             if len(parts) == 1 or not parts[1].strip():
-                response = format_official_document_status(
-                    await official_document_rows(connection)
-                )
+                response = format_official_document_status(await official_document_rows(connection))
             else:
                 await self._start_official_document_upload(
                     connection,
@@ -2803,10 +2978,53 @@ class TelegramIngress:
                     parts[1].strip().casefold(),
                 )
                 return
+        elif command in {"/document_view", "/document_verify", "/document_reject"}:
+            parts = text.split()
+            try:
+                expected_length = 2 if command == "/document_view" else 3
+                if len(parts) != expected_length:
+                    raise InvalidOfficialDocument(
+                        "Откройте /documents и скопируйте команду проверки."
+                    )
+                document_id = UUID(parts[1])
+                if command == "/document_view":
+                    document = await connection.fetchrow(
+                        "SELECT * FROM official_documents WHERE id=$1", document_id
+                    )
+                    if not document:
+                        raise InvalidOfficialDocument("Документ не найден.")
+                    checked_official_pdf(document, self.download_root.parent)
+                    await enqueue_outbox(
+                        connection,
+                        event_type="telegram_message",
+                        payload={"chat_id": chat_id, "document_id": str(document_id)},
+                        idempotency_key=stable_idempotency_key("document-view", update_id),
+                    )
+                    response = (
+                        f"Проверьте файл и метаданные: {document['title_ru']}; "
+                        f"№ {document['document_number'] or 'не указан'}; "
+                        f"выдан {document['issued_on']}; действует до {document['valid_until']}; "
+                        "публикация разрешена: "
+                        f"{'да' if document['publication_allowed'] else 'нет'}. "
+                        "После проверки скопируйте команду из /documents."
+                    )
+                else:
+                    response = await review_official_document(
+                        connection,
+                        document_id=document_id,
+                        expected_sha=parts[2],
+                        actor_id=actor.user_id,
+                        verify=command == "/document_verify",
+                        media_root=self.download_root.parent,
+                    )
+            except (ValueError, InvalidOfficialDocument) as exc:
+                response = (
+                    str(exc)
+                    if isinstance(exc, InvalidOfficialDocument)
+                    else "Неверный ID документа."
+                )
         elif command == "/document_cancel":
-            await self._cancel_official_document_upload(
-                connection, actor, update_id, chat_id
-            )
+            await self._cancel_official_document_upload(connection, actor, update_id, chat_id)
             return
         elif command == "/readiness":
             await enqueue_job(
@@ -2846,10 +3064,14 @@ class TelegramIngress:
                         target_id=row["id"],
                         ttl_seconds=7 * 24 * 60 * 60,
                     )
-                    keyboard.append([{
-                        "text": f"Проверить: {label[:48]}",
-                        "callback_data": callback.callback_data,
-                    }])
+                    keyboard.append(
+                        [
+                            {
+                                "text": f"Проверить: {label[:48]}",
+                                "callback_data": callback.callback_data,
+                            }
+                        ]
+                    )
                 await self._reply(
                     connection,
                     update_id,
@@ -2895,10 +3117,14 @@ class TelegramIngress:
                         target_id=row["id"],
                         ttl_seconds=7 * 24 * 60 * 60,
                     )
-                    keyboard.append([{
-                        "text": f"Проверить: {label[:48]}",
-                        "callback_data": callback.callback_data,
-                    }])
+                    keyboard.append(
+                        [
+                            {
+                                "text": f"Проверить: {label[:48]}",
+                                "callback_data": callback.callback_data,
+                            }
+                        ]
+                    )
                 await self._reply(
                     connection,
                     update_id,
@@ -2980,7 +3206,14 @@ class TelegramIngress:
         return "text"
 
 
-async def run_outbox(bot: Bot, pool: asyncpg.Pool, worker_id: str, stop: asyncio.Event) -> None:
+async def run_outbox(
+    bot: Bot,
+    pool: asyncpg.Pool,
+    worker_id: str,
+    stop: asyncio.Event,
+    *,
+    media_root: Path = Path("var/media"),
+) -> None:
     db_retry_delay = 1.0
     while not stop.is_set():
         event = None
@@ -3038,7 +3271,28 @@ async def run_outbox(bot: Bot, pool: asyncpg.Pool, worker_id: str, stop: asyncio
             continue
         try:
             payload = event["payload"]
-            if event["event_type"] == "telegram_media_group":
+            if payload.get("document_id"):
+                actor = await get_actor_by_telegram_id(pool, int(payload["chat_id"]))
+                if (
+                    not actor
+                    or not actor.active
+                    or not actor.has_any_role(Role.FEDERATION_EDITOR, Role.SUPERADMIN)
+                ):
+                    raise AuthorizationError("private PDF access has been revoked")
+                document = await pool.fetchrow(
+                    "SELECT * FROM official_documents WHERE id=$1", UUID(payload["document_id"])
+                )
+                if not document:
+                    raise InvalidOfficialDocument("Документ недоступен.")
+                path = checked_official_pdf(document, media_root)
+                sent = await bot.send_document(
+                    chat_id=payload["chat_id"],
+                    document=FSInputFile(
+                        path, filename=safe_original_filename(document["original_filename"])
+                    ),
+                )
+                external_id = str(sent.message_id)
+            elif event["event_type"] == "telegram_media_group":
                 paths = [Path(item) for item in payload.get("paths", [])]
                 if not 1 <= len(paths) <= 10 or any(not item.is_file() for item in paths):
                     raise ValueError("media group requires 1-10 existing artifact files")
@@ -3049,9 +3303,7 @@ async def run_outbox(bot: Bot, pool: asyncpg.Pool, worker_id: str, stop: asyncio
                     )
                     for index, path in enumerate(paths)
                 ]
-                sent_group = await bot.send_media_group(
-                    chat_id=payload["chat_id"], media=media
-                )
+                sent_group = await bot.send_media_group(chat_id=payload["chat_id"], media=media)
                 external_id = ",".join(str(item.message_id) for item in sent_group)
             else:
                 sent = await bot.send_message(
@@ -3083,7 +3335,8 @@ async def run_outbox(bot: Bot, pool: asyncpg.Pool, worker_id: str, stop: asyncio
             try:
                 await pool.execute(
                     """
-                    UPDATE outbox_events SET status='retry', available_at=now() + make_interval(secs => $2),
+                    UPDATE outbox_events
+                    SET status='retry', available_at=now() + make_interval(secs => $2),
                         locked_at=NULL, locked_by=NULL, last_error=$3 WHERE id=$1
                     """,
                     event["id"],

@@ -22,7 +22,8 @@ async def health_pool():
         await pool.close()
         raise RuntimeError(f"refusing destructive fixture database: {database}")
     await pool.execute(
-        "TRUNCATE users, jobs, outbox_events, runtime_heartbeats RESTART IDENTITY CASCADE"
+        "TRUNCATE users, jobs, outbox_events, runtime_heartbeats, processed_updates "
+        "RESTART IDENTITY CASCADE"
     )
     yield pool
     await pool.close()
@@ -53,6 +54,14 @@ async def test_health_accepts_fresh_heartbeats_and_backup(health_pool, tmp_path)
     assert report["telegram_polling"] == "ok"
     assert report["worker"] == "ok"
     assert report["backup_status"] == "ok"
+
+    await health_pool.execute(
+        "INSERT INTO processed_updates(update_id,status,error_class) "
+        "VALUES (1,'failed','ValueError')"
+    )
+    report = await health_report(health_pool, tmp_path / "media", tmp_path / "backups")
+    assert report["ok"] is False
+    assert report["failed_updates"] == 1
 
 
 @pytest.mark.postgres

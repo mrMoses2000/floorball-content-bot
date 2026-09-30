@@ -45,7 +45,7 @@ class AssemblyAIBatchTranscriber:
         self.timeout_seconds = timeout_seconds
 
     async def transcribe(self, path: Path, language: str) -> TranscriptResult:
-        if language == "kz":
+        if language in {"kz", "kk"}:
             raise PermanentProviderError("Kazakh must use the verified Whisper streaming provider")
         headers = {"authorization": self.api_key}
         timeout = httpx.Timeout(30, read=60)
@@ -61,7 +61,7 @@ class AssemblyAIBatchTranscriber:
                 request = {
                     "audio_url": upload.json()["upload_url"],
                     "language_code": "ru" if language == "ru" else language,
-                    "speech_models": ["universal-3-pro"],
+                    "speech_models": ["universal-2"],
                     "punctuate": True,
                     "format_text": True,
                 }
@@ -84,7 +84,10 @@ class AssemblyAIBatchTranscriber:
                             language=data.get("language_code") or language,
                             confidence=data.get("confidence"),
                             duration_seconds=data.get("audio_duration"),
-                            billing_metadata={"speech_model": data.get("speech_model")},
+                            billing_metadata={
+                                "speech_model": data.get("speech_model_used")
+                                or data.get("speech_model")
+                            },
                         )
                     if data["status"] == "error":
                         raise PermanentProviderError(data.get("error") or "AssemblyAI error")

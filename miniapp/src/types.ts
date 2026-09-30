@@ -23,6 +23,7 @@ export type Field = {
 }
 
 export type Workflow = {
+  upload_targets?: { path: string; label: string }[]
   mode: string
   label: string
   session_id: string | null

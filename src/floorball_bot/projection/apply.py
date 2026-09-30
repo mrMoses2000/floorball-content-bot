@@ -11,6 +11,7 @@ from floorball_bot.auth import require_roles
 from floorball_bot.dialogue.repository import DialogueSpecRepository
 from floorball_bot.domain import Actor, Role
 from floorball_bot.projection.trainer import CityDirectoryEntry, plan_trainer_projection
+from floorball_bot.projection.trainer_assets import apply_trainer_assets
 from floorball_bot.workflow import canonical_hash
 
 
@@ -45,12 +46,11 @@ class TrainerInspectionResult(BaseModel):
     public_preview: dict[str, Any]
 
 
-async def _canonical_snapshot(
-    connection: asyncpg.Connection, city_id: UUID
-) -> dict[str, Any]:
+async def _canonical_snapshot(connection: asyncpg.Connection, city_id: UUID) -> dict[str, Any]:
     city = await connection.fetchrow(
         """
-        SELECT slug, players_estimate, coaches_estimate, clubs_estimate, data_status, revision
+        SELECT slug, hero_url, players_estimate, coaches_estimate, clubs_estimate,
+               data_status, revision
         FROM cities WHERE id=$1
         """,
         city_id,
@@ -81,7 +81,22 @@ async def _canonical_snapshot(
         """,
         city_id,
     )
+    players = await connection.fetch(
+        """SELECT p.source_key,p.name_ru,p.name_kz,p.bio_ru,p.bio_kz,p.photo_url,
+                  p.selected_for_publication,p.approved_for_publication,p.revision
+           FROM players p JOIN player_city_memberships m ON m.player_id=p.id
+           WHERE m.city_id=$1 AND m.valid_to IS NULL ORDER BY p.source_key,p.id""",
+        city_id,
+    )
+    gallery = await connection.fetch(
+        """SELECT source_key,src,thumbnail,caption_ru,caption_kz,sort_order,
+                  deleted_at IS NOT NULL AS deleted FROM city_gallery_items
+           WHERE city_id=$1 ORDER BY source_key""",
+        city_id,
+    )
     return {
+        "players": [dict(row) for row in players],
+        "gallery": [dict(row) for row in gallery],
         "city": dict(city) if city else None,
         "content": dict(content) if content else None,
         "clubs": [dict(row) for row in clubs],
@@ -122,7 +137,10 @@ async def inspect_trainer_draft(
             raise ProjectionRejected("draft or current revision not found")
         if row["workflow"] != "trainer":
             raise ProjectionRejected("draft is not a trainer dialogue")
-        loaded = DialogueSpecRepository().load("trainer")
+        try:
+            loaded = DialogueSpecRepository().load("trainer", sha256=row["definition_hash"])
+        except ValueError as exc:
+            raise ProjectionRejected("dialogue definition hash changed") from exc
         if (
             row["definition_hash"] != loaded.sha256
             or row["definition_version"] != loaded.spec.version
@@ -148,6 +166,7 @@ async def inspect_trainer_draft(
         plan = plan_trainer_projection(
             _require_mapping(content.get("fields"), "revision fields"),
             preferred_language=row["preferred_language"],
+            spec=loaded.spec,
             city_directory=tuple(
                 CityDirectoryEntry(**dict(directory_row)) for directory_row in directory_rows
             ),
@@ -208,8 +227,8 @@ async def _replace_draft_owned_children(
     actor_id: UUID,
     plan,
 ) -> None:
-    club_prefix = f"draft:{draft_id}:club:"
-    schedule_prefix = f"draft:{draft_id}:schedule:"
+    club_prefix = f"draft:city-{city_id}:club:"
+    schedule_prefix = f"draft:city-{city_id}:schedule:"
     club_keys = [f"{club_prefix}{index}" for index in range(len(plan.clubs))]
     schedule_keys = [f"{schedule_prefix}{index}" for index in range(len(plan.schedules))]
 
@@ -219,7 +238,7 @@ async def _replace_draft_owned_children(
         WHERE city_id=$1 AND source_key LIKE $2 AND NOT (source_key=ANY($4::text[]))
         """,
         city_id,
-        f"{club_prefix}%",
+        "draft:%:club:%",
         actor_id,
         club_keys,
     )
@@ -260,7 +279,7 @@ async def _replace_draft_owned_children(
         WHERE city_id=$1 AND source_key LIKE $2 AND NOT (source_key=ANY($4::text[]))
         """,
         city_id,
-        f"{schedule_prefix}%",
+        "draft:%:schedule:%",
         actor_id,
         schedule_keys,
     )
@@ -313,6 +332,7 @@ async def apply_approved_trainer_draft(
             SELECT d.id, d.entity_type, d.city_id, d.status, d.current_revision,
                    d.approved_revision, r.content, r.content_hash,
                    s.workflow, s.definition_version, s.definition_hash, s.context_hash,
+                   s.id AS session_id, s.user_id AS author_id,
                    u.preferred_language
             FROM drafts d
             JOIN conversation_sessions s ON s.id=d.session_id
@@ -335,7 +355,10 @@ async def apply_approved_trainer_draft(
         if row["content"] is None:
             raise ProjectionRejected("approved revision content is missing")
 
-        loaded = DialogueSpecRepository().load("trainer")
+        try:
+            loaded = DialogueSpecRepository().load("trainer", sha256=row["definition_hash"])
+        except ValueError as exc:
+            raise ProjectionRejected("dialogue definition hash changed") from exc
         if row["definition_hash"] != loaded.sha256:
             raise ProjectionRejected("dialogue definition hash changed")
         if row["definition_version"] != loaded.spec.version:
@@ -383,6 +406,7 @@ async def apply_approved_trainer_draft(
         plan = plan_trainer_projection(
             fields,
             preferred_language=row["preferred_language"],
+            spec=loaded.spec,
             city_directory=directory,
         )
         if not plan.ready:
@@ -432,6 +456,17 @@ async def apply_approved_trainer_draft(
             city_id=city_id,
             actor_id=actor.user_id,
             plan=plan,
+        )
+        await apply_trainer_assets(
+            connection,
+            fields=fields,
+            city_id=city_id,
+            city_slug=plan.city_slug,
+            session_id=row["session_id"],
+            draft_id=draft_id,
+            actor_id=actor.user_id,
+            author_id=row["author_id"],
+            language=row["preferred_language"],
         )
         after = canonical_hash(await _canonical_snapshot(connection, city_id))
         application_id = await connection.fetchval(

@@ -8,6 +8,29 @@ from floorball_bot.domain import Actor, Role, normalize_phone, verify_self_conta
 from floorball_bot.errors import AuthorizationError
 
 
+async def provision_telegram_user(
+    connection: asyncpg.Connection, *, telegram_id: int, display_name: str
+) -> UUID:
+    """Provision a known Telegram identity without granting any roles."""
+    if telegram_id <= 0 or not display_name.strip():
+        raise ValueError("positive Telegram user ID and display name are required")
+    user_id = await connection.fetchval(
+        """
+        INSERT INTO users(telegram_id, display_name)
+        VALUES ($1,$2)
+        ON CONFLICT (telegram_id) DO UPDATE
+        SET display_name=EXCLUDED.display_name, updated_at=now()
+        WHERE users.active=TRUE AND users.deleted_at IS NULL
+        RETURNING id
+        """,
+        telegram_id,
+        display_name.strip(),
+    )
+    if user_id is None:
+        raise AuthorizationError("existing account is inactive or deleted")
+    return user_id
+
+
 async def get_actor_by_telegram_id(
     connection: asyncpg.Connection, telegram_id: int
 ) -> Actor | None:

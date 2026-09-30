@@ -310,4 +310,6 @@ async def test_worker_requires_second_button_before_commit_and_reports_deploy(
         "SELECT payload->>'text' FROM outbox_events "
         "WHERE idempotency_key LIKE 'publish-succeeded:%'"
     )
-    assert "запускайте развёртывание репозитория" in final_text
+    assert "floorball-build.git" in final_text
+    assert "plesk-static" in final_text
+    assert "Получить сейчас" in final_text

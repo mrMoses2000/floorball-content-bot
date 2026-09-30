@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Run Cloudflare Quick Tunnel and automatically sync MINI_APP_PUBLIC_URL.
+"""Keep the configured HTTPS tunnel and Telegram Mini App menu available.
 
-When cloudflared starts, it assigns a dynamic trycloudflare.com domain.
-This script extracts that domain, waits for the health check to succeed,
-writes it to .env if changed, and restarts floorball-content-bot.service
-so Telegram's Chat Menu Button stays up-to-date.
+Tailscale restores a persistent dedicated route. Cloudflare Quick Tunnel remains
+available for temporary use and synchronizes its changing URL with the bot.
 """
 
 from __future__ import annotations
 
+# Commands use fixed executable names and argv, with no shell or user message input.
+# ruff: noqa: S603, S607
 import ipaddress
 import logging
 import os
-from pathlib import Path
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
+from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 logging.basicConfig(
@@ -35,10 +37,14 @@ ENV_PATTERN = re.compile(r"^MINI_APP_PUBLIC_URL=.*$", re.MULTILINE)
 
 
 def wait_for_health(public_url: str) -> bool:
-    hostname = public_url.removeprefix("https://").rstrip("/")
+    if urlsplit(public_url).scheme != "https":
+        raise ValueError("tunnel health requires HTTPS")
+    hostname = urlsplit(public_url).hostname
     for _ in range(25):
         try:
-            with urlopen(f"{public_url.rstrip('/')}/healthz", timeout=5) as response:
+            with urlopen(  # noqa: S310 - HTTPS scheme checked above
+                f"{public_url.rstrip('/')}/healthz", timeout=5
+            ) as response:
                 if response.status == 200:
                     return True
         except (OSError, URLError):
@@ -147,6 +153,12 @@ def restart_bot_service() -> None:
 
 
 def main() -> int:
+    provider = os.environ.get("MINI_APP_TUNNEL_PROVIDER", "cloudflare")
+    if provider == "tailscale":
+        return run_tailscale_funnel()
+    if provider != "cloudflare":
+        logger.error("Unknown MINI_APP_TUNNEL_PROVIDER: %s", provider)
+        return 1
     if not CLOUDFLARED_BIN.is_file() or not os.access(CLOUDFLARED_BIN, os.X_OK):
         logger.error("cloudflared is missing or not executable at %s", CLOUDFLARED_BIN)
         return 1
@@ -202,6 +214,50 @@ def main() -> int:
                 proc.kill()
 
     return proc.returncode or 0
+
+
+def run_tailscale_funnel() -> int:
+    """Restore this Mini App route; tailscaled owns the persistent HTTPS tunnel."""
+    public_url = os.environ.get("MINI_APP_PUBLIC_URL", "").rstrip("/") + "/"
+    parsed = urlsplit(public_url)
+    if (
+        parsed.scheme != "https" or not parsed.hostname
+        or not parsed.hostname.endswith(".ts.net") or parsed.path in {"", "/"}
+        or parsed.query or parsed.fragment or parsed.username or parsed.port
+    ):
+        logger.error("Tailscale requires an HTTPS .ts.net URL with a dedicated Mini App path")
+        return 1
+    status = subprocess.run(
+        ["tailscale", "status", "--json"], capture_output=True, text=True,
+        check=True, timeout=15,
+    )
+    import json
+
+    node_name = json.loads(status.stdout)["Self"]["DNSName"].rstrip(".")
+    if parsed.hostname != node_name:
+        logger.error("MINI_APP_PUBLIC_URL must match this Tailscale node")
+        return 1
+    port = int(os.environ.get("MINI_APP_PORT", "8092"))
+    if not 1 <= port <= 65535:
+        raise ValueError("invalid MINI_APP_PORT")
+    stopped = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+    signal.signal(signal.SIGINT, lambda *_: stopped.set())
+    command = [
+        "tailscale", "funnel", "--bg", "--yes", "--set-path", parsed.path.rstrip("/"),
+        f"http://127.0.0.1:{port}",
+    ]
+    subprocess.run(command, check=True, timeout=30)
+    logger.info("Persistent Mini App Funnel configured at %s", public_url)
+    while not stopped.is_set():
+        try:
+            with urlopen(public_url + "healthz", timeout=10) as response:  # noqa: S310
+                if response.status != 200:
+                    logger.warning("Mini App public health status: %s", response.status)
+        except (OSError, URLError):
+            logger.warning("Mini App public health unavailable; retrying")
+        stopped.wait(30)
+    return 0
 
 
 if __name__ == "__main__":

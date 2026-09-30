@@ -16,3 +16,5 @@ miniapp/vite.config.d.ts
 *.egg-info/
 var/
 publication-previews/
+output/playwright/
+.playwright-cli/

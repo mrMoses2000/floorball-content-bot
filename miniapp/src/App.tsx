@@ -141,6 +141,7 @@ export function App() {
   const [editing, setEditing] = useState<{ workflow: Workflow; field: Field } | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [uploadNotice, setUploadNotice] = useState('')
   const language = data?.user.language ?? 'ru'
   const t = copy[language]
 
@@ -172,6 +173,14 @@ export function App() {
     finally { setBusy(false) }
   }
 
+  async function upload(workflow: Workflow, path: string, file?: File) {
+    if (!file || !workflow.session_id || busy) return
+    setUploadNotice('')
+    if (await action(() => api.upload(workflow.session_id!, path, workflow.revision, file))) {
+      setUploadNotice(language === 'ru' ? 'Фото обрабатывается. Результат придёт в чат; затем обновите анкету.' : 'Фото өңделуде. Нәтиже чатқа келеді; содан кейін сауалнаманы жаңартыңыз.')
+    }
+  }
+
   async function startWorkflow(mode: string) {
     if (busy) return
     if (await action(() => api.start(mode))) setSelectedMode(mode)
@@ -198,6 +207,16 @@ export function App() {
             <button className="back-button" onClick={() => setSelectedMode(null)}><ArrowLeft size={18} />{t.back}</button>
             <div className="detail-head"><div className="eyebrow">{selected.progress}% {t.completed}</div><h1>{selected.label}</h1><Progress value={selected.progress} /><p>{selected.status === 'active' ? selected.next_question || t.allDone : t.submitted}</p></div>
             {selected.mode === 'news' && <div className="easy-note"><MessageCircle size={22} /><p>{t.newsTip}</p></div>}
+            {uploadNotice && <p role="status">{uploadNotice}</p>}
+            {(selected.upload_targets ?? []).length > 0 && <section className="data-section">
+              <h2>{language === 'ru' ? 'Фотографии' : 'Фотосуреттер'}</h2>
+              {(selected.upload_targets ?? []).map(target => <label className="field-row" key={target.path}>
+                <span className="field-copy">{target.label}</span>
+                <input type="file" accept="image/jpeg,image/png,image/webp" disabled={busy}
+                  onChange={event => { void upload(selected, target.path, event.target.files?.[0]); event.target.value = '' }} />
+              </label>)}
+              <button className="text-button" disabled={busy} onClick={() => void load()}><RefreshCw size={18} />{language === 'ru' ? 'Обновить анкету' : 'Сауалнаманы жаңарту'}</button>
+            </section>}
             {selected.sections.map((section) => (
               <section className="data-section" key={section.title}>
                 <h2>{section.title}</h2>

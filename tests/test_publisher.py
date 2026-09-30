@@ -309,7 +309,7 @@ async def test_publication_preview_uses_isolated_worktree_and_does_not_push(tmp_
     assert command("git", "rev-parse", "main", cwd=bare) == base
     assert any("preview_ready" in execution[0] for execution in pool.executions)
     assert preview.screenshot_manifest_hash
-    assert len(preview.artifacts) == 18
+    assert len(preview.artifacts) == 24
     await publisher.cleanup(preview.worktree)
     assert not preview.worktree.exists()
 

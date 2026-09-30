@@ -9,8 +9,7 @@
 draft state machine, RU/KZ extraction contracts, fake и реальные provider adapters, image
 sanitization, deterministic city exporter/importer, автоматическая проверка готовности,
 Telegram-уведомления, RU/KZ/EN desktop/mobile screenshot preview с manifest-bound confirm,
-atomic Git push, durable contact
-requests с асинхронной SMTP-доставкой, approval-gated национальные и городские новости,
+atomic Git push, проверка развёртывания Plesk, approval-gated национальные и городские новости,
 Telegram-галереи новостей до десяти фотографий с manifest-bound публикацией,
 приватный реестр официальных PDF с контролем комплектности и напоминаниями руководству,
 Telegram Mini App с проверкой подписи `initData`, статусами доступа, прогрессом анкет и
@@ -61,41 +60,5 @@ cd miniapp && npm ci && npm run lint && npm test && npm run build
 Чат и Mini App используют одну память диалогов: сложные списки, файлы и согласия бот намеренно
 оставляет в чате, а отправленные анкеты в кабинете доступны только для чтения.
 
-После настройки `CONTACT_API_SECRET` (не менее 32 случайных байт), SMTP и постоянного HTTPS
-туннеля на домашний `127.0.0.1:8088` запустите API формы связи:
-
-```bash
-.venv/bin/floorball-bot contact-api
-```
-
-Для рассылки тренерам используйте ссылку
-`https://t.me/floorball_site_agent_bot?start=coach`. Тренер подтверждает собственный контакт и
-автоматически получает только роль `coach_form`, без доступа к редактированию или публикации.
-
-Привилегированных редакторов и администраторов создавайте только вручную:
-
-```bash
-.venv/bin/floorball-bot create-user --phone '+7 700 000 00 00' --name 'Администратор'
-.venv/bin/floorball-bot grant-role --user UUID --role superadmin
-.venv/bin/floorball-bot scope-city --user UUID --city CITY_UUID
-```
-
-Пользователи с ролью `federation_editor` или `superadmin` управляют официальными документами
-через `/documents` и `/document <код>`. Бот принимает PDF до 20 МБ, проверяет тип и опасное
-активное содержимое, фиксирует SHA-256, номер и сроки, хранит оригинал приватно и раз в неделю
-напоминает о недостающих или истекающих документах. Разрешение на публикацию записывается
-отдельно и само по себе никогда не публикует файл на сайте.
-
-Публичная заявка на новый город начинается по deep link
-`https://t.me/floorball_site_agent_bot?start=new_city`. После проверки superadmin команда
-`city-initialize` сначала выполняется без `--apply` и показывает безопасный dry-run.
-
-Текущие bundles импортируются сначала dry-run, затем явным `--apply`:
-
-```bash
-.venv/bin/floorball-bot import-city /home/moses/floorball.kz/app/src/data/generated/city-content.json
-.venv/bin/floorball-bot import-city /home/moses/floorball.kz/app/src/data/generated/city-content.json --apply
-.venv/bin/floorball-bot import-federation /home/moses/floorball.kz/app/src/data/generated/federation-content.json --apply
-```
-
-Подробности: [архитектура](docs/ARCHITECTURE.md), [операции](docs/OPERATIONS.md), [настройка интеграций](docs/INTEGRATIONS.md), [privacy/consent](docs/PRIVACY_CONSENT.md).
+Публичные веб-формы и SMTP relay удалены. Сбор контента выполняется ботом и Mini App.
+Стабильный вход кабинета: https://floorball.kz/bot/ (перенаправление на Funnel).

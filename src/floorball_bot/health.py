@@ -35,6 +35,9 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
     db_ok = await pool.fetchval("SELECT 1") == 1
     dead_jobs = await pool.fetchval("SELECT count(*) FROM jobs WHERE status='dead'")
     dead_outbox = await pool.fetchval("SELECT count(*) FROM outbox_events WHERE status='dead'")
+    failed_updates = await pool.fetchval(
+        "SELECT count(*) FROM processed_updates WHERE status='failed'"
+    )
     latest_publication = await pool.fetchval(
         "SELECT max(updated_at) FROM publication_jobs WHERE status='published'"
     )
@@ -124,6 +127,7 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
             and percent < 90
             and dead_jobs == 0
             and dead_outbox == 0
+            and failed_updates == 0
             and telegram_fresh
             and worker_fresh
             and backup_fresh
@@ -136,6 +140,7 @@ async def health_report(pool: asyncpg.Pool, state_root: Path, backup_root: Path)
         "disk_status": "critical" if percent >= 90 else "warning" if percent >= 80 else "ok",
         "dead_jobs": dead_jobs,
         "dead_outbox": dead_outbox,
+        "failed_updates": failed_updates,
         "heartbeats": heartbeats,
         "telegram_polling": "ok" if telegram_fresh else "stale",
         "worker": "ok" if worker_fresh else "stale",

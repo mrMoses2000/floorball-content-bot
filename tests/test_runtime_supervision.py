@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 
 from floorball_bot.cli import supervise_bot_tasks
 from floorball_bot.telegram import TelegramIngress, canonical_command, run_outbox
@@ -226,6 +226,7 @@ class PoisonUpdateBot:
 @pytest.mark.asyncio
 async def test_ingress_survives_failed_update_and_increments_offset(monkeypatch):
     from unittest.mock import AsyncMock, MagicMock
+
     from aiogram.types import Update
 
     update1 = MagicMock(spec=Update)
@@ -255,7 +256,38 @@ async def test_ingress_survives_failed_update_and_increments_offset(monkeypatch)
 
     await ingress.run()
 
-    # The failing update didn't crash ingress, update 101 was processed, and offset advanced past 101
+    # A durably recorded poison update does not prevent processing the next update.
     assert accepted == [101]
     assert ingress.offset == 102
 
+
+@pytest.mark.asyncio
+async def test_ingress_retries_entire_batch_after_database_failure(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aiogram.types import Update
+
+    updates = [MagicMock(spec=Update, update_id=100), MagicMock(spec=Update, update_id=101)]
+    attempted = []
+
+    class ReplayingBot:
+        async def __call__(self, method):
+            if len(attempted) < 3:
+                assert method.offset is None
+                return updates
+            await ingress.stop()
+            return []
+
+    ingress = RetryingIngress(ReplayingBot())
+    monkeypatch.setattr("floorball_bot.telegram.record_heartbeat", AsyncMock())
+    ingress._wait_polling_retry = AsyncMock()
+
+    async def accept(update):
+        attempted.append(update.update_id)
+        if len(attempted) == 1:
+            raise TimeoutError("database unavailable")
+
+    ingress.accept = accept
+    await ingress.run()
+    assert attempted == [100, 100, 101]
+    assert ingress.offset == 102

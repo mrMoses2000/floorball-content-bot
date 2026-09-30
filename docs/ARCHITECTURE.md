@@ -1,5 +1,17 @@
 # Архитектура Floorball Content Bot
 
+## Сбор данных
+
+Все новые данные собираются через Telegram-бот и его Mini App. PostgreSQL —
+канонический источник. Google Forms, Sheets и Apps Script являются наследием
+и не требуются как основной или резервный канал нового сбора. Импорт
+исторических city/federation bundles сохраняется.
+
+В текущем website checkout ещё есть старая турнирная форма через Apps Script;
+этот канал нужно заменить при обновлении сайта. Отдельного сценария регистрации
+команды на турнир в боте пока нет. Сначала завершается и проверяется работа бота,
+после этого добавляются реальные пользователи и выполняется развёртывание сайта.
+
 ## Граница системы
 
 Система принимает Telegram updates, авторизует заранее заведённых пользователей, сохраняет входные данные и медиа, формирует версионированные черновики, проводит user/reviewer approval и только затем создаёт детерминированный preview публикации для `floorball.kz`.
@@ -122,9 +134,11 @@ publication remain in application code.
 - Health command checks DB, polling heartbeat, disk, dead jobs, latest backup and publication.
 - Health also reports active/stuck publication reconciliation and treats a persistent remote-ref
   mismatch as unhealthy until an operator resolves it.
-- The contact API binds only `127.0.0.1`. A stable Tailscale Funnel or named Cloudflare Tunnel
-  may expose only `/floorball-contact/api/contact/`; the Vite build points
-  `VITE_CONTACT_API_URL` to that public HTTPS endpoint. `/healthz` checks PostgreSQL readiness.
+- Plesk webhooks are private configuration and are called after atomic Git ref verification.
+  Public index and changed asset byte hashes must match before publication is finalized.
+- Reviewed session media associations bind images to exact fields; media_links and latest
+  consent gate publication. Player identities use permanent profile keys. Minors require guardian
+  permission. PDF assets are exported only from verified explicitly public registry records.
 
 ## Resource model
 

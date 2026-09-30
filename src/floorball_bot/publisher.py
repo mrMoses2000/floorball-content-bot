@@ -11,9 +11,11 @@ import socket
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import asyncpg
+from aiohttp import ClientError, ClientSession, ClientTimeout
 from PIL import Image
 
 from floorball_bot.errors import RetryableProviderError, ValidationBlocked
@@ -23,7 +25,11 @@ ALLOWED_SOURCE_CHANGES = {
     "app/src/data/generated/federation-content.json",
     "app/src/data/generated/news-content.json",
 }
-ALLOWED_CONTENT_PREFIXES = ("app/public/assets/news/",)
+ALLOWED_CONTENT_PREFIXES = (
+    "app/public/assets/news/",
+    "app/public/assets/content/",
+    "app/public/assets/documents/",
+)
 CODE_TEMPLATE_PREFIXES = (
     "app/src/components/",
     "app/src/pages/",
@@ -44,9 +50,7 @@ def is_allowed_change(path: str, change_class: str = "content") -> bool:
     return False
 
 
-def build_change_manifest(
-    worktree: Path, paths: set[str], *, change_class: str
-) -> dict:
+def build_change_manifest(worktree: Path, paths: set[str], *, change_class: str) -> dict:
     if change_class not in {"content", "code_template"}:
         raise ValidationBlocked("unknown publication change class")
     unexpected = sorted(path for path in paths if not is_allowed_change(path, change_class))
@@ -92,6 +96,7 @@ def derive_affected_routes(payload: dict, previous: dict) -> tuple[str, ...]:
     routes = {"/"}
     if "cities" in payload:
         routes.add("/clubs")
+        routes.add("/players")
         old = {item.get("slug"): item for item in previous.get("cities", [])}
         current = {item.get("slug"): item for item in payload.get("cities", [])}
         for slug in old.keys() | current.keys():
@@ -116,6 +121,7 @@ def derive_affected_routes(payload: dict, previous: dict) -> tuple[str, ...]:
             "achievements": "/about/achievements",
             "roadmap": "/about/roadmap",
             "leadership": "/about/leadership",
+            "documents": "/documents",
         }
         current = payload.get("federation", {})
         old = previous.get("federation", {})
@@ -125,6 +131,15 @@ def derive_affected_routes(payload: dict, previous: dict) -> tuple[str, ...]:
     else:
         raise ValidationBlocked("unsupported publication payload")
     return tuple(sorted(routes))
+
+
+async def _bounded_response(response, limit: int) -> bytes:
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(65536):
+        body.extend(chunk)
+        if len(body) > limit:
+            return b""
+    return bytes(body)
 
 
 async def run_command(
@@ -189,6 +204,8 @@ class GitPublisher:
         screenshot_capture: ScreenshotCapture | None = None,
         publish_enabled: bool = True,
         media_root: Path | None = None,
+        plesk_static_webhook_url: str = "",
+        plesk_source_webhook_url: str = "",
     ) -> None:
         self.pool = pool
         self.repository = repository.resolve()
@@ -197,6 +214,21 @@ class GitPublisher:
         self.screenshot_capture = screenshot_capture or self._capture_screenshots
         self.publish_enabled = publish_enabled
         self.media_root = media_root.expanduser().resolve() if media_root else None
+        self.plesk_static_webhook_url = plesk_static_webhook_url
+        self.plesk_source_webhook_url = plesk_source_webhook_url
+        for url in (plesk_static_webhook_url, plesk_source_webhook_url):
+            if url:
+                parsed = urlsplit(url)
+                if (
+                    parsed.scheme != "https"
+                    or parsed.hostname != "srv-plesk38.ps.kz"
+                    or parsed.port != 8443
+                    or parsed.username
+                    or parsed.password
+                ):
+                    raise ValidationBlocked(
+                        "Plesk webhook must use the configured HTTPS hosting panel"
+                    )
 
     @staticmethod
     def _bundle_path(payload: dict) -> str:
@@ -225,9 +257,7 @@ class GitPublisher:
     ) -> list[dict]:
         port = self._allocate_loopback_port()
         environment = {
-            key: os.environ[key]
-            for key in ("PATH", "HOME", "LANG", "LC_ALL")
-            if key in os.environ
+            key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL") if key in os.environ
         }
         process = await asyncio.create_subprocess_exec(
             "npm",
@@ -308,6 +338,8 @@ class GitPublisher:
 
     async def _materialize_news_assets(self, worktree: Path, payload: dict) -> None:
         assets_root = worktree / "app/public/assets/news"
+        if assets_root.is_symlink():
+            raise ValidationBlocked("news asset root is a symlink")
         if assets_root.exists():
             shutil.rmtree(assets_root)
         requested: dict[str, str] = {}
@@ -336,12 +368,14 @@ class GitPublisher:
             SELECT ma.sha256, ma.derivative_path
             FROM media_assets ma
             JOIN LATERAL (
-                SELECT c.status FROM consents c
+                SELECT c.status,c.valid_from,c.valid_until FROM consents c
                 WHERE c.subject_type='media' AND c.subject_id=ma.id
                   AND c.scope='media_publication'
                 ORDER BY c.updated_at DESC, c.created_at DESC, c.id DESC
                 LIMIT 1
             ) latest_consent ON latest_consent.status='granted'
+              AND (latest_consent.valid_from IS NULL OR latest_consent.valid_from <= now())
+              AND (latest_consent.valid_until IS NULL OR latest_consent.valid_until >= now())
             WHERE ma.sha256=ANY($1::text[]) AND ma.deleted_at IS NULL
               AND ma.derivative_path IS NOT NULL AND ma.moderation_status='approved'
             """,
@@ -366,6 +400,104 @@ class GitPublisher:
                 raise ValidationBlocked("news gallery target escaped its worktree")
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(resolved, target)
+
+    async def _materialize_content_assets(self, worktree: Path, payload: dict) -> None:
+        """Materialize only consented derivatives / reviewed PDF bytes into managed roots."""
+        requested = set()
+
+        def collect(value):
+            if isinstance(value, dict):
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+            elif isinstance(value, str) and value.startswith(
+                ("/assets/content/", "/assets/documents/")
+            ):
+                requested.add(value)
+
+        collect(payload)
+        current_bundle = self._bundle_path(payload)
+        for bundle in ALLOWED_SOURCE_CHANGES - {current_bundle}:
+            collect(json.loads((worktree / bundle).read_text(encoding="utf-8")))
+        import re
+
+        images, documents = {}, {}
+        for public_path in requested:
+            match = re.fullmatch(
+                r"/assets/(content|documents)/([0-9a-f]{64})\.(webp|pdf)", public_path
+            )
+            if not match or (match[1], match[3]) not in {("content", "webp"), ("documents", "pdf")}:
+                raise ValidationBlocked("public asset is not manifest-bound")
+            (images if match[1] == "content" else documents)[public_path] = match[2]
+        if requested and self.media_root is None:
+            raise ValidationBlocked("public assets require a configured private media root")
+        image_rows = (
+            await self.pool.fetch(
+                """SELECT ma.sha256,ma.derivative_path FROM media_assets ma JOIN LATERAL (
+                 SELECT c.status,c.valid_from,c.valid_until FROM consents c
+                 WHERE c.subject_type='media' AND c.subject_id=ma.id AND c.scope='media_publication'
+                 ORDER BY c.updated_at DESC,c.created_at DESC,c.id DESC LIMIT 1
+               ) consent ON consent.status='granted'
+               WHERE ma.sha256=ANY($1::text[]) AND ma.deleted_at IS NULL
+                 AND ma.moderation_status='approved' AND ma.derivative_path IS NOT NULL
+                 AND (consent.valid_from IS NULL OR consent.valid_from <= now())
+                 AND (consent.valid_until IS NULL OR consent.valid_until >= now())""",
+                list(images.values()),
+            )
+            if images
+            else []
+        )
+        document_rows = (
+            await self.pool.fetch(
+                """SELECT d.sha256,d.original_path,d.byte_size FROM official_documents d
+               JOIN official_document_requirements r ON r.code=d.requirement_code AND r.active
+               WHERE d.sha256=ANY($1::text[]) AND d.status='verified' AND d.publication_allowed
+                 AND d.reviewed_by IS NOT NULL AND d.reviewed_at IS NOT NULL
+                 AND (d.issued_on IS NULL OR d.issued_on <= CURRENT_DATE)
+                 AND (d.valid_until IS NULL OR d.valid_until >= CURRENT_DATE)""",
+                list(documents.values()),
+            )
+            if documents
+            else []
+        )
+        by_image = {r["sha256"]: r["derivative_path"] for r in image_rows}
+        by_document = {r["sha256"]: r for r in document_rows}
+        copies = []
+        for path, digest in sorted(images.items() | documents.items()):
+            document = by_document.get(digest) if path in documents else None
+            source_value = document["original_path"] if document else by_image.get(digest)
+            if not source_value:
+                raise ValidationBlocked(
+                    "public asset lost approval; refresh the corresponding bundle"
+                )
+            source = Path(source_value)
+            root = (
+                self.media_root / ("official_documents" if path in documents else "derived")
+            ).resolve()
+            resolved = source.resolve(strict=True)
+            if source.is_symlink() or not resolved.is_file() or not resolved.is_relative_to(root):
+                raise ValidationBlocked("public asset escaped the private media root")
+            if path in documents and (
+                hashlib.sha256(resolved.read_bytes()).hexdigest() != digest
+                or resolved.stat().st_size != document["byte_size"]
+            ):
+                raise ValidationBlocked("verified PDF bytes changed")
+            target = worktree / "app/public" / path.lstrip("/")
+            if not target.resolve().is_relative_to(worktree.resolve()):
+                raise ValidationBlocked("public asset target escaped the worktree")
+            copies.append((resolved, target))
+        # Keep assets referenced by other bundles, remove only obsolete managed files.
+        for folder in ("content", "documents"):
+            root = worktree / "app/public/assets" / folder
+            if root.is_symlink():
+                raise ValidationBlocked("managed public asset root is a symlink")
+            if root.exists():
+                shutil.rmtree(root)
+        for source, target in copies:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
 
     @staticmethod
     def _validate_artifacts(
@@ -427,9 +559,18 @@ class GitPublisher:
             raise ValidationBlocked(f"expected screenshots are missing: {missing[:5]}")
         validated.sort(key=lambda item: (item["route"], item["language"], item["viewport"]))
         manifest_body = [
-            {key: item[key] for key in (
-                "route", "language", "viewport", "width", "height", "filename", "sha256"
-            )}
+            {
+                key: item[key]
+                for key in (
+                    "route",
+                    "language",
+                    "viewport",
+                    "width",
+                    "height",
+                    "filename",
+                    "sha256",
+                )
+            }
             for item in validated
         ]
         manifest_hash = hashlib.sha256(
@@ -513,9 +654,7 @@ class GitPublisher:
         base_commit = (
             await run_command("git", "rev-parse", "origin/main", cwd=self.repository)
         ).strip()
-        base_static_commit = await self._remote_ref(
-            self.repository, "refs/heads/plesk-static"
-        )
+        base_static_commit = await self._remote_ref(self.repository, "refs/heads/plesk-static")
         await run_command(
             "git", "worktree", "add", "--detach", str(worktree), "origin/main", cwd=self.repository
         )
@@ -559,6 +698,7 @@ class GitPublisher:
                     raise ValidationBlocked("unsupported publication payload")
             finally:
                 source.unlink(missing_ok=True)
+            await self._materialize_content_assets(worktree, payload)
             source_changes = {
                 line[3:]
                 for line in (
@@ -579,9 +719,7 @@ class GitPublisher:
             checks.append(
                 await run_command("node", "scripts/test-federation-content.mjs", cwd=worktree)
             )
-            checks.append(
-                await run_command("node", "scripts/test-news-content.mjs", cwd=worktree)
-            )
+            checks.append(await run_command("node", "scripts/test-news-content.mjs", cwd=worktree))
             checks.append(await run_command("npm", "--prefix", "app", "test", cwd=worktree))
             checks.append(await run_command("npm", "--prefix", "app", "run", "build", cwd=worktree))
             for required in (worktree / "app/dist/index.html", worktree / "app/dist/.htaccess"):
@@ -594,13 +732,9 @@ class GitPublisher:
                 ).splitlines()
                 if len(line) > 3
             }
-            change_manifest = build_change_manifest(
-                worktree, all_changes, change_class="content"
-            )
+            change_manifest = build_change_manifest(worktree, all_changes, change_class="content")
             diff = await run_command("git", "diff", "--stat", cwd=worktree)
-            raw_artifacts = await self.screenshot_capture(
-                worktree, affected_routes, artifact_dir
-            )
+            raw_artifacts = await self.screenshot_capture(worktree, affected_routes, artifact_dir)
             artifacts, manifest_hash = self._validate_artifacts(
                 raw_artifacts, output_dir=artifact_dir, routes=affected_routes
             )
@@ -724,18 +858,12 @@ class GitPublisher:
                 raise ValidationBlocked("publication confirmation is invalid or expired")
             if row["status"] == "published":
                 return row["main_commit"], row["static_commit"]
-            if (
-                row["draft_status"] != "approved"
-                or row["approved_hash"] != row["revision_hash"]
-            ):
+            if row["draft_status"] != "approved" or row["approved_hash"] != row["revision_hash"]:
                 raise ValidationBlocked("approved revision hash changed")
             if row["status"] == "preview_ready":
-                if (
-                    not row["preview_live"]
-                    or not secrets.compare_digest(
-                        row["preview_nonce_hash"],
-                        hashlib.sha256(nonce.encode()).hexdigest(),
-                    )
+                if not row["preview_live"] or not secrets.compare_digest(
+                    row["preview_nonce_hash"],
+                    hashlib.sha256(nonce.encode()).hexdigest(),
                 ):
                     raise ValidationBlocked("publication confirmation is invalid or expired")
                 await connection.execute(
@@ -874,9 +1002,8 @@ class GitPublisher:
             if not target.is_file():
                 raise ValidationBlocked("a manifest file is missing from the worktree")
             body = target.read_bytes()
-            if (
-                len(body) != entry.get("byteSize")
-                or hashlib.sha256(body).hexdigest() != entry.get("sha256")
+            if len(body) != entry.get("byteSize") or hashlib.sha256(body).hexdigest() != entry.get(
+                "sha256"
             ):
                 raise ValidationBlocked("a manifest file changed after preview")
 
@@ -930,9 +1057,7 @@ class GitPublisher:
             }
             if current_changes != manifest_paths:
                 raise ValidationBlocked("worktree changes no longer match the preview manifest")
-            await run_command(
-                "git", "add", "--all", "--", *sorted(manifest_paths), cwd=worktree
-            )
+            await run_command("git", "add", "--all", "--", *sorted(manifest_paths), cwd=worktree)
             await run_command(
                 "git",
                 "commit",
@@ -944,9 +1069,11 @@ class GitPublisher:
         else:
             parent = (await run_command("git", "rev-parse", "HEAD^", cwd=worktree)).strip()
             changed = set(
-                (await run_command(
-                    "git", "diff", "--name-only", f"{row['base_commit']}..HEAD", cwd=worktree
-                )).splitlines()
+                (
+                    await run_command(
+                        "git", "diff", "--name-only", f"{row['base_commit']}..HEAD", cwd=worktree
+                    )
+                ).splitlines()
             )
             if parent != row["base_commit"] or changed != manifest_paths:
                 raise ValidationBlocked("publication worktree commit is not recoverable")
@@ -984,9 +1111,7 @@ class GitPublisher:
             )
         return head, static_commit
 
-    async def _push_or_observe(
-        self, row: asyncpg.Record, lease_owner: str
-    ) -> tuple[str, str]:
+    async def _push_or_observe(self, row: asyncpg.Record, lease_owner: str) -> tuple[str, str]:
         publication_id = row["id"]
         worktree = self.worktree_root / str(publication_id)
         expected = (row["expected_main_commit"], row["expected_static_commit"])
@@ -1009,9 +1134,7 @@ class GitPublisher:
                         publication_id,
                         lease_owner,
                     )
-                    raise RetryableProviderError(
-                        "publishing is disabled by PUBLISH_ENABLED=false"
-                    )
+                    raise RetryableProviderError("publishing is disabled by PUBLISH_ENABLED=false")
                 await run_command(
                     "git",
                     "push",
@@ -1070,9 +1193,71 @@ class GitPublisher:
             raise RetryableProviderError("publication state changed after remote verification")
         return expected
 
-    async def _advance_publication(
-        self, publication_id: UUID, lease_owner: str
-    ) -> tuple[str, str]:
+    async def _deploy_plesk(self, row) -> None:
+        expected = await run_command(
+            "git", "show", f"{row['static_commit']}:index.html", cwd=self.repository
+        )
+        expected_hash = hashlib.sha256(expected.encode()).hexdigest()
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=30)) as client:
+                for hook in (self.plesk_source_webhook_url, self.plesk_static_webhook_url):
+                    if not hook:
+                        continue
+                    async with client.get(hook, allow_redirects=False) as response:
+                        if response.status != 200:
+                            raise RetryableProviderError(
+                                f"Plesk webhook returned HTTP {response.status}"
+                            )
+                for _ in range(24):
+                    async with client.get(
+                        f"https://floorball.kz/?release={row['id']}",
+                        headers={"Cache-Control": "no-cache"},
+                        allow_redirects=False,
+                    ) as response:
+                        body = await _bounded_response(response, 1024 * 1024)
+                        if (
+                            response.status == 200
+                            and hashlib.sha256(body).hexdigest() == expected_hash
+                        ):
+                            valid_assets = True
+                            for entry in (row.get("change_manifest") or {}).get("generated", []):
+                                if entry.get("deleted") or not entry["path"].startswith(
+                                    "app/dist/"
+                                ):
+                                    continue
+                                relative = entry["path"].removeprefix("app/dist/")
+                                if relative in {"index.html", ".htaccess"}:
+                                    continue
+                                if ".." in relative.split("/") or relative.startswith("/"):
+                                    raise ValidationBlocked("deployment manifest path is unsafe")
+                                async with client.get(
+                                    f"https://floorball.kz/{relative}?release={row['id']}",
+                                    allow_redirects=False,
+                                ) as asset_response:
+                                    asset_bytes = await _bounded_response(
+                                        asset_response, entry["byteSize"]
+                                    )
+                                    if (
+                                        asset_response.status != 200
+                                        or len(asset_bytes) != entry["byteSize"]
+                                        or hashlib.sha256(asset_bytes).hexdigest()
+                                        != entry["sha256"]
+                                    ):
+                                        valid_assets = False
+                                        break
+                            if valid_assets:
+                                return
+                    await asyncio.sleep(5)
+        except (ClientError, TimeoutError):
+            # Webhook query strings are credentials: never include provider URLs in logs/outbox.
+            raise RetryableProviderError(
+                "Plesk deployment could not be verified over HTTPS"
+            ) from None
+        raise RetryableProviderError(
+            "Plesk public build does not match the verified static commit yet"
+        )
+
+    async def _advance_publication(self, publication_id: UUID, lease_owner: str) -> tuple[str, str]:
         row = await self._load_owned_publication(publication_id, lease_owner)
         if row["status"] == "confirming":
             await self._prepare_publication_commits(row, lease_owner)
@@ -1082,6 +1267,8 @@ class GitPublisher:
             row = await self._load_owned_publication(publication_id, lease_owner)
         if row["status"] != "remote_verified":
             raise RetryableProviderError("publication has not reached remote verification")
+        if self.plesk_static_webhook_url:
+            await self._deploy_plesk(row)
         try:
             await self.cleanup(self.worktree_root / str(publication_id))
         except CommandFailed as exc:

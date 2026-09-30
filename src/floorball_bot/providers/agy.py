@@ -28,6 +28,7 @@ class StructuredExtractor(Protocol):
         mode: DialogueMode | str | None = None,
         context: Mapping[str, Any] | BaseModel | None = None,
         known_fields: Mapping[str, Any] | None = None,
+        spec_sha256: str | None = None,
     ) -> T: ...
 
 
@@ -44,6 +45,7 @@ class FakeExtractor:
         mode: DialogueMode | str | None = None,
         context: Mapping[str, Any] | BaseModel | None = None,
         known_fields: Mapping[str, Any] | None = None,
+        spec_sha256: str | None = None,
     ) -> T:
         self.inputs.append(text)
         return output_model.model_validate(self.result.model_dump())
@@ -89,6 +91,7 @@ class AgyExtractor:
         mode: DialogueMode | str | None = None,
         context: Mapping[str, Any] | BaseModel | None = None,
         known_fields: Mapping[str, Any] | None = None,
+        spec_sha256: str | None = None,
     ) -> T:
         if len(text) > 50_000:
             raise PermanentProviderError("extractor input exceeds 50,000 characters")
@@ -97,6 +100,7 @@ class AgyExtractor:
             mode=mode,
             context=context,
             known_fields=known_fields or {},
+            spec_sha256=spec_sha256,
         )
         prompt = self._prompt(text, trusted_instruction)
         first_error: Exception | None = None
@@ -134,13 +138,14 @@ class AgyExtractor:
         mode: DialogueMode | str | None,
         context: Mapping[str, Any] | BaseModel | None,
         known_fields: Mapping[str, Any],
+        spec_sha256: str | None = None,
     ) -> str:
         if mode is None:
             return (
                 "Extract factual floorball.kz draft data only. Do not infer missing facts, "
                 "authorize, approve, or publish. Ask at most two next questions."
             )
-        loaded = self.dialogue_repository.load(mode)
+        loaded = self.dialogue_repository.load(mode, sha256=spec_sha256)
         gaps = evaluate_gaps(loaded.spec, known_fields)
         if isinstance(context, BaseModel):
             safe_context: Any = context.model_dump(mode="json")

@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -326,3 +326,39 @@ async def test_federation_revision_withdraws_removed_leadership(pg_pool, tmp_pat
     assert await pg_pool.fetchval(
         "SELECT count(*) FROM leadership_profiles WHERE active=TRUE"
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_latest_consent_overrides_imported_public_contacts_and_portraits(pg_pool, tmp_path):
+    city_source = tmp_path / "city.json"
+    federation_source = tmp_path / "federation.json"
+    city_source.write_text(json.dumps(city_bundle()), encoding="utf-8")
+    federation_source.write_text(json.dumps(federation_bundle()), encoding="utf-8")
+    async with pg_pool.acquire() as connection, connection.transaction():
+        await apply_city_import(connection, read_city_bundle(city_source))
+        await apply_federation_import(connection, read_federation_bundle(federation_source))
+    subjects = [
+        ("contact", await pg_pool.fetchval("SELECT id FROM clubs"), "contact"),
+        ("player", await pg_pool.fetchval("SELECT id FROM players"), "portrait"),
+        ("leadership", await pg_pool.fetchval("SELECT id FROM leadership_profiles"), "contact"),
+        ("leadership", await pg_pool.fetchval("SELECT id FROM leadership_profiles"), "portrait"),
+    ]
+    for index, status in enumerate(("granted", "withdrawn", "granted")):
+        for subject, identifier, scope in subjects:
+            await pg_pool.execute(
+                """
+                INSERT INTO consents(subject_type,subject_id,scope,status,created_at,updated_at)
+                VALUES ($1,$2,$3,$4,$5,$5)
+                """,
+                subject, identifier, scope, status, GENERATED_AT + timedelta(seconds=index),
+            )
+        city = (await project_city_payload(pg_pool, generated_at=GENERATED_AT)).cities[0]
+        leader = (
+            await project_federation_payload(pg_pool, generated_at=GENERATED_AT)
+        ).federation.leadership[0]
+        expected = status == "granted"
+        assert bool(city.clubs_list[0].contactPhone) is expected
+        assert bool(city.players_list[0].photo) is expected
+        assert bool(leader.email) is expected
+        assert bool(leader.phone) is expected
+        assert bool(leader.photo) is expected

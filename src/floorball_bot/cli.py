@@ -12,9 +12,9 @@ from uuid import UUID
 from aiogram import Bot
 from aiohttp import web
 
+from floorball_bot.auth import provision_telegram_user
 from floorball_bot.city_applications import initialize_city_application
 from floorball_bot.config import get_settings
-from floorball_bot.contact_api import create_contact_app
 from floorball_bot.context_gateway import (
     AgentContextGateway,
     AgentMode,
@@ -22,6 +22,7 @@ from floorball_bot.context_gateway import (
     load_context_actor,
 )
 from floorball_bot.db import create_pool, run_migrations
+from floorball_bot.domain import Role
 from floorball_bot.health import health_report
 from floorball_bot.importers import (
     apply_city_import,
@@ -46,7 +47,6 @@ from floorball_bot.providers.transcription import (
     RoutedAssemblyAITranscriber,
 )
 from floorball_bot.publisher import GitPublisher
-from floorball_bot.smtp_mailer import SmtpContactMailer
 from floorball_bot.telegram import TelegramIngress, run_outbox
 from floorball_bot.worker import Worker
 
@@ -94,7 +94,6 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("migrate")
     commands.add_parser("bot")
     commands.add_parser("worker")
-    commands.add_parser("contact-api")
     commands.add_parser("miniapp-api")
     commands.add_parser("health")
     commands.add_parser("media-consent-reconcile")
@@ -113,11 +112,13 @@ def parser() -> argparse.ArgumentParser:
     federation_import.add_argument("path", type=Path)
     federation_import.add_argument("--apply", action="store_true")
     user = commands.add_parser("create-user")
-    user.add_argument("--phone", required=True)
+    identity = user.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--phone")
+    identity.add_argument("--telegram-id", type=int)
     user.add_argument("--name", required=True)
     role = commands.add_parser("grant-role")
     role.add_argument("--user", required=True, type=UUID)
-    role.add_argument("--role", required=True)
+    role.add_argument("--role", required=True, choices=[role.value for role in Role])
     scope = commands.add_parser("scope-city")
     scope.add_argument("--user", required=True, type=UUID)
     scope.add_argument("--city", required=True, type=UUID)
@@ -165,9 +166,7 @@ async def async_main(args: argparse.Namespace) -> None:
             print(json.dumps({"applied": applied}, ensure_ascii=False))
         elif args.command == "health":
             report = await health_report(pool, settings.media_root, settings.backup_root)
-            print(
-                json.dumps(report, ensure_ascii=False, default=str)
-            )
+            print(json.dumps(report, ensure_ascii=False, default=str))
             if not report["ok"]:
                 raise SystemExit(1)
         elif args.command == "media-consent-reconcile":
@@ -192,11 +191,7 @@ async def async_main(args: argparse.Namespace) -> None:
                 mode=AgentMode(args.mode),
                 city_slug=args.city,
             )
-            print(
-                json.dumps(
-                    snapshot.model_dump(mode="json"), ensure_ascii=False, indent=2
-                )
-            )
+            print(json.dumps(snapshot.model_dump(mode="json"), ensure_ascii=False, indent=2))
         elif args.command == "bot":
             token = settings.require_telegram_token()
             bot = Bot(token)
@@ -215,7 +210,9 @@ async def async_main(args: argparse.Namespace) -> None:
             try:
                 await supervise_bot_tasks(
                     ingress=ingress,
-                    outbox_coro=run_outbox(bot, pool, "bot-outbox", stop),
+                    outbox_coro=run_outbox(
+                        bot, pool, "bot-outbox", stop, media_root=settings.media_root
+                    ),
                     stop=stop,
                 )
             finally:
@@ -247,17 +244,8 @@ async def async_main(args: argparse.Namespace) -> None:
                     settings.worktree_root,
                     publish_enabled=settings.publish_enabled,
                     media_root=settings.media_root,
-                ),
-                contact_mailer=(
-                    SmtpContactMailer(
-                        host=settings.smtp_host,
-                        port=settings.smtp_port,
-                        username=settings.smtp_username,
-                        password=settings.smtp_password.get_secret_value(),
-                        use_ssl=settings.smtp_use_ssl,
-                    )
-                    if settings.smtp_configured()
-                    else None
+                    plesk_static_webhook_url=settings.plesk_static_webhook_url.get_secret_value(),
+                    plesk_source_webhook_url=settings.plesk_source_webhook_url.get_secret_value(),
                 ),
                 lease_seconds=settings.job_lease_seconds,
             )
@@ -265,34 +253,13 @@ async def async_main(args: argparse.Namespace) -> None:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(worker.stop()))
             await worker.run()
-        elif args.command == "contact-api":
-            app = create_contact_app(
-                pool,
-                fingerprint_secret=settings.require_contact_api_secret(),
-                allowed_origins=settings.allowed_contact_origins(),
-            )
-            runner = web.AppRunner(app, access_log=None)
-            await runner.setup()
-            site = web.TCPSite(
-                runner,
-                host=settings.contact_api_host,
-                port=settings.contact_api_port,
-            )
-            await site.start()
-            stop = asyncio.Event()
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, stop.set)
-            try:
-                await stop.wait()
-            finally:
-                await runner.cleanup()
         elif args.command == "miniapp-api":
             app = create_miniapp_app(
                 pool,
                 bot_token=settings.require_telegram_token(),
                 dist_root=settings.mini_app_dist_root,
                 auth_max_age_seconds=settings.mini_app_auth_max_age_seconds,
+                media_root=settings.media_root,
             )
             runner = web.AppRunner(app, access_log=None)
             await runner.setup()
@@ -336,6 +303,13 @@ async def async_main(args: argparse.Namespace) -> None:
                     report["imported"] = await apply_federation_import(connection, incoming)
             print(json.dumps(report, ensure_ascii=False, indent=2))
         elif args.command == "create-user":
+            if args.telegram_id is not None:
+                async with pool.acquire() as connection:
+                    user_id = await provision_telegram_user(
+                        connection, telegram_id=args.telegram_id, display_name=args.name
+                    )
+                print(user_id)
+                return
             from floorball_bot.domain import normalize_phone
 
             user_id = await pool.fetchval(
@@ -350,7 +324,8 @@ async def async_main(args: argparse.Namespace) -> None:
             print(user_id)
         elif args.command == "grant-role":
             await pool.execute(
-                "INSERT INTO user_roles(user_id, role_name) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+                "INSERT INTO user_roles(user_id, role_name) VALUES ($1,$2) "
+                "ON CONFLICT (user_id, role_name) DO UPDATE SET revoked_at=NULL, granted_at=now()",
                 args.user,
                 args.role,
             )
@@ -359,7 +334,7 @@ async def async_main(args: argparse.Namespace) -> None:
             await pool.execute(
                 """
                 INSERT INTO user_city_scopes(user_id, city_id) VALUES ($1,$2)
-                ON CONFLICT DO UPDATE SET revoked_at=NULL, granted_at=now()
+                ON CONFLICT (user_id, city_id) DO UPDATE SET revoked_at=NULL, granted_at=now()
                 """,
                 args.user,
                 args.city,
@@ -383,19 +358,11 @@ async def async_main(args: argparse.Namespace) -> None:
             if actor is None or not actor.active:
                 raise RuntimeError("project-trainer requires an active reviewer")
             result = (
-                await apply_approved_trainer_draft(
-                    pool, draft_id=args.draft, actor=actor
-                )
+                await apply_approved_trainer_draft(pool, draft_id=args.draft, actor=actor)
                 if args.apply
-                else await inspect_trainer_draft(
-                    pool, draft_id=args.draft, actor=actor
-                )
+                else await inspect_trainer_draft(pool, draft_id=args.draft, actor=actor)
             )
-            print(
-                json.dumps(
-                    result.model_dump(mode="json"), ensure_ascii=False, indent=2
-                )
-            )
+            print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
         elif args.command == "publish-preview":
             row = await pool.fetchrow(
                 """

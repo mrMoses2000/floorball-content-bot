@@ -57,19 +57,11 @@ class Settings(BaseSettings):
     poll_timeout_seconds: int = 30
     run_external_tests: bool = Field(default=False, validation_alias="RUN_EXTERNAL_TESTS")
     publish_enabled: bool = Field(default=False, validation_alias="PUBLISH_ENABLED")
-    smtp_host: str = Field(default="smtp.gmail.com", validation_alias="SMTP_HOST")
-    smtp_port: int = Field(default=465, validation_alias="SMTP_PORT")
-    smtp_username: str = Field(default="", validation_alias="SMTP_USERNAME")
-    smtp_password: SecretStr = Field(default=SecretStr(""), validation_alias="SMTP_PASSWORD")
-    smtp_use_ssl: bool = Field(default=True, validation_alias="SMTP_USE_SSL")
-    contact_api_host: str = Field(default="127.0.0.1", validation_alias="CONTACT_API_HOST")
-    contact_api_port: int = Field(default=8088, validation_alias="CONTACT_API_PORT")
-    contact_api_secret: SecretStr = Field(
-        default=SecretStr(""), validation_alias="CONTACT_API_SECRET"
+    plesk_static_webhook_url: SecretStr = Field(
+        default=SecretStr(""), validation_alias="PLESK_STATIC_WEBHOOK_URL"
     )
-    contact_allowed_origins: str = Field(
-        default="https://floorball.kz,https://www.floorball.kz",
-        validation_alias="CONTACT_ALLOWED_ORIGINS",
+    plesk_source_webhook_url: SecretStr = Field(
+        default=SecretStr(""), validation_alias="PLESK_SOURCE_WEBHOOK_URL"
     )
     mini_app_public_url: str = Field(default="", validation_alias="MINI_APP_PUBLIC_URL")
     mini_app_host: str = Field(default="127.0.0.1", validation_alias="MINI_APP_HOST")
@@ -99,22 +91,6 @@ class Settings(BaseSettings):
         if not value:
             raise RuntimeError("ASSEMBLI_AI/ASSEMBLYAI_API_KEY is not configured")
         return value
-
-    def smtp_configured(self) -> bool:
-        return bool(self.smtp_username.strip() and self.smtp_password.get_secret_value().strip())
-
-    def require_contact_api_secret(self) -> bytes:
-        value = self.contact_api_secret.get_secret_value().encode()
-        if len(value) < 32:
-            raise RuntimeError("CONTACT_API_SECRET must contain at least 32 bytes")
-        return value
-
-    def allowed_contact_origins(self) -> tuple[str, ...]:
-        return tuple(
-            origin.strip().rstrip("/")
-            for origin in self.contact_allowed_origins.split(",")
-            if origin.strip()
-        )
 
     @field_validator("mini_app_public_url", mode="after")
     @classmethod

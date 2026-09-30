@@ -258,7 +258,7 @@ async def test_superadmin_applies_public_fields_but_keeps_contact_private(pg_poo
     )
     assert club["contact_phone_private"] == "+77001112233"
     assert not club["contact_is_public"]
-    assert club["source_key"] == f"draft:{draft_id}:club:0"
+    assert club["source_key"] == f"draft:city-{city_id}:club:0"
     assert await pg_pool.fetchval(
         "SELECT count(*) FROM training_schedules WHERE city_id=$1", city_id
     ) == 1

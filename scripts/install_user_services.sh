@@ -29,7 +29,9 @@ units=(
   floorball-content-watchdog.timer
 )
 
-if [[ -x "${HOME}/.local/bin/cloudflared" ]] || command -v cloudflared >/dev/null 2>&1; then
+if [[ -x "${HOME}/.local/bin/cloudflared" ]] \
+  || command -v cloudflared >/dev/null 2>&1 \
+  || command -v tailscale >/dev/null 2>&1; then
   install -m 600 "${project_root}/deploy/systemd/user/floorball-content-tunnel.service" "${unit_root}/"
   units+=(floorball-content-tunnel.service)
 fi

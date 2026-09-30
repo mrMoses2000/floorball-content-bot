@@ -89,10 +89,32 @@ def build_news_payload(items: list[dict[str, Any]], *, generated_at: datetime) -
 
 
 def _bundle_public_id(source_key: str | None, prefix: str, fallback: Any) -> str:
-    marker = f"bundle:{prefix}:"
-    if source_key and source_key.startswith(marker):
-        return source_key[len(marker) :].split(":", 1)[-1]
+    for origin in ("bundle", "dialogue"):
+        marker = f"{origin}:{prefix}:"
+        if source_key and source_key.startswith(marker):
+            value = source_key[len(marker) :]
+            return value.split(":", 1)[-1] if origin == "bundle" else value
     return str(fallback)
+
+
+async def _managed_media_allowed(connection, generated_at: datetime) -> set[str]:
+    rows = await connection.fetch(
+        """SELECT ma.sha256 FROM media_assets ma JOIN LATERAL (
+             SELECT c.status,c.valid_from,c.valid_until FROM consents c
+             WHERE c.subject_type='media' AND c.subject_id=ma.id AND c.scope='media_publication'
+             ORDER BY c.updated_at DESC,c.created_at DESC,c.id DESC LIMIT 1
+           ) consent ON consent.status='granted'
+           WHERE ma.deleted_at IS NULL AND ma.moderation_status='approved'
+             AND ma.derivative_path IS NOT NULL
+             AND (consent.valid_from IS NULL OR consent.valid_from <= $1)
+             AND (consent.valid_until IS NULL OR consent.valid_until >= $1)""",
+        generated_at,
+    )
+    return {f"/assets/content/{row['sha256']}.webp" for row in rows}
+
+
+def _allowed_media(path: str, allowed: set[str]) -> bool:
+    return not path.startswith("/assets/content/") or path in allowed
 
 
 async def project_city_payload(
@@ -109,6 +131,7 @@ async def project_city_payload(
         ORDER BY c.public_sort_order, c.slug
         """
     )
+    allowed_media = await _managed_media_allowed(connection, generated_at)
     city_ids = [row["id"] for row in city_rows]
     if not city_ids:
         return build_city_payload([], generated_at=generated_at)
@@ -116,13 +139,16 @@ async def project_city_payload(
     clubs = await connection.fetch(
         """
         SELECT c.*,
-               (c.source_key LIKE 'bundle:club:%' OR EXISTS (
-                   SELECT 1 FROM consents consent
-                   WHERE consent.subject_type='contact' AND consent.subject_id=c.id
-                     AND consent.scope='contact' AND consent.status='granted'
+               COALESCE((
+                   SELECT consent.status='granted'
                      AND (consent.valid_from IS NULL OR consent.valid_from <= $2)
                      AND (consent.valid_until IS NULL OR consent.valid_until >= $2)
-               )) AS contact_allowed
+                   FROM consents consent
+                   WHERE consent.subject_type='contact' AND consent.subject_id=c.id
+                     AND consent.scope='contact'
+                   ORDER BY consent.updated_at DESC, consent.created_at DESC, consent.id DESC
+                   LIMIT 1
+               ), c.source_key LIKE 'bundle:club:%', FALSE) AS contact_allowed
         FROM clubs c
         WHERE c.city_id=ANY($1::uuid[]) AND c.status='active' AND c.deleted_at IS NULL
         ORDER BY city_id, source_key NULLS LAST, name, id
@@ -141,13 +167,24 @@ async def project_city_payload(
     players = await connection.fetch(
         """
         SELECT DISTINCT ON (p.id) p.*, pcm.city_id,
-               (p.source_key LIKE 'bundle:player:%' OR EXISTS (
-                   SELECT 1 FROM consents consent
-                   WHERE consent.subject_type='player' AND consent.subject_id=p.id
-                     AND consent.scope='portrait' AND consent.status='granted'
+               COALESCE((
+                   SELECT consent.status='granted'
                      AND (consent.valid_from IS NULL OR consent.valid_from <= $2)
                      AND (consent.valid_until IS NULL OR consent.valid_until >= $2)
-               )) AS portrait_allowed
+                   FROM consents consent
+                   WHERE consent.subject_type='player' AND consent.subject_id=p.id
+                     AND consent.scope='portrait'
+                   ORDER BY consent.updated_at DESC, consent.created_at DESC, consent.id DESC
+                   LIMIT 1
+               ), p.source_key LIKE 'bundle:player:%', FALSE) AS portrait_allowed,
+               COALESCE((
+                   SELECT consent.status='granted'
+                     AND (consent.valid_from IS NULL OR consent.valid_from <= $2)
+                     AND (consent.valid_until IS NULL OR consent.valid_until >= $2)
+                   FROM consents consent WHERE consent.subject_type='player'
+                     AND consent.subject_id=p.id AND consent.scope='name_bio'
+                   ORDER BY consent.updated_at DESC,consent.created_at DESC,consent.id DESC LIMIT 1
+               ), p.source_key LIKE 'bundle:player:%', FALSE) AS name_allowed
         FROM players p
         JOIN player_city_memberships pcm ON pcm.player_id=p.id
         WHERE pcm.city_id=ANY($1::uuid[])
@@ -155,7 +192,7 @@ async def project_city_payload(
           AND (pcm.valid_to IS NULL OR pcm.valid_to >= $2::date)
           AND p.status='active' AND p.deleted_at IS NULL
           AND p.selected_for_publication=TRUE AND p.approved_for_publication=TRUE
-        ORDER BY p.id, pcm.valid_from DESC
+        ORDER BY p.id, (pcm.valid_to IS NULL) DESC, pcm.valid_from DESC, pcm.id
         """,
         city_ids,
         generated_at,
@@ -203,10 +240,14 @@ async def project_city_payload(
             }
         )
     for row in players:
+        if not row["name_allowed"]:
+            continue
         by_city[row["city_id"]]["players"].append(
             {
                 "id": _bundle_public_id(row["source_key"], "player", row["id"]),
-                "photo": row["photo_url"] if row["portrait_allowed"] else "",
+                "photo": row["photo_url"]
+                if row["portrait_allowed"] and _allowed_media(row["photo_url"], allowed_media)
+                else "",
                 "nameRu": row["name_ru"],
                 "nameKz": row["name_kz"],
                 "nameEn": row["name_en"],
@@ -219,6 +260,10 @@ async def project_city_payload(
             }
         )
     for row in gallery:
+        if not _allowed_media(row["src"], allowed_media) or not _allowed_media(
+            row["thumbnail"], allowed_media
+        ):
+            continue
         by_city[row["city_id"]]["gallery"].append(
             {
                 "id": row["public_id"],
@@ -251,7 +296,9 @@ async def project_city_payload(
                 "locativeEn": row["locative_en"],
                 "region": row["region"],
                 "regionAliases": list(row["region_aliases"]),
-                "hero": row["hero_url"],
+                "hero": row["hero_url"]
+                if _allowed_media(row["hero_url"], allowed_media)
+                else "/assets/heroes/clubs.png",
                 "geoCoords": (
                     [row["longitude"], row["latitude"]]
                     if row["longitude"] is not None and row["latitude"] is not None
@@ -292,24 +339,31 @@ async def project_federation_payload(
             """
         )
     }
+    allowed_media = await _managed_media_allowed(connection, generated_at)
     leadership = []
     for row in await connection.fetch(
         """
         SELECT lp.*,
-               (lp.source_key LIKE 'bundle:leader:%' OR EXISTS (
-                   SELECT 1 FROM consents consent
-                   WHERE consent.subject_type='leadership' AND consent.subject_id=lp.id
-                     AND consent.scope='contact' AND consent.status='granted'
+               COALESCE((
+                   SELECT consent.status='granted'
                      AND (consent.valid_from IS NULL OR consent.valid_from <= $1)
                      AND (consent.valid_until IS NULL OR consent.valid_until >= $1)
-               )) AS contact_allowed,
-               (lp.source_key LIKE 'bundle:leader:%' OR EXISTS (
-                   SELECT 1 FROM consents consent
+                   FROM consents consent
                    WHERE consent.subject_type='leadership' AND consent.subject_id=lp.id
-                     AND consent.scope='portrait' AND consent.status='granted'
+                     AND consent.scope='contact'
+                   ORDER BY consent.updated_at DESC, consent.created_at DESC, consent.id DESC
+                   LIMIT 1
+               ), lp.source_key LIKE 'bundle:leader:%', FALSE) AS contact_allowed,
+               COALESCE((
+                   SELECT consent.status='granted'
                      AND (consent.valid_from IS NULL OR consent.valid_from <= $1)
                      AND (consent.valid_until IS NULL OR consent.valid_until >= $1)
-               )) AS portrait_allowed
+                   FROM consents consent
+                   WHERE consent.subject_type='leadership' AND consent.subject_id=lp.id
+                     AND consent.scope='portrait'
+                   ORDER BY consent.updated_at DESC, consent.created_at DESC, consent.id DESC
+                   LIMIT 1
+               ), lp.source_key LIKE 'bundle:leader:%', FALSE) AS portrait_allowed
         FROM leadership_profiles lp
         WHERE lp.active=TRUE AND lp.deleted_at IS NULL
         ORDER BY sort_order, source_key NULLS LAST, id
@@ -327,7 +381,9 @@ async def project_federation_payload(
                 "bioKz": row["bio_kz"],
                 "focusRu": row["focus_ru"],
                 "focusKz": row["focus_kz"],
-                "photo": row["photo_url"] if row["portrait_allowed"] else "",
+                "photo": row["photo_url"]
+                if row["portrait_allowed"] and _allowed_media(row["photo_url"], allowed_media)
+                else "",
                 "email": (
                     row["email_private"]
                     if row["contacts_are_public"] and row["contact_allowed"]
@@ -340,6 +396,30 @@ async def project_federation_payload(
                 ),
             }
         )
+    documents = []
+    for document in await connection.fetch(
+        """SELECT d.* FROM official_documents d
+           JOIN official_document_requirements r ON r.code=d.requirement_code AND r.active
+           WHERE d.status='verified' AND d.publication_allowed AND d.reviewed_by IS NOT NULL
+             AND d.reviewed_at IS NOT NULL AND (d.issued_on IS NULL OR d.issued_on <= $1::date)
+             AND (d.valid_until IS NULL OR d.valid_until >= $1::date)
+           ORDER BY r.sort_order,d.issued_on DESC NULLS LAST,d.id""",
+        generated_at,
+    ):
+        documents.append(
+            {
+                "id": str(document["id"]),
+                "titleRu": document["title_ru"],
+                "titleKz": document["title_kz"],
+                "url": f"/assets/documents/{document['sha256']}.pdf",
+                "sha256": document["sha256"],
+                "byteSize": document["byte_size"],
+                "issuedOn": document["issued_on"].isoformat() if document["issued_on"] else None,
+                "validUntil": document["valid_until"].isoformat()
+                if document["valid_until"]
+                else None,
+            }
+        )
     return build_federation_payload(
         {
             "mission": sections.get("mission", {}),
@@ -347,6 +427,7 @@ async def project_federation_payload(
             "achievements": sections.get("achievements", []),
             "roadmap": sections.get("roadmap", []),
             "leadership": leadership,
+            "documents": documents,
         },
         generated_at=generated_at,
     )
@@ -432,7 +513,7 @@ async def project_news_payload(
 
 
 def deterministic_json(
-    model: CityPayload | FederationPayload | NewsPayload | dict[str, Any]
+    model: CityPayload | FederationPayload | NewsPayload | dict[str, Any],
 ) -> str:
     value = (
         model.model_dump(mode="json", exclude_none=True) if hasattr(model, "model_dump") else model

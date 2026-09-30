@@ -74,6 +74,7 @@ def read_federation_bundle(path: Path) -> list[ImportRecord]:
             content={"value": value, "generatedAt": payload.generatedAt},
         )
         for key, value in sorted(federation.items())
+        if key != "documents"
     ]
 
 
@@ -410,9 +411,7 @@ async def apply_city_import(
         )
         public_date = (_timestamp(value.get("updatedAt")) or datetime.now().astimezone()).date()
         await _sync_city_clubs(connection, city_id, value.get("clubs_list", []), imported_by)
-        await _sync_city_schedules(
-            connection, city_id, value.get("schedule", []), imported_by
-        )
+        await _sync_city_schedules(connection, city_id, value.get("schedule", []), imported_by)
         await _sync_city_players(
             connection,
             city_id,

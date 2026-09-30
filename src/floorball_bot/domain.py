@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -345,6 +346,8 @@ class FederationLeader(BaseModel):
     @field_validator("photo")
     @classmethod
     def validate_photo(cls, value: str) -> str:
+        if re.fullmatch(r"/assets/content/[0-9a-f]{64}\.webp", value):
+            return value
         return _validate_public_url(value)
 
     @model_validator(mode="after")
@@ -354,6 +357,18 @@ class FederationLeader(BaseModel):
         return self
 
 
+class PublicDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: UUID
+    titleRu: str = Field(min_length=1, max_length=240)
+    titleKz: str = Field(default="", max_length=240)
+    url: str = Field(pattern=r"^/assets/documents/[0-9a-f]{64}\.pdf$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byteSize: int = Field(gt=0, le=20 * 1024 * 1024)
+    issuedOn: str | None = None
+    validUntil: str | None = None
+
+
 class PublicFederation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mission: FederationMission = Field(default_factory=FederationMission)
@@ -361,6 +376,7 @@ class PublicFederation(BaseModel):
     achievements: list[FederationTimelineItem] = Field(default_factory=list, max_length=15)
     roadmap: list[FederationRoadmapItem] = Field(default_factory=list, max_length=12)
     leadership: list[FederationLeader] = Field(default_factory=list, max_length=12)
+    documents: list[PublicDocument] = Field(default_factory=list, max_length=100)
 
 
 class FederationPayload(BaseModel):

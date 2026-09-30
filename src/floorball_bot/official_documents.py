@@ -115,9 +115,7 @@ def format_official_document_status(rows: list[asyncpg.Record]) -> str:
             validity = f", до {row['valid_until'].isoformat()}" if row["valid_until"] else ""
             number = f" № {row['document_number']}" if row["document_number"] else ""
             state = "проверен" if row["status"] == "verified" else "получен"
-            lines.append(
-                f"✅ {row['title_ru']} (`{row['code']}`) — {state}{number}{validity}"
-            )
+            lines.append(f"✅ {row['title_ru']} (`{row['code']}`) — {state}{number}{validity}")
         else:
             icon = "❗" if row["required"] else "▫️"
             lines.append(f"{icon} {row['title_ru']} (`{row['code']}`) — нет, {required}")
@@ -179,8 +177,7 @@ async def send_missing_document_reminders(pool: asyncpg.Pool) -> int:
         if expiring:
             lines.append("Истекают в ближайшие 30 дней:")
             lines.extend(
-                f"• {row['title_ru']} — {row['valid_until'].isoformat()}"
-                for row in expiring
+                f"• {row['title_ru']} — {row['valid_until'].isoformat()}" for row in expiring
             )
         lines.append("Откройте /documents и загрузите файл командой /document <код>.")
         text = "\n".join(lines)
@@ -210,3 +207,105 @@ async def send_missing_document_reminders(pool: asyncpg.Pool) -> int:
                     {"week": week_bucket},
                 )
         return sent
+
+
+def checked_official_pdf(document, media_root: Path) -> Path:
+    source = Path(document["original_path"])
+    root = (media_root / "official_documents").resolve()
+    resolved = source.resolve()
+    if (
+        source.is_symlink()
+        or not resolved.is_relative_to(root)
+        or not resolved.is_file()
+        or resolved.stat().st_size != document["byte_size"]
+    ):
+        raise InvalidOfficialDocument("Приватный PDF недоступен или изменён.")
+    if hashlib.sha256(resolved.read_bytes()).hexdigest() != document["sha256"]:
+        raise InvalidOfficialDocument("Контрольная сумма PDF изменилась. Загрузите файл заново.")
+    return resolved
+
+
+async def review_official_document(
+    connection,
+    *,
+    document_id: UUID,
+    expected_sha: str,
+    actor_id: UUID,
+    verify: bool,
+    media_root: Path,
+) -> str:
+    # One requirement mutex serializes verification and supersession without
+    # locking competing document rows in an inconsistent order.
+    code = await connection.fetchval(
+        "SELECT requirement_code FROM official_documents WHERE id=$1", document_id
+    )
+    if not code:
+        raise InvalidOfficialDocument("Документ не найден.")
+    await connection.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", "official-document:" + code
+    )
+    document = await connection.fetchrow(
+        "SELECT * FROM official_documents WHERE id=$1 FOR UPDATE", document_id
+    )
+    permitted = await connection.fetchval(
+        """SELECT EXISTS(SELECT 1 FROM users u JOIN user_roles r ON r.user_id=u.id
+           WHERE u.id=$1 AND u.active AND u.deleted_at IS NULL AND r.revoked_at IS NULL
+             AND r.role_name IN ('superadmin','federation_editor'))""",
+        actor_id,
+    )
+    if not permitted:
+        raise InvalidOfficialDocument("Нет доступа к проверке документов.")
+    if document["sha256"] != expected_sha:
+        raise InvalidOfficialDocument("Контрольная сумма не совпала. Откройте /documents ещё раз.")
+    target = "verified" if verify else "rejected"
+    if document["status"] == target:
+        return "Этот результат проверки уже сохранён."
+    if document["status"] not in {"received", "verified"}:
+        raise InvalidOfficialDocument("Завершите загрузку и заполнение метаданных документа.")
+    if verify:
+        checked_official_pdf(document, media_root)
+        if not document["publication_allowed"]:
+            raise InvalidOfficialDocument("Автор не разрешил публичное размещение этого PDF.")
+        today = datetime.now(UTC).date()
+        if (document["valid_until"] and document["valid_until"] < today) or (
+            document["issued_on"] and document["issued_on"] > today
+        ):
+            raise InvalidOfficialDocument("Документ ещё не действует или уже истёк.")
+        old = await connection.fetch(
+            """UPDATE official_documents SET status='superseded',
+                   revision=revision+1,updated_at=now()
+               WHERE requirement_code=$1 AND id<>$2 AND status='verified' RETURNING id""",
+            code,
+            document_id,
+        )
+        for row in old:
+            await connection.execute(
+                """INSERT INTO official_document_events(
+                       document_id,requirement_code,actor_id,action)
+                   VALUES ($1,$2,$3,'superseded')""",
+                row["id"],
+                code,
+                actor_id,
+            )
+    await connection.execute(
+        "UPDATE official_documents SET status=$2,reviewed_by=$3,reviewed_at=now(),"
+        "revision=revision+1,updated_at=now() WHERE id=$1",
+        document_id,
+        target,
+        actor_id,
+    )
+    await connection.execute(
+        """INSERT INTO official_document_events(
+                   document_id,requirement_code,actor_id,action,details)
+           VALUES ($1,$2,$3,$4,$5)""",
+        document_id,
+        code,
+        actor_id,
+        "verified" if verify else "rejected",
+        {"sha256": expected_sha},
+    )
+    return (
+        "PDF проверен. Он войдёт в следующий подтверждённый выпуск /publish federation."
+        if verify
+        else "Документ отклонён. Обновите публичный раздел: /publish federation."
+    )

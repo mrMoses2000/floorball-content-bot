@@ -5,37 +5,32 @@
 1. Создайте отдельного бота через BotFather и отключите privacy mode только если это действительно нужно для групп.
 2. Поместите токен в защищённый `TG_API_KEY`.
 3. Запустите `floorball-bot bot`. Процесс вызывает `getWebhookInfo`; webhook удаляется только у этого токена и с `drop_pending_updates=false`.
-4. Привилегированный пользователь должен быть заранее создан CLI-командой. `/start` выдаёт
-   кнопку `request_contact`; текстовый телефон не авторизует.
+4. Привилегированный пользователь должен быть заранее создан CLI-командой. При создании по
+   телефону `/start` предлагает `request_contact`; текстовый телефон не авторизует. При создании
+   по Telegram ID существующий активный actor сразу получает меню назначенных ему ролей.
 5. Публичная ссылка `https://t.me/floorball_site_agent_bot?start=coach` разрешает self-contact
    onboarding только в роль `coach_form`. Она не выдаёт city scope, review или publish права.
 
 Long polling не требует домена, HTTPS, Cloudflare Tunnel, port forwarding или публичного входящего порта.
 
-## Форма связи и SMTP
+## Публикация сайта
 
-1. Сгенерируйте отдельный случайный `CONTACT_API_SECRET` длиной не менее 32 байт. Он используется
-   только для HMAC-псевдонимизации IP и не передаётся браузеру.
-2. Укажите `SMTP_USERNAME` и отдельный app password в `SMTP_PASSWORD`; обычный пароль Gmail не
-   используйте. Получатель жёстко задан как `Knff@gmail.com` и не принимается из HTTP-запроса.
-3. Запустите `floorball-bot contact-api` на `127.0.0.1:8088` и оставьте worker запущенным.
-4. На домашнем сервере создайте постоянный HTTPS-маршрут, например:
-   `tailscale funnel --bg --yes --set-path=/floorball-contact http://127.0.0.1:8088`.
-   В сборке сайта задайте `VITE_CONTACT_API_URL=https://<stable-host>/floorball-contact/api/contact/v1/requests`.
-   Plesk при этом отдаёт только статику и не должен соединяться с домашним IP напрямую.
-5. Проверьте `GET http://127.0.0.1:8088/healthz` и публичный HTTPS health URL, затем отправьте одну заявку с уникальным marker,
-   найдите её UUID в `contact_requests` и подтвердите письмо в `Knff@gmail.com`.
+Бот собирает анкеты и файлы, reviewer утверждает ревизии. Publisher строит
+preview и ждёт отдельное подтверждение конкретной сборки. Затем атомарно
+обновляет main/plesk-static, вызывает приватные Plesk webhooks и сверяет
+публичный index.html и изменённые assets с manifest. При сбое развёртывания
+сохраняется remote_verified; существующая reconciliation повторяет проверку.
 
-API возвращает только факт долговременного принятия (`202 accepted`), а не обещание доставки.
-Повтор неизменённой формы использует тот же UUID. Временная SMTP-ошибка повторяется не более пяти
-раз; окончательная ошибка остаётся видимой в БД и отправляется superadmin через Telegram outbox.
-Не включайте публичный маршрут до настройки SMTP: иначе заявка сохранится, но delivery job
-завершится как `mailer_not_configured`.
+Contact API / SMTP и веб-формы сбора удалены: они не использовались в production.
+Телефонное подтверждение личности в Telegram сохранено.
+
 
 ## AssemblyAI
 
 - Пользовательское имя секрета: `ASSEMBLI_AI`; также принят canonical alias `ASSEMBLYAI_API_KEY`.
-- RU и другие проверенные batch-языки идут через pre-recorded API.
+- RU и другие проверенные batch-языки идут через pre-recorded API с закреплённой
+  `universal-2`. RU проверен синтетической записью 30 сентября 2026; `universal-3-pro`
+  не подходит этому пути и заменён в текущем API.
 - KZ/KK маршрутизируется в Whisper Streaming (`whisper-rt`) после ffmpeg 16 kHz mono conversion и отправляется с wall-clock pacing. Session всегда получает `Terminate`.
 - Обычные тесты используют `FakeTranscriber` и не расходуют credits.
 - Для external smoke подготовьте короткие аудио с юридически допустимым содержимым и запустите отдельный тестовый сценарий; production-голоса не используйте как тестовые fixtures.
@@ -43,9 +38,9 @@ API возвращает только факт долговременного п
 ## Agy CLI
 
 Проверьте `agy --version` и авторизацию для того же Linux user, от которого работает worker.
-Production wrapper использует модель `gemini-3.8-flash` с effort `high`, print mode,
+На проверенном сервере закреплена модель `gemini-3.8-flash-high` с effort `high`, print mode,
 `--sandbox`, отключённые slash-команды и строгую JSON Schema. Процесс запускается прямым argv
-без shell; Telegram/AssemblyAI/SMTP secrets в дочернее окружение не наследуются. Значения можно
+без shell; Telegram/AssemblyAI secrets в дочернее окружение не наследуются. Значения можно
 переопределить через `AGY_CLI`, `AGY_MODEL`, `AGY_EFFORT` и `AGY_TIMEOUT_SECONDS`.
 
 ## GitHub deploy key

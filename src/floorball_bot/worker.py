@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import asyncpg
 
 from floorball_bot.callbacks import create_callback
-from floorball_bot.contact_requests import ContactDelivery, ContactMailer
 from floorball_bot.context_gateway import AgentContextGateway, AgentMode, load_context_actor
 from floorball_bot.db import transaction
 from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
@@ -30,6 +30,7 @@ from floorball_bot.media import MediaPipeline
 from floorball_bot.news_defaults import apply_news_defaults
 from floorball_bot.official_documents import send_missing_document_reminders
 from floorball_bot.projection.apply import apply_approved_trainer_draft
+from floorball_bot.projection.federation import apply_approved_federation_draft
 from floorball_bot.projection.news import apply_approved_news_draft
 from floorball_bot.providers.agy import StructuredExtractor
 from floorball_bot.providers.transcription import Transcriber
@@ -57,7 +58,6 @@ class Worker:
         transcriber: Transcriber,
         media_pipeline: MediaPipeline | None = None,
         publisher: GitPublisher | None = None,
-        contact_mailer: ContactMailer | None = None,
         lease_seconds: int = 300,
         readiness_interval_seconds: int = 60,
         document_reminder_interval_seconds: int = 60 * 60,
@@ -67,7 +67,6 @@ class Worker:
         self.transcriber = transcriber
         self.media_pipeline = media_pipeline
         self.publisher = publisher
-        self.contact_mailer = contact_mailer
         self.dialogues = DialogueSpecRepository()
         self.context_gateway = AgentContextGateway(pool)
         self.lease_seconds = lease_seconds
@@ -123,10 +122,7 @@ class Worker:
                 continue
             if job is None:
                 now = time.monotonic()
-                if (
-                    self.publisher is not None
-                    and now - self._last_publication_reconcile >= 30
-                ):
+                if self.publisher is not None and now - self._last_publication_reconcile >= 30:
                     self._last_publication_reconcile = now
                     try:
                         await self._reconcile_one_stale_publication()
@@ -171,8 +167,6 @@ class Worker:
                 await self._scan_readiness()
             elif job.kind == "apply_projection":
                 await self._apply_projection(job)
-            elif job.kind == "contact_delivery":
-                await self._contact_delivery(job)
             elif job.kind == "publish_preview":
                 await self._publish_preview(job)
             elif job.kind == "publish_confirm":
@@ -211,11 +205,11 @@ class Worker:
         if actor is None or not actor.active:
             raise PermanentProviderError("projection actor no longer exists")
         if workflow == "news":
-            result = await apply_approved_news_draft(
-                self.pool, draft_id=draft_id, actor=actor
-            )
+            result = await apply_approved_news_draft(self.pool, draft_id=draft_id, actor=actor)
         elif workflow == "trainer":
-            result = await apply_approved_trainer_draft(
+            result = await apply_approved_trainer_draft(self.pool, draft_id=draft_id, actor=actor)
+        elif workflow in {"strategy", "history", "leadership"}:
+            result = await apply_approved_federation_draft(
                 self.pool, draft_id=draft_id, actor=actor
             )
         else:
@@ -249,97 +243,6 @@ class Worker:
                     "projection-applied", result.application_id, chat_id
                 ),
             )
-
-    async def _contact_delivery(self, job: ClaimedJob) -> None:
-        request_id = UUID(str(job.payload["request_id"]))
-        async with transaction(self.pool) as connection:
-            row = await connection.fetchrow(
-                """
-                UPDATE contact_requests SET status='sending', attempts=attempts+1,
-                    locked_at=now(), locked_by=$2, updated_at=now()
-                WHERE id=$1 AND status IN ('pending','retry','sending')
-                RETURNING id AS request_id, locale, name, reply_to, subject,
-                          message, recipient, attempts
-                """,
-                request_id,
-                self.worker_id,
-            )
-            if not row:
-                status = await connection.fetchval(
-                    "SELECT status FROM contact_requests WHERE id=$1", request_id
-                )
-                if status == "sent":
-                    return
-                raise PermanentProviderError("contact request is not deliverable")
-        if self.contact_mailer is None:
-            await self.pool.execute(
-                """
-                UPDATE contact_requests SET status='dead', last_error='mailer_not_configured',
-                    locked_at=NULL, locked_by=NULL, updated_at=now() WHERE id=$1
-                """,
-                request_id,
-            )
-            await self._notify_contact_failure(request_id, "mailer_not_configured")
-            raise PermanentProviderError("contact mailer is not configured")
-        delivery_data = dict(row)
-        delivery_data.pop("attempts")
-        delivery = ContactDelivery.model_validate(delivery_data)
-        try:
-            external_id = await self.contact_mailer.send(delivery)
-        except Exception as exc:
-            terminal = row["attempts"] >= job.max_attempts
-            await self.pool.execute(
-                """
-                UPDATE contact_requests SET status=$2,
-                    available_at=now()+interval '30 seconds',
-                    last_error=$3, locked_at=NULL, locked_by=NULL, updated_at=now()
-                WHERE id=$1
-                """,
-                request_id,
-                "dead" if terminal else "retry",
-                type(exc).__name__,
-            )
-            if terminal:
-                await self._notify_contact_failure(request_id, type(exc).__name__)
-                raise PermanentProviderError("contact delivery exhausted retries") from exc
-            raise RetryableProviderError("contact delivery failed") from exc
-        await self.pool.execute(
-            """
-            UPDATE contact_requests SET status='sent', external_id=$2, sent_at=now(),
-                last_error='', locked_at=NULL, locked_by=NULL, updated_at=now()
-            WHERE id=$1
-            """,
-            request_id,
-            external_id[:500],
-        )
-
-    async def _notify_contact_failure(self, request_id: UUID, error_class: str) -> None:
-        recipients = await self.pool.fetch(
-            """
-            SELECT DISTINCT u.id, u.telegram_id
-            FROM users u
-            JOIN user_roles ur ON ur.user_id=u.id AND ur.role_name='superadmin'
-                              AND ur.revoked_at IS NULL
-            WHERE u.active=TRUE AND u.deleted_at IS NULL AND u.telegram_id IS NOT NULL
-            """
-        )
-        async with transaction(self.pool) as connection:
-            for recipient in recipients:
-                await enqueue_outbox(
-                    connection,
-                    event_type="telegram_message",
-                    payload={
-                        "chat_id": recipient["telegram_id"],
-                        "text": (
-                            "Заявка с сайта не доставлена после повторных попыток. "
-                            f"Request ID: {request_id}. Ошибка: {error_class}. "
-                            "Данные сохранены в contact_requests; нужна ручная проверка SMTP."
-                        ),
-                    },
-                    idempotency_key=stable_idempotency_key(
-                        "contact-delivery-dead", request_id, recipient["id"]
-                    ),
-                )
 
     async def _publication_recipients(self, fallback_chat_id: int | None) -> set[int]:
         rows = await self.pool.fetch(
@@ -440,10 +343,14 @@ class Worker:
                         ttl_seconds=7 * 24 * 60 * 60,
                     )
                     retry_markup = {
-                        "inline_keyboard": [[{
-                            "text": "Повторить сборку preview",
-                            "callback_data": retry.callback_data,
-                        }]]
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "Повторить сборку preview",
+                                    "callback_data": retry.callback_data,
+                                }
+                            ]
+                        ]
                     }
                 await enqueue_outbox(
                     connection,
@@ -524,10 +431,12 @@ class Worker:
                     ),
                     "reply_markup": {
                         "inline_keyboard": [
-                            [{
-                                "text": "Даю добро: commit и push",
-                                "callback_data": callback.callback_data,
-                            }],
+                            [
+                                {
+                                    "text": "Даю добро: commit и push",
+                                    "callback_data": callback.callback_data,
+                                }
+                            ],
                             [
                                 {
                                     "text": "Нужны изменения",
@@ -541,9 +450,7 @@ class Worker:
                         ]
                     },
                 },
-                idempotency_key=stable_idempotency_key(
-                    "preview-ready", publication_id, actor_id
-                ),
+                idempotency_key=stable_idempotency_key("preview-ready", publication_id, actor_id),
             )
 
     async def _publish_confirm(self, job: ClaimedJob) -> None:
@@ -594,10 +501,14 @@ class Worker:
                         ttl_seconds=7 * 24 * 60 * 60,
                     )
                     retry_markup = {
-                        "inline_keyboard": [[{
-                            "text": "Собрать новый preview",
-                            "callback_data": retry.callback_data,
-                        }]]
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "Собрать новый preview",
+                                    "callback_data": retry.callback_data,
+                                }
+                            ]
+                        ]
                     }
                 await enqueue_outbox(
                     connection,
@@ -669,10 +580,14 @@ class Worker:
                         "text": (
                             "Commit и push завершены и проверены.\n\n"
                             f"main: {main_commit}\nplesk-static: {static_commit}\n\n"
-                            "В Plesk откройте floorball-build.git (ветка plesk-static, "
-                            "каталог /httpdocs). Нажмите «Получить сейчас», затем "
-                            "«Развернуть сейчас», если сборка не развернулась автоматически. "
-                            "После обновления проверьте сайт floorball.kz."
+                            + (
+                                "Сборка автоматически развёрнута в Plesk "
+                                "и проверена на floorball.kz."
+                                if self.publisher
+                                and getattr(self.publisher, "plesk_static_webhook_url", "")
+                                else "В Plesk откройте floorball-build.git: «Получить сейчас», "
+                                "затем «Развернуть сейчас». Проверьте floorball.kz."
+                            )
                         ),
                     },
                     idempotency_key=stable_idempotency_key(
@@ -742,9 +657,7 @@ class Worker:
                         f"Причина: {row['reconciliation_error'] or 'state mismatch'}."
                     ),
                 },
-                idempotency_key=stable_idempotency_key(
-                    "publish-reconcile-failed", publication_id
-                ),
+                idempotency_key=stable_idempotency_key("publish-reconcile-failed", publication_id),
             )
 
     async def _transcribe(self, job: ClaimedJob) -> None:
@@ -756,16 +669,19 @@ class Worker:
                 """
                 SELECT id FROM messages
                 WHERE telegram_chat_id=$1 AND message_type IN ('voice','audio')
-                ORDER BY created_at DESC LIMIT 1
+                  AND ($2::uuid IS NULL OR id=$2)
+                  AND transcript_confirmed=FALSE
+                ORDER BY created_at ASC LIMIT 1 FOR UPDATE
                 """,
                 chat_id,
+                UUID(job.payload["message_id"]) if job.payload.get("message_id") else None,
             )
             transcript = result.text.strip()
             if message_id:
                 await connection.execute(
                     """
                     UPDATE messages SET normalized_text=$2, source_language=$3,
-                        provider_metadata=$4::jsonb, transcript_confirmed=$5
+                        provider_metadata=$4::jsonb, transcript_confirmed=FALSE
                     WHERE id=$1
                     """,
                     message_id,
@@ -777,8 +693,8 @@ class Worker:
                         "confidence": result.confidence,
                         "duration_seconds": result.duration_seconds,
                         "billing": result.billing_metadata or {},
+                        "transcribed_at": datetime.now(UTC).isoformat(),
                     },
-                    bool(transcript),
                 )
             if not transcript:
                 await enqueue_outbox(
@@ -794,31 +710,17 @@ class Worker:
                     idempotency_key=stable_idempotency_key("transcript-empty", job.id),
                 )
                 return
-            if not job.payload.get("session_id") or not job.payload.get("mode"):
-                await enqueue_outbox(
-                    connection,
-                    event_type="telegram_message",
-                    payload={
-                        "chat_id": chat_id,
-                        "text": (
-                            "Сначала выберите анкету, к которой нужно добавить "
-                            "голосовое сообщение."
-                        ),
-                    },
-                    idempotency_key=stable_idempotency_key("transcript-no-session", job.id),
-                )
-                return
-            await enqueue_job(
+            await enqueue_outbox(
                 connection,
-                kind="extract",
+                event_type="telegram_message",
                 payload={
-                    "text": transcript,
                     "chat_id": chat_id,
-                    "user_id": job.payload.get("user_id"),
-                    "session_id": job.payload["session_id"],
-                    "mode": job.payload["mode"],
+                    "text": (
+                        f"Расшифровка:\n{transcript}\n\n"
+                        "Подтвердите текст словом «Подтверждаю» или отправьте исправленный текст."
+                    ),
                 },
-                idempotency_key=stable_idempotency_key("voice-extract", job.id),
+                idempotency_key=stable_idempotency_key("transcript-ready", job.id),
             )
 
     async def _extract(self, job: ClaimedJob) -> None:
@@ -830,7 +732,6 @@ class Worker:
     async def _extract_dialogue(self, job: ClaimedJob) -> None:
         session_id = UUID(str(job.payload["session_id"]))
         mode = DialogueMode(str(job.payload["mode"]))
-        loaded = self.dialogues.load(mode)
         async with self.pool.acquire() as connection:
             session = await connection.fetchrow(
                 """
@@ -841,24 +742,28 @@ class Worker:
             )
             if not session or session["status"] != "active":
                 raise PermanentProviderError("dialogue session is not active")
+            loaded = self.dialogues.load(mode, sha256=session["definition_hash"])
             if session["definition_hash"] != loaded.sha256:
                 raise PermanentProviderError("dialogue definition changed for an active session")
-            memory = await connection.fetchval(
-                "SELECT structured_memory FROM conversation_memory WHERE session_id=$1",
+            memory_row = await connection.fetchrow(
+                "SELECT structured_memory, revision FROM conversation_memory WHERE session_id=$1",
                 session_id,
-            ) or {}
+            )
+            memory = memory_row["structured_memory"] if memory_row else {}
+            memory_revision = memory_row["revision"] if memory_row else None
             actor = await load_context_actor(connection, session["user_id"])
-            language = await connection.fetchval(
-                "SELECT preferred_language FROM users WHERE id=$1", session["user_id"]
-            ) or "ru"
+            language = (
+                await connection.fetchval(
+                    "SELECT preferred_language FROM users WHERE id=$1", session["user_id"]
+                )
+                or "ru"
+            )
         if actor is None:
             raise PermanentProviderError("dialogue actor no longer exists")
         fields = dict(memory.get("fields", {}))
         city_slug = None
         if mode == DialogueMode.TRAINER:
-            directory = await self.context_gateway.snapshot(
-                actor=actor, mode=AgentMode.TRAINER
-            )
+            directory = await self.context_gateway.snapshot(actor=actor, mode=AgentMode.TRAINER)
             city_value = fields.get("city")
             if isinstance(city_value, dict):
                 supplied = str(city_value.get("name") or city_value.get("other_name") or "")
@@ -908,6 +813,7 @@ class Worker:
             mode=mode,
             context=context,
             known_fields=fields,
+            spec_sha256=loaded.sha256,
         )
         merged = apply_dialogue_patch(
             loaded.spec,
@@ -950,6 +856,19 @@ class Worker:
                 "или отправьте анкету командой /submit."
             ]
         async with transaction(self.pool) as connection:
+            current_session = await connection.fetchrow(
+                "SELECT status FROM conversation_sessions WHERE id=$1 FOR UPDATE", session_id
+            )
+            if not current_session or current_session["status"] != "active":
+                raise PermanentProviderError("dialogue session closed during extraction")
+            current_revision = await connection.fetchval(
+                "SELECT revision FROM conversation_memory WHERE session_id=$1 FOR UPDATE",
+                session_id,
+            )
+            if current_revision != memory_revision:
+                raise RetryableProviderError(
+                    "dialogue edited during extraction; retry from fresh data"
+                )
             await connection.execute(
                 """
                 INSERT INTO conversation_memory(session_id, structured_memory)
@@ -962,8 +881,7 @@ class Worker:
                 {
                     "fields": merged,
                     "critical_missing": [
-                        gap.field_id
-                        for gap in (*gaps.required_to_start, *gaps.required_for_submit)
+                        gap.field_id for gap in (*gaps.required_to_start, *gaps.required_for_submit)
                     ],
                     "publish_missing": [gap.field_id for gap in gaps.required_for_publish],
                     "optional_missing": [gap.field_id for gap in gaps.recommended],
@@ -1024,6 +942,17 @@ class Worker:
                 )
             news_photo_count = 0
             session_id = job.payload.get("session_id")
+            if session_id and job.payload.get("field_path"):
+                from floorball_bot.attachments import attach_session_media
+
+                await attach_session_media(
+                    connection,
+                    session_id=UUID(str(session_id)),
+                    user_id=uploader_id,
+                    media_id=media_id,
+                    field_path=job.payload["field_path"],
+                    expected_record=job.payload.get("expected_record"),
+                )
             if session_id and job.payload.get("session_workflow") == "news":
                 news_session_id = UUID(str(session_id))
                 session = await connection.fetchrow(
@@ -1089,7 +1018,13 @@ class Worker:
                         f"({news_photo_count}/10). Когда закончите загрузку, отправьте "
                         "/photos-ready."
                         if news_photo_count
-                        else "Фото обработано без EXIF и ожидает consent/moderation approval."
+                        else (
+                            "Фото обработано без EXIF и прикреплено к анкете. "
+                            "Подтвердите права на публикацию в чате; "
+                            "затем отправьте анкету на проверку."
+                            if job.payload.get("field_path")
+                            else "Фото обработано без EXIF и ожидает проверки прав на публикацию."
+                        )
                     ),
                 },
                 idempotency_key=stable_idempotency_key("media-result", job.id),

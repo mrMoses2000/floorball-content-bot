@@ -9,12 +9,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 from aiohttp import web
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from floorball_bot.attachments import attachment_field, record_identity, upload_targets
 from floorball_bot.auth import get_actor_by_telegram_id
 from floorball_bot.db import transaction
 from floorball_bot.dialogue import DialogueMode, DialogueSpecRepository
@@ -23,13 +24,16 @@ from floorball_bot.dialogue.models import FieldType
 from floorball_bot.dialogue.patches import validate_field_value
 from floorball_bot.dialogue.presentation import field_copy, friendly_question, hidden_from_user
 from floorball_bot.domain import Role
+from floorball_bot.errors import ValidationBlocked
 from floorball_bot.news_defaults import apply_news_defaults
+from floorball_bot.queue import enqueue_job, stable_idempotency_key
 
 POOL = web.AppKey("pool", asyncpg.Pool)
 BOT_TOKEN = web.AppKey("bot_token", str)
 AUTH_MAX_AGE = web.AppKey("auth_max_age", int)
 DIST_ROOT = web.AppKey("dist_root", Path)
 DIALOGUES = web.AppKey("dialogues", DialogueSpecRepository)
+MEDIA_ROOT = web.AppKey("media_root", Path)
 
 
 class MiniAppError(Exception):
@@ -97,7 +101,7 @@ async def error_middleware(request: web.Request, handler):
         response = web.json_response(
             {"error": {"code": exc.code, "message": exc.message}}, status=exc.status
         )
-    except (json.JSONDecodeError, ValidationError, web.HTTPBadRequest):
+    except (json.JSONDecodeError, ValidationError, ValidationBlocked, web.HTTPBadRequest):
         response = web.json_response(
             {"error": {"code": "invalid_request", "message": "Проверьте введённые данные."}},
             status=400,
@@ -142,8 +146,7 @@ def _localized(value, language: str) -> str:
 
 def _editable(field) -> bool:
     return (
-        field.type
-        not in {FieldType.FILE, FieldType.RECORD_LIST}
+        field.type not in {FieldType.FILE, FieldType.RECORD_LIST}
         and field.privacy != "consent"
         and not field.db_target.startswith("users")
     )
@@ -195,9 +198,7 @@ def _serialize_session(
             (option["label"] for option in options if option["value"] == current), None
         )
         no_city_options = (
-            loaded.spec.mode == DialogueMode.NEWS
-            and field.id == "city_slug"
-            and not options
+            loaded.spec.mode == DialogueMode.NEWS and field.id == "city_slug" and not options
         )
         question = presentation["question"]
         if no_city_options:
@@ -211,16 +212,15 @@ def _serialize_session(
                 "id": field.id,
                 "label": presentation["label"],
                 "question": question,
-                "type": "choice" if options or (
-                    loaded.spec.mode == DialogueMode.NEWS and field.id == "city_slug"
-                ) else field.type.value,
+                "type": "choice"
+                if options or (loaded.spec.mode == DialogueMode.NEWS and field.id == "city_slug")
+                else field.type.value,
                 "requirement": field.requirement.value,
                 "value": current,
                 "display_value": option_label,
                 "filled": current not in (None, "", [], {}),
-                "missing": field.id in missing or any(
-                    item.startswith(f"{field.id}.") for item in missing
-                ),
+                "missing": field.id in missing
+                or any(item.startswith(f"{field.id}.") for item in missing),
                 "editable": session is not None
                 and session["status"] == "active"
                 and _editable(field)
@@ -259,6 +259,9 @@ def _serialize_session(
             None,
         ),
         "sections": [{"title": title, "fields": items} for title, items in sections.items()],
+        "upload_targets": upload_targets(loaded.spec, fields, language)
+        if session is not None and session["status"] == "active"
+        else [],
     }
 
 
@@ -281,7 +284,7 @@ async def _bootstrap_payload(request: web.Request, connection=None) -> dict[str,
         )
         session_rows = await connection.fetch(
             """
-            SELECT DISTINCT ON (s.workflow) s.id, s.workflow, s.status,
+            SELECT DISTINCT ON (s.workflow) s.id, s.workflow, s.status, s.definition_hash,
                    COALESCE(m.structured_memory, '{}'::jsonb) AS memory,
                    COALESCE(m.revision, 1) AS memory_revision
             FROM conversation_sessions s
@@ -334,6 +337,8 @@ async def _bootstrap_payload(request: web.Request, connection=None) -> dict[str,
         if not roles.intersection(loaded.spec.allowed_roles):
             continue
         row = rows.get(loaded.spec.mode.value)
+        if row:
+            loaded = dialogues.load(loaded.spec.mode, sha256=row["definition_hash"])
         workflows.append(
             _serialize_session(
                 loaded,
@@ -378,9 +383,8 @@ async def _bootstrap_payload(request: web.Request, connection=None) -> dict[str,
             "id": "media",
             "label": "Медиа",
             "granted": bool(
-                roles & {
-                    "media_editor", "federation_editor", "city_coach", "reviewer", "superadmin"
-                }
+                roles
+                & {"media_editor", "federation_editor", "city_coach", "reviewer", "superadmin"}
             ),
         },
     ]
@@ -409,14 +413,25 @@ async def start_session(request: web.Request) -> web.Response:
     if not {role.value for role in actor.roles}.intersection(loaded.spec.allowed_roles):
         raise MiniAppError(403, "forbidden", "Этот раздел пока недоступен.")
     async with transaction(request.app[POOL]) as connection:
+        await connection.execute("SELECT id FROM users WHERE id=$1 FOR UPDATE", actor.user_id)
+        await connection.execute(
+            """
+            UPDATE conversation_sessions SET status='paused', updated_at=now()
+            WHERE user_id=$1 AND workflow<>$2 AND status='active'
+            """,
+            actor.user_id,
+            mode.value,
+        )
         row = await connection.fetchrow(
             """
             SELECT id FROM conversation_sessions
-            WHERE user_id=$1 AND workflow=$2 AND status='active'
+            WHERE user_id=$1 AND workflow=$2 AND status IN ('active','paused')
+              AND definition_hash=$3
             ORDER BY last_activity_at DESC LIMIT 1 FOR UPDATE
             """,
             actor.user_id,
             mode.value,
+            loaded.sha256,
         )
         if row is None:
             session_id = await connection.fetchval(
@@ -431,9 +446,7 @@ async def start_session(request: web.Request) -> web.Response:
                 loaded.sha256,
                 evaluate_gaps(loaded.spec, {}).next_field_id or "ready_to_submit",
             )
-            initial_fields = (
-                apply_news_defaults({}) if mode == DialogueMode.NEWS else {}
-            )
+            initial_fields = apply_news_defaults({}) if mode == DialogueMode.NEWS else {}
             await connection.execute(
                 """
                 INSERT INTO conversation_memory(session_id, structured_memory)
@@ -441,6 +454,12 @@ async def start_session(request: web.Request) -> web.Response:
                 """,
                 session_id,
                 {"fields": initial_fields, "skipped": []},
+            )
+        else:
+            await connection.execute(
+                "UPDATE conversation_sessions SET status='active', last_activity_at=now() "
+                "WHERE id=$1",
+                row["id"],
             )
     return web.json_response(await _bootstrap_payload(request), status=201)
 
@@ -469,15 +488,18 @@ async def update_field(request: web.Request) -> web.Response:
         raise MiniAppError(404, "not_found", "Анкета не найдена.") from exc
     field_path = request.match_info["field_path"]
     mutation = FieldMutation.model_validate(await request.json())
-    payload_hash = hashlib.sha256(
-        mutation.model_dump_json(exclude_none=False).encode()
-    ).hexdigest()
+    payload_hash = hashlib.sha256(mutation.model_dump_json(exclude_none=False).encode()).hexdigest()
     async with transaction(request.app[POOL]) as connection:
         duplicate = await connection.fetchrow(
-            "SELECT payload_hash FROM miniapp_mutations WHERE request_id=$1", mutation.request_id
+            "SELECT payload_hash,user_id,session_id FROM miniapp_mutations WHERE request_id=$1",
+            mutation.request_id,
         )
         if duplicate:
-            if duplicate["payload_hash"] != payload_hash:
+            if (
+                duplicate["payload_hash"] != payload_hash
+                or duplicate["user_id"] != actor.user_id
+                or duplicate["session_id"] != session_id
+            ):
                 raise MiniAppError(409, "request_conflict", "Изменение уже было отправлено иначе.")
             return web.json_response(await _bootstrap_payload(request, connection))
         session = await connection.fetchrow(
@@ -495,7 +517,7 @@ async def update_field(request: web.Request) -> web.Response:
             raise MiniAppError(409, "read_only", "Отправленную анкету нельзя изменить здесь.")
         if session["revision"] != mutation.revision:
             raise MiniAppError(409, "stale", "Данные изменились. Обновите экран и повторите.")
-        loaded = request.app[DIALOGUES].load(session["workflow"])
+        loaded = request.app[DIALOGUES].load(session["workflow"], sha256=session["definition_hash"])
         if not {role.value for role in actor.roles}.intersection(loaded.spec.allowed_roles):
             raise MiniAppError(403, "forbidden", "Этот раздел пока недоступен.")
         if loaded.sha256 != session["definition_hash"]:
@@ -544,7 +566,8 @@ async def update_field(request: web.Request) -> web.Response:
                            JOIN cities c ON c.id=s.city_id
                            WHERE s.user_id=$1 AND s.revoked_at IS NULL
                              AND c.slug=$2 AND c.active=TRUE AND c.deleted_at IS NULL)""",
-                        actor.user_id, fields["city_slug"],
+                        actor.user_id,
+                        fields["city_slug"],
                     )
                 if not allowed_city:
                     raise MiniAppError(403, "city_forbidden", "Этот город вам недоступен.")
@@ -598,6 +621,137 @@ async def update_field(request: web.Request) -> web.Response:
     return web.json_response(await _bootstrap_payload(request))
 
 
+async def upload_media(request: web.Request) -> web.Response:
+    actor = request["actor"]
+    try:
+        session_id = UUID(request.match_info["session_id"])
+    except ValueError as exc:
+        raise MiniAppError(404, "not_found", "Анкета не найдена.") from exc
+    field_path = request.match_info["field_path"]
+    async with request.app[POOL].acquire() as connection:
+        session = await connection.fetchrow(
+            """SELECT s.workflow,s.definition_hash,s.status,m.structured_memory,m.revision
+               FROM conversation_sessions s JOIN conversation_memory m ON m.session_id=s.id
+               WHERE s.id=$1 AND s.user_id=$2""",
+            session_id,
+            actor.user_id,
+        )
+    if not session or session["status"] != "active":
+        raise MiniAppError(409, "read_only", "Откройте активную анкету.")
+    loaded = request.app[DIALOGUES].load(session["workflow"], sha256=session["definition_hash"])
+    if not {role.value for role in actor.roles}.intersection(loaded.spec.allowed_roles):
+        raise MiniAppError(403, "forbidden", "Этот раздел недоступен.")
+    parent, record, _ = attachment_field(
+        loaded.spec, (session["structured_memory"] or {}).get("fields") or {}, field_path
+    )
+    expected_record = record_identity(record) if parent.type == FieldType.RECORD_LIST else None
+    root = request.app[MEDIA_ROOT] / "incoming"
+    root.mkdir(parents=True, exist_ok=True)
+    incoming = root / f"{uuid4()}.image"
+    retained = False
+    try:
+        reader = await request.multipart()
+        metadata = {}
+        file_seen = False
+        digest = hashlib.sha256()
+        size = 0
+        for _ in range(3):
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name in {"revision", "request_id"} and part.name not in metadata:
+                raw = bytearray()
+                while chunk := await part.read_chunk():
+                    raw.extend(chunk)
+                    if len(raw) > 100:
+                        raise MiniAppError(400, "invalid_request", "Проверьте данные загрузки.")
+                metadata[part.name] = raw.decode("ascii")
+            elif part.name == "file" and not file_seen:
+                file_seen = True
+                with incoming.open("xb") as output:
+                    while chunk := await part.read_chunk():
+                        size += len(chunk)
+                        if size > 20 * 1024 * 1024:
+                            raise MiniAppError(413, "too_large", "Фото должно быть меньше 20 МБ.")
+                        digest.update(chunk)
+                        output.write(chunk)
+            else:
+                raise MiniAppError(400, "invalid_request", "Ожидается одна фотография.")
+        if await reader.next() is not None or not file_seen or not size:
+            raise MiniAppError(400, "invalid_request", "Выберите одну фотографию.")
+        try:
+            request_id = UUID(metadata["request_id"])
+            revision = int(metadata["revision"])
+        except (KeyError, ValueError) as exc:
+            raise MiniAppError(400, "invalid_request", "Обновите анкету и повторите.") from exc
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                [str(actor.user_id), str(session_id), field_path, revision, digest.hexdigest()]
+            ).encode()
+        ).hexdigest()
+        async with transaction(request.app[POOL]) as connection:
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", str(request_id)
+            )
+            duplicate = await connection.fetchrow(
+                "SELECT user_id,session_id,payload_hash FROM miniapp_mutations WHERE request_id=$1",
+                request_id,
+            )
+            if duplicate:
+                if (
+                    duplicate["user_id"] != actor.user_id
+                    or duplicate["session_id"] != session_id
+                    or duplicate["payload_hash"] != payload_hash
+                ):
+                    raise MiniAppError(
+                        409, "request_conflict", "Загрузка уже была отправлена иначе."
+                    )
+                return web.json_response(await _bootstrap_payload(request, connection), status=202)
+            current = await connection.fetchrow(
+                """SELECT s.status,m.revision FROM conversation_sessions s
+                   JOIN conversation_memory m ON m.session_id=s.id WHERE s.id=$1 AND s.user_id=$2
+                   FOR UPDATE OF s,m""",
+                session_id,
+                actor.user_id,
+            )
+            if not current or current["status"] != "active":
+                raise MiniAppError(409, "read_only", "Откройте активную анкету.")
+            if current["revision"] != revision:
+                raise MiniAppError(409, "stale", "Данные изменились. Обновите экран и повторите.")
+            await enqueue_job(
+                connection,
+                kind="media",
+                payload={
+                    "path": str(incoming),
+                    "chat_id": actor.telegram_id,
+                    "user_id": str(actor.user_id),
+                    "session_id": str(session_id),
+                    "session_workflow": session["workflow"],
+                    "field_path": field_path,
+                    "expected_record": expected_record,
+                    "filename": "miniapp-image",
+                },
+                idempotency_key=stable_idempotency_key("miniapp-media", request_id),
+            )
+            await connection.execute(
+                """INSERT INTO miniapp_mutations(
+                       request_id,user_id,session_id,action,payload_hash,result_revision)
+                   VALUES ($1,$2,$3,'media_queued',$4,$5)""",
+                request_id,
+                actor.user_id,
+                session_id,
+                payload_hash,
+                revision,
+            )
+        retained = True
+        return web.json_response(await _bootstrap_payload(request), status=202)
+    except (UnicodeError, ValueError) as exc:
+        raise MiniAppError(400, "invalid_request", "Проверьте данные загрузки.") from exc
+    finally:
+        if not retained:
+            incoming.unlink(missing_ok=True)
+
+
 async def update_language(request: web.Request) -> web.Response:
     mutation = LanguageMutation.model_validate(await request.json())
     await request.app[POOL].execute(
@@ -639,6 +793,7 @@ def create_miniapp_app(
     bot_token: str,
     dist_root: Path,
     auth_max_age_seconds: int = 86_400,
+    media_root: Path = Path("var/media"),
 ) -> web.Application:
     app = web.Application(
         middlewares=[error_middleware, auth_middleware], client_max_size=64 * 1024
@@ -648,13 +803,13 @@ def create_miniapp_app(
     app[AUTH_MAX_AGE] = auth_max_age_seconds
     app[DIST_ROOT] = dist_root.resolve()
     app[DIALOGUES] = DialogueSpecRepository()
+    app[MEDIA_ROOT] = media_root.resolve()
     app.router.add_get("/healthz", health)
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/miniapp/v1/bootstrap", bootstrap)
     app.router.add_post("/api/miniapp/v1/sessions/{mode}", start_session)
-    app.router.add_patch(
-        "/api/miniapp/v1/sessions/{session_id}/fields/{field_path}", update_field
-    )
+    app.router.add_patch("/api/miniapp/v1/sessions/{session_id}/fields/{field_path}", update_field)
     app.router.add_patch("/api/miniapp/v1/preferences/language", update_language)
+    app.router.add_post("/api/miniapp/v1/sessions/{session_id}/media/{field_path}", upload_media)
     app.router.add_get("/{path:.*}", frontend)
     return app
