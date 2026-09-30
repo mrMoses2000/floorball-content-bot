@@ -23,12 +23,14 @@ async def test_plesk_deploy_verifies_public_bytes_instead_of_accepting_hook_resp
     async def respond(request):
         observed.append(request.path)
         if request.path == "/hook":
+            assert request.method == "POST"
             return web.Response(text="accepted")
         if request.path == "/assets/release.js":
             return web.Response(body=asset if asset_matches else b"stale script")
         return web.Response(text=index)
 
     app = web.Application()
+    app.router.add_post("/hook", respond)
     app.router.add_get("/{path:.*}", respond)
     async with TestServer(app) as server:
 
@@ -45,6 +47,10 @@ async def test_plesk_deploy_verifies_public_bytes_instead_of_accepting_hook_resp
             def get(self, url, **kwargs):
                 parts = urlsplit(url)
                 return self.client.get(server.make_url(parts.path or "/"), **kwargs)
+
+            def post(self, url, **kwargs):
+                parts = urlsplit(url)
+                return self.client.post(server.make_url(parts.path or "/"), **kwargs)
 
         async def command(*_args, **_kwargs):
             return index

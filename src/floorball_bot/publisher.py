@@ -1203,7 +1203,7 @@ class GitPublisher:
                 for hook in (self.plesk_source_webhook_url, self.plesk_static_webhook_url):
                     if not hook:
                         continue
-                    async with client.get(hook, allow_redirects=False) as response:
+                    async with client.post(hook, allow_redirects=False) as response:
                         if response.status != 200:
                             raise RetryableProviderError(
                                 f"Plesk webhook returned HTTP {response.status}"
