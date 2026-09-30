@@ -2017,10 +2017,11 @@ class TelegramIngress:
         await connection.execute(
             """
             UPDATE conversation_sessions SET status='paused', updated_at=now()
-            WHERE user_id=$1 AND workflow<>$2 AND status='active'
+            WHERE user_id=$1 AND (workflow<>$2 OR definition_hash<>$3) AND status='active'
             """,
             actor.user_id,
             mode.value,
+            loaded.sha256,
         )
         session = await connection.fetchrow(
             """

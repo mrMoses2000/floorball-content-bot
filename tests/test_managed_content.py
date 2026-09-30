@@ -342,6 +342,69 @@ def test_old_dialogue_pins_still_load_after_new_versions_are_selected():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workflow", ["trainer", "leadership"])
+async def test_miniapp_new_version_pauses_old_session_and_preserves_answers(
+    pg_pool, tmp_path, workflow
+):
+    repository = DialogueSpecRepository()
+    old = repository._load_path(workflow, repository.root / f"{workflow}.v1.json")
+    current = repository.load(workflow)
+    user = await pg_pool.fetchval(
+        "INSERT INTO users(telegram_id,display_name) VALUES (98765,'Editor') RETURNING id"
+    )
+    await pg_pool.execute(
+        "INSERT INTO user_roles(user_id,role_name) VALUES ($1,'superadmin')", user
+    )
+    old_session = await pg_pool.fetchval(
+        "INSERT INTO conversation_sessions(user_id,workflow,definition_version,definition_hash) "
+        "VALUES ($1,$2,$3,$4) RETURNING id",
+        user,
+        workflow,
+        old.spec.version,
+        old.sha256,
+    )
+    memory = {"fields": {}, "skipped": [], "note": "preserve old answers"}
+    await pg_pool.execute(
+        "INSERT INTO conversation_memory(session_id,structured_memory) VALUES ($1,$2)",
+        old_session,
+        memory,
+    )
+    app = create_miniapp_app(pg_pool, bot_token="test-token", dist_root=tmp_path)  # noqa: S106
+    headers = {"Authorization": "tma " + signed_init_data("test-token", telegram_id=98765)}
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(f"/api/miniapp/v1/sessions/{workflow}", headers=headers)
+        assert response.status == 201
+        assert (
+            await pg_pool.fetchval(
+                "SELECT status FROM conversation_sessions WHERE id=$1", old_session
+            )
+            == "paused"
+        )
+        assert (
+            await pg_pool.fetchval(
+                "SELECT structured_memory FROM conversation_memory WHERE session_id=$1", old_session
+            )
+            == memory
+        )
+        active = await pg_pool.fetch(
+            "SELECT definition_hash FROM conversation_sessions "
+            "WHERE user_id=$1 AND status='active'",
+            user,
+        )
+        assert len(active) == 1
+        assert active[0]["definition_hash"] == current.sha256
+        assert (
+            await client.post(f"/api/miniapp/v1/sessions/{workflow}", headers=headers)
+        ).status == 201
+        assert (
+            await pg_pool.fetchval(
+                "SELECT count(*) FROM conversation_sessions WHERE user_id=$1", user
+            )
+            == 2
+        )
+
+
+@pytest.mark.asyncio
 async def test_new_drafts_update_stable_players_clubs_and_require_guardian_consent(pg_pool):
     actor, draft, city = await _seed_case(pg_pool)
     session = await pg_pool.fetchval("SELECT session_id FROM drafts WHERE id=$1", draft)
