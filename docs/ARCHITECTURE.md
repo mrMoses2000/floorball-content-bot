@@ -7,46 +7,44 @@
 и не требуются как основной или резервный канал нового сбора. Импорт
 исторических city/federation bundles сохраняется.
 
-В текущем website checkout ещё есть старая турнирная форма через Apps Script;
-этот канал нужно заменить при обновлении сайта. Отдельного сценария регистрации
-команды на турнир в боте пока нет. Сначала завершается и проверяется работа бота,
-после этого добавляются реальные пользователи и выполняется развёртывание сайта.
+Старая турнирная форма и демонстрационный календарь удалены. Отдельная регистрация
+команды на турнир в боте не реализована; подтверждённые анонсы публикуются в новостях.
 
 ## Граница системы
 
 Система принимает Telegram updates, авторизует заранее заведённых пользователей, сохраняет входные данные и медиа, формирует версионированные черновики, проводит user/reviewer approval и только затем создаёт детерминированный preview публикации для `floorball.kz`.
 
 Внешние зависимости: Telegram Bot API, AssemblyAI, локальный Agy CLI, PostgreSQL,
-SMTP, ffmpeg/ImageMagick/Pillow, локальный clone `floorball.kz` и GitHub. Plesk остаётся
-ручным последним шагом.
+ffmpeg/Pillow, локальный clone `floorball.kz`, GitHub и Plesk. Webhooks Plesk
+настроены на сервере; publisher проверяет фактически доступную сборку.
 
 ## Deployment units
 
 ```mermaid
 flowchart LR
   TG[Telegram API] -->|long polling| BOT[floorball-bot]
-  SITE[floorball.kz contact form] -->|HTTPS tunnel| CONTACT[floorball-contact-api]
-  CONTACT -->|durable request + job| PG
+  MINI[Telegram Mini App] -->|signed initData| API[floorball-miniapp-api]
+  API -->|transaction and revision check| PG
   BOT -->|transaction| PG[(PostgreSQL)]
   PG --> WORKER[floorball-worker]
   WORKER --> AAI[AssemblyAI]
   WORKER --> AGY[Agy CLI sandbox]
   WORKER --> MEDIA[Local private media]
-  WORKER -->|fixed-recipient SMTP| MAIL[Knff Gmail]
   PG --> PUB[floorball-publisher]
   PUB --> WT[Isolated git worktree]
   WT --> TESTS[Parser tests + Vitest + Vite build]
   TESTS --> SHOTS[Loopback Playwright screenshots]
   SHOTS -->|manifest + media group| TG
   SHOTS -->|explicit bound confirmation| GH[GitHub main + plesk-static]
-  GH -->|manual| PLESK[Plesk deploy]
+  GH -->|private POST webhook| PLESK[Plesk deploy]
+  PLESK -->|public files match SHA-256| PUB
 ```
 
 - `floorball-bot`: `getUpdates`, durable acceptance, authorization handlers, Telegram replies/outbox dispatch, graceful SIGTERM.
 - `floorball-worker`: claims jobs with `FOR UPDATE SKIP LOCKED`, transcribes, extracts structured data, prepares media derivatives and resumes retries.
-- `floorball-contact-api`: loopback-only HTTP service; validates the versioned contact contract,
-  allowed Origin, body size, honeypot and HMAC pseudonymized IP rate limit, then atomically stores
-  the request and delivery job before returning `202 accepted`.
+- `floorball-miniapp-api`: loopback-only API; validates Telegram initData, owner, active roles,
+  pinned questionnaire version and revision. File uploads enter the durable media queue.
+  The private interface is publicly reachable through HTTPS Funnel, with authentication on data APIs.
 - `floorball-publisher`: advisory lock, approved hash check, isolated worktree, deterministic
   export, tests/build and loopback-only Playwright screenshots; commit/push is a second explicit
   action bound to the persisted screenshot manifest.
@@ -81,15 +79,11 @@ Telegram acceptance inserts `processed_updates`, normalized message and any requ
     expected commits and `pushing`; Git commit/push runs without an open DB transaction.
 12. The atomic push has a durable reconciliation job. Both old remote refs allow a safe retry;
     both expected refs advance to `remote_verified`; any mixed/foreign refs require manual
-    recovery. Finalization is idempotent and only then records `published` and reports both commit
-    IDs. Any new revision, change request or cancellation invalidates every prior artifact/button.
-13. After both remote refs are verified, the bot asks the operator to deploy in Plesk.
-
-Contact requests use a separate flow: the site submits one stable UUID, the loopback API stores
-the bounded public fields and a delivery job in one transaction, and the worker sends plain text
-to the fixed recipient. Retries preserve the request UUID and deterministic Message-ID; after the
-bounded attempts, the row stays `dead` and a Telegram-bound superadmin is notified. SMTP remains
-at-least-once across a crash after remote acceptance and before the local `sent` commit.
+    recovery. Any new revision, change request or cancellation invalidates every prior artifact/button.
+13. At `remote_verified`, publisher sends POST to the generated Plesk hooks. A successful HTTP
+    response starts deployment; public index.html and generated files must also match SHA-256.
+    Only then does idempotent finalization record `published` and report both commits. A deployment
+    failure remains at `remote_verified` for reconciliation.
 
 New-city applications are another isolated flow. `/start new_city` stores a short-lived intent
 before any identity binding. A verified self-contact creates `city_applicant`, not `users`; answers
@@ -102,7 +96,10 @@ Official-document intake is an isolated management flow. Only `federation_editor
 files, stores a private content-addressed original, and records metadata plus an append-only event
 trail in PostgreSQL. The worker compares required document types with current received/verified
 versions and sends weekly idempotent reminders for missing or soon-expiring items. A recorded
-publication permission is metadata only; it never bypasses the normal publication approval gate.
+publication permission never bypasses approval. /document_view privately returns checked bytes;
+/document_verify and /document_reject bind decisions to the exact SHA-256. Only verified,
+explicitly public and current PDF records reach the next federation preview. Reminders to an
+ID whose owner has not started the bot can fail with chat not found; delivery is monitored.
 
 ## Interfaces
 
@@ -117,7 +114,7 @@ publication permission is metadata only; it never bypasses the normal publicatio
 
 ## Agy subprocess boundary
 
-The wrapper invokes Agy print mode with `gemini-3.8-flash`, high reasoning effort,
+The wrapper invokes Agy print mode with the configured model (production: `gemini-3.8-flash-high`), high reasoning effort,
 `--sandbox`, disabled slash-command expansion and a strict JSON Schema. Agy 1.2.7 print mode
 requires the one-turn prompt as an argv value; the wrapper invokes it directly without a shell,
 so user text cannot become a command. Each call uses a secret-free allowlisted environment, an

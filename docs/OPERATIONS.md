@@ -92,7 +92,7 @@ curl --fail https://moses-cv.tail55e85c.ts.net/floorball-miniapp/healthz
 `processed_updates` и журналы polling, устраните причину и разберите каждый
 ошибочный update. Запись о сбое нельзя просто удалять ради зелёного health.
 Успешный health показывает состояние процессов, очередей и backup, но не
-подтверждает доставку SMTP, качество распознавания речи или обновление Plesk.
+подтверждает качество распознавания речи или обновление Plesk; публикация отдельно проверяет публичные файлы.
 
 После изменения URL перезапустите `floorball-content-bot.service`: он синхронизирует Telegram
 menu button. API принимает только подписанный Telegram `initData`; прямой запрос к
@@ -120,9 +120,9 @@ menu button. API принимает только подписанный Telegram
 - Compromised token: остановить units, rotate только затронутый token/key, обновить EnvironmentFile, `daemon-reload` не нужен для value change, запустить units и проверить logs без вывода секрета.
 - Wrong publication: создать новую approved revision и обычный revert commit. Не force-push и не переписывать Git history.
 
-## Plesk handoff
+## Развёртывание Plesk и ручное восстановление
 
-После успешного push и проверки обеих удалённых веток бот сообщает commit IDs. Публичный сайт берёт готовую сборку из Plesk repository `floorball-build.git`: ветка `plesk-static`, каталог `/httpdocs`. Оператор на этой карточке нажимает «Получить сейчас», сверяет полученный commit с сообщением бота и, если автоматическое развёртывание не произошло, нажимает «Развернуть сейчас». Карточка `floorball.kz.git` с веткой `main` обновляет только исходники в `/app-src` и не меняет публичный сайт. Автоматический click не выполняется.
+После atomic push publisher вызывает настроенные PLESK_SOURCE_WEBHOOK_URL и PLESK_STATIC_WEBHOOK_URL методом POST. Plesk получает main в /app-src и plesk-static в /httpdocs. HTTP 2xx подтверждает принятие запроса; publisher дополнительно сверяет index.html и изменённые файлы публичного сайта по SHA-256. При ошибке остаётся remote_verified и запускается reconciliation. Для ручного восстановления оператор нажимает «Получить сейчас» на обеих карточках и «Развернуть сейчас», если автоматическое развёртывание не произошло. Сначала нужно сверить commits с ожидаемыми в publication_jobs.
 
 Проверить `https://floorball.kz`, прямой reload `/clubs/almaty`, RU/KZ/EN, hero, gallery и игрока без фото.
 

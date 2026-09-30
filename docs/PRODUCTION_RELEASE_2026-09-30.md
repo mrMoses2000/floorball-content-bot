@@ -27,7 +27,7 @@ Publisher собирает публичные JSON и разрешённые ф�
 
 ## Проверка
 
-- Бот: 185 pytest на отдельной базе с суффиксом _test; Ruff прошёл.
+- Бот: 187 pytest на отдельной базе с суффиксом _test; Ruff прошёл.
 - Сайт: 32 теста, три проверки контрактов, ESLint и production build прошли.
 - Mini App: два теста и production build прошли.
 - Проверены загрузки больше 64 KB, ограничение 20 MB, повтор запроса, устаревшая
@@ -54,6 +54,61 @@ Systemd и lingering обеспечивают запуск без входа п�
 
 ## Состояние развёртывания
 
-Проверенный код готов к установке; итоговые commit, резервная копия и проверки
-живого сайта будут записаны ниже после выпуска. Этот раздел до обновления не
-является подтверждением завершённого развёртывания.
+Выпуск выполнен 30 сентября 2026, Asia/Almaty.
+
+| Компонент | Проверенный выпуск |
+| --- | --- |
+| Код бота | `946e0e3440dbb0bfff431d92b3041f3a1c4459aa` (следующие коммиты уточняют документацию) |
+| Сайт main | `dcf707f` |
+| Сайт plesk-static | `f8c90b27e5bbe6a1df2f5a532b02b8a6b5953529` |
+| Миграции | 022 и 023 применены |
+| Plesk через Chrome | обе ветки получены; автоматическое развёртывание выполнено |
+| Plesk webhook | POST принят, затем 35 публичных JS/CSS/JSON/index файлов совпали по SHA-256 |
+| Оба пользователя | активны, superadmin; подписанный bootstrap возвращает 200 |
+| Запрос без initData | 401 |
+| floorball.kz/bot/ | 302 на HTTPS Funnel, Mini App открывается |
+| Автозапуск | четыре сервиса enabled и active; Linger=yes |
+
+Резервная копия до установки:
+`/home/moses/tg_bot_floorball_site/var/deploy-backups/release-20260930-023030/`.
+Сохранены исходники, приватный .env и патч предыдущих изменений. Свежие DB/media
+backup: `20260930T022556Z`. История миграций и данных сохранена. Старые SMTP-файлы
+удалены; .env очищен от настроек снятого с эксплуатации канала.
+
+Health после выпуска: database/polling/worker/backup — ok, dead_jobs=0,
+failed_updates=0, publication reconciliation без расхождений. Общий ok=false
+из-за одного исторического dead_outbox для 191148810 (chat not found). Это
+неисправленная доставка, зависящая от начала диалога пользователем. Не меняли
+её статус на sent и не удаляли запись. getChat также подтверждает недоступность
+этого личного чата; доступ к данным Mini App для ID уже работает.
+
+## Команды и свидетельства проверки
+
+- В audit checkout: `PYTHONPATH=src /home/moses/tg_bot_floorball_site/.venv/bin/python /tmp/floorball-test-run.py` — 187 passed; две рекомендации aiohttp NotAppKeyWarning.
+- `/home/moses/tg_bot_floorball_site/.venv/bin/ruff check src tests` — passed.
+- Сайт: `node scripts/test-coach-data-api.mjs`, `node scripts/test-federation-content.mjs`,
+  `node scripts/test-news-content.mjs`; `npm --prefix app test`, `npm --prefix app run lint`,
+  `npm --prefix app run build` — passed.
+- Mini App: `npm --prefix miniapp test`, `npm --prefix miniapp run build` — passed.
+- Production: `.venv/bin/python -m pip check`, `.venv/bin/python -m compileall -q src`;
+  `.venv/bin/floorball-bot health`; systemctl is-active/is-enabled; loginctl Linger.
+- Read-only Telegram getMe/getWebhookInfo/getChat/getChatMenuButton, подписанный
+  HTTP bootstrap обоих ID и HTTP-проверка доменного входа.
+- `var/live-release-verification-20260930.json` на сервере: результаты без токенов.
+  Локальная копия: `var/audit-2026-09-30/live-release-verification.json`.
+- Снимки до/после Plesk и сайт: `var/audit-2026-09-30/`; 36 снимков интерфейса:
+  `var/audit-2026-09-30/site-preview/`.
+
+При проверке живой интеграции обнаружено и исправлено требование POST и успешный
+ответ 204. Регрессионный тест проверяет 200/204 и запрещает считать устаревший
+публичный asset успешным выпуском. Контракт метода подтверждён
+[Plesk Team](https://talk.plesk.com/threads/git-webhook-gives-404-error.374345/).
+
+## Что должен сделать пользователь
+
+1. С аккаунта 191148810 открыть @floorball_site_agent_bot и нажать Start.
+2. Загрузить реальные документы через /documents и заполнить анкеты контента.
+3. Проверить полученные сведения и подтвердить конкретный preview перед публикацией.
+
+Не проводили тестовую переписку от имени пользователей, не создавали выдуманные
+профили/PDF в production и не выполняли полный reboot общего сервера.

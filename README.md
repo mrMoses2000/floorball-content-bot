@@ -18,7 +18,7 @@ Telegram Mini App с проверкой подписи `initData`, статус�
 systemd units и backup scripts.
 
 Commit/push выполняется только после двух явных Telegram-кнопок для конкретной ревизии;
-Plesk deployment остаётся ручным.
+После подтверждения сборки publisher вызывает Plesk и проверяет публичные файлы.
 
 Git push fail-closed: worker/CLI требуют явный `PUBLISH_ENABLED=true`. Первый staging gate всегда
 работает с `false`, принимает только disposable `_staging`/`_test` БД, использует local bare Git и
