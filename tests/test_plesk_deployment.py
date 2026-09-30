@@ -13,8 +13,9 @@ from floorball_bot.publisher import GitPublisher
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asset_matches", [True, False])
+@pytest.mark.parametrize("hook_status", [200, 204])
 async def test_plesk_deploy_verifies_public_bytes_instead_of_accepting_hook_response(
-    tmp_path, monkeypatch, asset_matches
+    tmp_path, monkeypatch, asset_matches, hook_status
 ):
     index = "<html>Verified release</html>\n"
     asset = b"reviewed script"
@@ -24,7 +25,7 @@ async def test_plesk_deploy_verifies_public_bytes_instead_of_accepting_hook_resp
         observed.append(request.path)
         if request.path == "/hook":
             assert request.method == "POST"
-            return web.Response(text="accepted")
+            return web.Response(status=hook_status)
         if request.path == "/assets/release.js":
             return web.Response(body=asset if asset_matches else b"stale script")
         return web.Response(text=index)

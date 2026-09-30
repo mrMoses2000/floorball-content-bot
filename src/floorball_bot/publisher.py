@@ -1204,7 +1204,7 @@ class GitPublisher:
                     if not hook:
                         continue
                     async with client.post(hook, allow_redirects=False) as response:
-                        if response.status != 200:
+                        if not 200 <= response.status < 300:
                             raise RetryableProviderError(
                                 f"Plesk webhook returned HTTP {response.status}"
                             )
