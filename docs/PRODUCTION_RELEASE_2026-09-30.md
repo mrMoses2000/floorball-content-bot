@@ -27,12 +27,13 @@ Publisher собирает публичные JSON и разрешённые ф�
 
 ## Проверка
 
-- Бот: 187 pytest на отдельной базе с суффиксом _test; Ruff прошёл.
+- Бот: 189 pytest на отдельной базе с суффиксом _test; Ruff прошёл.
 - Сайт: 32 теста, три проверки контрактов, ESLint и production build прошли.
 - Mini App: два теста и production build прошли.
 - Проверены загрузки больше 64 KB, ограничение 20 MB, повтор запроса, устаревшая
   ревизия, запрет чужих файлов, привязка к игроку, согласия несовершеннолетних,
-  повторное применение анкеты и просмотр/утверждение/отзыв PDF.
+  повторное применение анкеты, переход со старой версии на новую с сохранением
+  ответов и просмотр/утверждение/отзыв PDF.
 - Получены 36 снимков RU/KZ/EN для desktop/mobile; проверены изменённые страницы.
 - pip check: No broken requirements found. compileall прошёл.
 
@@ -58,7 +59,7 @@ Systemd и lingering обеспечивают запуск без входа п�
 
 | Компонент | Проверенный выпуск |
 | --- | --- |
-| Код бота | `946e0e3440dbb0bfff431d92b3041f3a1c4459aa` (следующие коммиты уточняют документацию) |
+| Код бота | `80539e002babcc745414fa38f6f219cacdeeb063` (следующие коммиты уточняют документацию) |
 | Сайт main | `dcf707f` |
 | Сайт plesk-static | `f8c90b27e5bbe6a1df2f5a532b02b8a6b5953529` |
 | Миграции | 022 и 023 применены |
@@ -84,7 +85,7 @@ failed_updates=0, publication reconciliation без расхождений. Об
 
 ## Команды и свидетельства проверки
 
-- В audit checkout: `PYTHONPATH=src /home/moses/tg_bot_floorball_site/.venv/bin/python /tmp/floorball-test-run.py` — 187 passed; две рекомендации aiohttp NotAppKeyWarning.
+- В audit checkout: `PYTHONPATH=src /home/moses/tg_bot_floorball_site/.venv/bin/python /tmp/floorball-test-run.py` — 189 passed; две рекомендации aiohttp NotAppKeyWarning.
 - `/home/moses/tg_bot_floorball_site/.venv/bin/ruff check src tests` — passed.
 - Сайт: `node scripts/test-coach-data-api.mjs`, `node scripts/test-federation-content.mjs`,
   `node scripts/test-news-content.mjs`; `npm --prefix app test`, `npm --prefix app run lint`,
